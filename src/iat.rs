@@ -10,6 +10,21 @@ pub struct IatHook;
 
 impl IatHook {
     /// Hooks a function in the Import Address Table (IAT) of a module.
+    ///
+    /// Returns the original imported function pointer on success.
+    ///
+    /// # Safety
+    ///
+    /// - `h_module` must be a valid handle/base address of a PE module loaded in the
+    ///   current process.
+    /// - The PE headers and import directory referenced by `h_module` must be valid
+    ///   and readable.
+    /// - `detour_function` must be a valid function pointer with a compatible ABI
+    ///   and signature for the target import.
+    /// - Calling the returned original function pointer is only safe if it is cast
+    ///   to the correct function type and called with the correct ABI.
+    /// - Modifying the target module's IAT must be valid for the process and must
+    ///   not violate any concurrency assumptions of the caller.
     pub unsafe fn hook_import(
         h_module: HMODULE, // Handle to the module whose IAT we want to hook
         target_dll: &str,

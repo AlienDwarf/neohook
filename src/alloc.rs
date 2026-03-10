@@ -8,7 +8,7 @@ impl TrampolineAlloc {
     /// Allocates a region of memory that is within 2GB of the target address, which is necessary for x86 relative jumps.
     /// - `target`: The address of the function we want to hook
     /// - `size`: The size of the memory region we want to allocate for the trampoline
-    /// ## Safety
+    /// # Safety
     /// This function performs raw pointer arithmetic. The caller must ensure that `target` is a valid pointer
     pub unsafe fn alloc_nearby(target: *const u8, size: usize) -> Option<*mut u8> {
         let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
