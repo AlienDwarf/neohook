@@ -7,3 +7,4 @@ pub mod module;
 pub mod threads;
 pub mod alloc;
 pub mod disasm;
+pub mod iat;
