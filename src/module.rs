@@ -2,23 +2,39 @@ use std::ffi::CString;
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::LibraryLoader::*;
 use windows_sys::Win32::System::Memory::*;
+use windows_sys::Win32::System::SystemServices::*;
+
+// --- Architecture-specific imports ---
+#[cfg(target_arch = "x86")]
+use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS32 as IMAGE_NT_HEADERS;
+
+#[cfg(target_arch = "x86_64")]
+use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64 as IMAGE_NT_HEADERS;
 
 pub fn get_module_size(h_module: HMODULE) -> u32 {
-    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // Reworked function. Now we read the PE headers to get the size of the module instead of using VirtualQuery,
+    // which can be unreliable for modules with non-standard memory layouts (e.g., due to ASLR, rebasing, or custom section alignments).
 
-    if unsafe {
-        VirtualQuery(
-            h_module as _,
-            &mut mbi,
-            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
-        )
-    } != 0
-    {
-        // The RegionSize field of MEMORY_BASIC_INFORMATION gives the size of the region in bytes.
-        return mbi.RegionSize as u32;
+    // safety check
+    if h_module.is_null() {
+        return 0;
     }
-    // If VirtualQuery fails, we return 0 to indicate an error.
-    0
+
+    let dos_header = h_module as *const IMAGE_DOS_HEADER;
+
+    // validation: Is this a valid PE Module?
+    unsafe {
+        if (*dos_header).e_magic != IMAGE_DOS_SIGNATURE {
+            return 0;
+        }
+    }
+
+    // Go to nt header
+    let nt_headers =
+        unsafe { (h_module as usize + (*dos_header).e_lfanew as usize) as *const IMAGE_NT_HEADERS };
+
+    // Now we can read the SizeOfImage from the optional header to get the size
+    (unsafe { *nt_headers }).OptionalHeader.SizeOfImage
 }
 
 pub fn find_function(module_name: &str, function_name: &str) -> Option<*const u8> {
