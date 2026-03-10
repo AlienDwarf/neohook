@@ -1,11 +1,22 @@
 use iced_x86::{
-    BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, Instruction, InstructionBlock,
+    BlockEncoder, BlockEncoderOptions, Code, Decoder, DecoderOptions, Instruction, InstructionBlock,
 };
 
 /// Provides functionality to disassemble and relocate instructions
 pub struct Disassembler;
 
 impl Disassembler {
+    /// Helper function to determine the bitness of the current architecture (32 or 64)
+    fn bitness() -> u32 {
+        #[cfg(target_arch = "x86")]
+        {
+            32
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            64
+        }
+    }
     /// Calculates the total length of instructions at `address` until at least `min_size` bytes are covered.
     pub unsafe fn get_instruction_len(
         address: *const u8,
@@ -15,7 +26,12 @@ impl Disassembler {
 
         // We read a buffer of 32 bytes for analysis (x64 instructions are max 15 bytes)
         let code_slice = unsafe { std::slice::from_raw_parts(address, 32) };
-        let mut decoder = Decoder::with_ip(64, code_slice, address as u64, DecoderOptions::NONE);
+        let mut decoder = Decoder::with_ip(
+            Self::bitness(),
+            code_slice,
+            address as u64,
+            DecoderOptions::NONE,
+        );
 
         while decoder.can_decode() {
             let mut instruction = Instruction::default();
@@ -38,8 +54,11 @@ impl Disassembler {
     /// Checks if the instruction at `address` is a relative instruction (e.g., JMP, CALL with relative addressing).
     /// This is important because such instructions need to be relocated when moved to a trampoline.
     pub unsafe fn is_relative(address: *const u8) -> bool {
+        let bitness = Self::bitness();
+        // We only analyze the first instruction at the address, so we read a buffer of 15 bytes (max instruction length) for analysis
         let code_slice = unsafe { std::slice::from_raw_parts(address, 15) };
-        let mut decoder = Decoder::with_ip(64, code_slice, address as u64, DecoderOptions::NONE);
+        let mut decoder =
+            Decoder::with_ip(bitness, code_slice, address as u64, DecoderOptions::NONE);
         let instr = decoder.decode();
 
         // We check if the instruction has IP-relative memory operands or is a near branch (like JMP or CALL with relative addressing).
@@ -71,15 +90,25 @@ impl Disassembler {
         trampoline: *mut u8,
         stolen_len: usize,
     ) -> Result<usize, String> {
+        let bitness = Self::bitness();
         let code_slice = unsafe { std::slice::from_raw_parts(target, stolen_len) };
 
         // Decode instrcutions until we have at least stolen_len
-        let decoder = Decoder::with_ip(64, code_slice, target as u64, DecoderOptions::NONE);
+        let decoder = Decoder::with_ip(bitness, code_slice, target as u64, DecoderOptions::NONE);
         let mut instructions: Vec<Instruction> = decoder.into_iter().collect();
 
         // Add a jump back to the original at the end (target + stolen_len)
         let return_addr = target as u64 + stolen_len as u64;
-        let jmp_back = Instruction::with_branch(iced_x86::Code::Jmp_rel8_64, return_addr)
+
+        // We need to use a different jump code for x64 if the return address is out of range for a rel32 jump
+        let jmp_code = if bitness == 64 {
+            Code::Jmp_rel32_64
+        } else {
+            // x86 standard relative jump (5 bytes)
+            Code::Jmp_rel32_32
+        };
+
+        let jmp_back = Instruction::with_branch(jmp_code, return_addr)
             .map_err(|_| "Error while creating JMP back")?;
 
         // iced-x86 automatically calculates the correct relative offset for the jump based on the instruction's IP,
@@ -88,7 +117,7 @@ impl Disassembler {
 
         // Enccode the instructions into the trampoline
         let block = InstructionBlock::new(&instructions, trampoline as u64);
-        let result = BlockEncoder::encode(64, block, BlockEncoderOptions::NONE)
+        let result = BlockEncoder::encode(bitness, block, BlockEncoderOptions::NONE)
             .map_err(|e| format!("Relocation failed: {}", e))?;
 
         // Copy the encoded instructions to the trampoline
