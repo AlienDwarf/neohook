@@ -3,3 +3,4 @@
 // It provides a simple and efficient way to hook functions in Windows applications, allowing developers to modify behavior, intercept calls, and implement custom logic without modifying the original code.
 
 pub mod mem;
+pub mod module;
