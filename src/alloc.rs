@@ -11,7 +11,7 @@ impl TrampolineAlloc {
     /// # Safety
     /// This function performs raw pointer arithmetic. The caller must ensure that `target` is a valid pointer
     pub unsafe fn alloc_nearby(target: *const u8, size: usize) -> Option<*mut u8> {
-        // --- x86 ---0
+        // --- x86 ---
         // For x86, we can simply allocate anywhere in the process's address space because the entire 4GB range is addressable with relative jumps.
         #[cfg(target_arch = "x86")]
         {
@@ -45,7 +45,7 @@ impl TrampolineAlloc {
         let min_addr = (target as usize).saturating_sub(0x7FFF_0000);
         let max_addr = (target as usize).saturating_add(0x7FFF_0000);
 
-        let current_addr = min_addr;
+        let mut current_addr = min_addr;
 
         // We scan block by block to find free regions that are at least `size` bytes
         while current_addr < max_addr {
