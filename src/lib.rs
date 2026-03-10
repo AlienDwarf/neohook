@@ -6,3 +6,4 @@ pub mod mem;
 pub mod module;
 pub mod threads;
 pub mod alloc;
+pub mod disasm;
