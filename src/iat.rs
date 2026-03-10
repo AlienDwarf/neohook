@@ -6,6 +6,20 @@ use windows_sys::Win32::System::Memory::*;
 use windows_sys::Win32::System::SystemServices::*;
 use windows_sys::Win32::System::WindowsProgramming::*;
 
+// --- Architecture-specific imports ---
+
+// If we're on 32-bit (x86):
+#[cfg(target_arch = "x86")]
+use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS32 as IMAGE_NT_HEADERS;
+#[cfg(target_arch = "x86")]
+use windows_sys::Win32::System::WindowsProgramming::IMAGE_THUNK_DATA32 as IMAGE_THUNK_DATA;
+
+// If we're on 64-bit (x64):
+#[cfg(target_arch = "x86_64")]
+use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64 as IMAGE_NT_HEADERS;
+#[cfg(target_arch = "x86_64")]
+use windows_sys::Win32::System::WindowsProgramming::IMAGE_THUNK_DATA64 as IMAGE_THUNK_DATA;
+
 pub struct IatHook;
 
 impl IatHook {
@@ -44,7 +58,7 @@ impl IatHook {
 
             // Calculate the address of the NT headers using the e_lfanew offset from the DOS header
             let nt_headers =
-                (h_module as usize + (*dos_header).e_lfanew as usize) as *const IMAGE_NT_HEADERS64;
+                (h_module as usize + (*dos_header).e_lfanew as usize) as *const IMAGE_NT_HEADERS;
 
             let import_dir =
                 (*nt_headers).OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT as usize];
@@ -64,23 +78,32 @@ impl IatHook {
                 if dll_name.eq_ignore_ascii_case(target_dll) {
                     // We need to find the Original Thunk (names) and the First Thunk (addresses)
                     let mut thunk = (h_module as usize + (*import_desc).FirstThunk as usize)
-                        as *mut IMAGE_THUNK_DATA64;
+                        as *mut IMAGE_THUNK_DATA;
                     let mut original_thunk = (h_module as usize
                         + (*import_desc).Anonymous.OriginalFirstThunk as usize)
-                        as *const IMAGE_THUNK_DATA64;
+                        as *const IMAGE_THUNK_DATA;
 
                     // If OriginalFirstThunk is 0, we should use FirstThunk for both (FALLBACK)
                     if (*import_desc).Anonymous.OriginalFirstThunk == 0 {
-                        original_thunk = thunk as *const IMAGE_THUNK_DATA64;
+                        original_thunk = thunk as *const IMAGE_THUNK_DATA;
                     }
 
                     // Iterate through the thunks to find the target function
                     while (*thunk).u1.Function != 0 {
                         let mut is_match = false;
 
-                        // Check if the import is by ordinal or by name. If it's by name, we need to compare the function name.
-                        if ((*original_thunk).u1.Ordinal & (1 << 63)) == 0 {
-                            // Import by name, we need to check the function name
+                        // ordinal check
+                        #[cfg(target_arch = "x86")]
+                        // In x86, the highest bit (0x80000000) indicates
+                        let is_ordinal = ((*original_thunk).u1.Ordinal & 0x8000_0000) != 0;
+                        #[cfg(target_arch = "x86_64")]
+                        // In x64, the highest bit (0x8000000000000000) indicates
+                        let is_ordinal = ((*original_thunk).u1.Ordinal & (1 << 63)) != 0;
+
+                        if !is_ordinal {
+                            let addr_of_data = (*original_thunk).u1.AddressOfData as usize;
+                            if addr_of_data != 0 {
+                                // Import by name, we need to check the function name
                             let import_by_name = (h_module as usize
                                 + (*original_thunk).u1.AddressOfData as usize)
                                 as *const IMAGE_IMPORT_BY_NAME;
@@ -92,26 +115,36 @@ impl IatHook {
                             if func_name == target_func {
                                 is_match = true;
                             }
+                            }
                         }
 
                         // if we found we change the protection to allow writing, then write the detour into the IAT and restore protection
                         if is_match {
                             let original_fn = (*thunk).u1.Function as *mut u8;
                             let mut old_protect = 0;
+                            let ptr_size = std::mem::size_of::<usize>();
 
                             // Change the protection of the memory page containing the IAT entry to allow writing
                             crate::mem::virtual_protect_same_execute(
                                 thunk as _,
-                                8,
+                                ptr_size,
                                 PAGE_READWRITE,
                                 &mut old_protect,
                             );
 
                             // HERE WE INSTALL THE HOOK
-                            (*thunk).u1.Function = detour_function as u64;
+                            // NOW SUPPORTING BOTH x86 AND x64
+                            #[cfg(target_arch = "x86")]
+                            {
+                                (*thunk).u1.Function = detour_function as u32;
+                            }
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                (*thunk).u1.Function = detour_function as u64;
+                            }
 
                             // Restore orig. protection
-                            VirtualProtect(thunk as _, 8, old_protect, &mut old_protect);
+                            VirtualProtect(thunk as _, ptr_size, old_protect, &mut old_protect);
 
                             // Then return the original fn ptr
                             return Some(original_fn);
