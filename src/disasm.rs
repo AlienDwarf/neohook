@@ -33,9 +33,14 @@ impl Disassembler {
             DecoderOptions::NONE,
         );
 
-        while decoder.can_decode() {
+        // Decode instructions until we have at least min_size bytes or we run out of instructions to decode
+        while decoder.can_decode() && total_bytes < min_size {
             let mut instruction = Instruction::default();
             decoder.decode_out(&mut instruction);
+            
+            if instruction.is_invalid() {
+                return Err("Invalid instruction encountered while calculating instruction length".to_string());
+            }
 
             total_bytes += instruction.len();
 

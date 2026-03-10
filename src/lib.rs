@@ -13,6 +13,7 @@ pub mod iat;
 pub mod mem;
 pub mod module;
 pub mod threads;
+pub mod api;
 
 /// Errors that can occur during the detouring process
 /// - `NotStarted`: The transaction has not been started or has already been committed/aborted.

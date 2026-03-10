@@ -1,4 +1,5 @@
 use windows_sys::Win32::System::Memory::*;
+use windows_sys::Win32::System::SystemInformation::GetSystemInfo;
 
 /// Provides functionality to allocate memory for trampolines,
 /// ensuring that the allocated memory is within a certain distance from the target function.
@@ -37,13 +38,24 @@ impl TrampolineAlloc {
         // If this is not possible we must use an absolute jump which requires a different patching strategy
         #[cfg(target_arch = "x86_64")]
         {
+            use windows_sys::Win32::System::SystemInformation::SYSTEM_INFO;
+
             let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
 
+            // Define boundaries in a 2GB range around the target address
+            let safety_buffer = 1024 * 1024 + size; // 1MB + size of trampoline to ensure we have enough space (should be more than enough for almost every trampoline)
+            let range = (i32::MAX as usize).saturating_sub(safety_buffer);
+
             // We define a search range of ±2GB around the target address
-            let min_addr = (target as usize).saturating_sub(0x7FFF_0000);
-            let max_addr = (target as usize).saturating_add(0x7FFF_0000);
+            let min_addr = (target as usize).saturating_sub(range);
+            let max_addr = (target as usize).saturating_add(range);
 
             let mut current_addr = min_addr;
+
+            // Get System Info to know the allocation granularity
+            let mut si: SYSTEM_INFO = unsafe { std::mem::zeroed() };
+            unsafe { GetSystemInfo(&mut si) };
+            let alloc_granularity = si.dwAllocationGranularity as usize;
 
             // We scan block by block to find free regions that are at least `size` bytes
             while current_addr < max_addr {
@@ -63,18 +75,24 @@ impl TrampolineAlloc {
                 if mbi.State == MEM_FREE && mbi.RegionSize >= size {
                     // Try to allocate here
                     // We have to ensure it's 64KB aligned (Allocation Granularity)
-                    let alloc_addr = align_up(current_addr, 64 * 1024);
+                    let region_start = mbi.BaseAddress as usize;
+                    let region_end = region_start.saturating_add(mbi.RegionSize);
+                    let search_start = region_start.max(current_addr);
+                    let alloc_candidate = align_up(search_start, alloc_granularity);
 
-                    if alloc_addr < (current_addr + mbi.RegionSize) {
+                    // Now a more robust check to ensure the candidate is within 2GB
+                    if alloc_candidate.saturating_add(size) <= region_end
+                        && alloc_candidate >= min_addr
+                        && alloc_candidate.saturating_add(size) <= max_addr
+                    {
                         let allocated = unsafe {
                             VirtualAlloc(
-                                alloc_addr as _,
+                                alloc_candidate as _,
                                 size,
                                 MEM_COMMIT | MEM_RESERVE,
                                 PAGE_EXECUTE_READWRITE,
                             )
                         };
-
                         if !allocated.is_null() {
                             return Some(allocated as *mut u8);
                         }
@@ -93,6 +111,11 @@ impl TrampolineAlloc {
 
             None
         }
+        // If we are on an unsupported architecture, we return None
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            return None;
+        }
     }
 }
 
@@ -100,4 +123,56 @@ impl TrampolineAlloc {
 #[cfg(target_arch = "x86_64")]
 fn align_up(addr: usize, align: usize) -> usize {
     (addr + align - 1) & !(align - 1)
+}
+
+/// Lightweight Trampoline handle for convenience.
+pub struct Trampoline {
+    pub ptr: *mut u8,
+    pub size: usize,
+}
+
+impl std::fmt::Debug for Trampoline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Trampoline")
+            .field("ptr", &self.ptr)
+            .field("size", &self.size)
+            .finish()
+    }
+}
+
+impl Trampoline {
+    pub fn as_ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+
+    /// Change protection to RX (PAGE_EXECUTE_READ). Returns true on success.
+    pub fn make_rx(&self) -> bool {
+        unsafe {
+            let mut old = 0u32;
+            let res = VirtualProtect(self.ptr as _, self.size, PAGE_EXECUTE_READ, &mut old);
+            res != 0
+        }
+    }
+}
+
+impl TrampolineAlloc {
+    /// Allocate a `Trampoline` structure near `target` with RWX permissions.
+    /// Caller should make_rx()
+    pub unsafe fn alloc_nearby_trampoline(target: *const u8, size: usize) -> Option<Trampoline> {
+        if let Some(p) = unsafe { Self::alloc_nearby(target, size) } {
+            Some(Trampoline { ptr: p, size })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for Trampoline {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.ptr.is_null() {
+                let _ = VirtualFree(self.ptr as _, 0, MEM_RELEASE);
+            }
+        }
+    }
 }

@@ -89,7 +89,11 @@ impl IatHook {
                     }
 
                     // Iterate through the thunks to find the target function
-                    while (*thunk).u1.Function != 0 {
+                    // Added: check for null pointers and zero ordinals to avoid infinite loops in case of malformed IATs
+                    while (*thunk).u1.Function != 0
+                        && !original_thunk.is_null()
+                        && (*original_thunk).u1.Ordinal != 0
+                    {
                         let mut is_match = false;
 
                         // ordinal check
@@ -104,17 +108,17 @@ impl IatHook {
                             let addr_of_data = (*original_thunk).u1.AddressOfData as usize;
                             if addr_of_data != 0 {
                                 // Import by name, we need to check the function name
-                            let import_by_name = (h_module as usize
-                                + (*original_thunk).u1.AddressOfData as usize)
-                                as *const IMAGE_IMPORT_BY_NAME;
-                            // The Name field of IMAGE_IMPORT_BY_NAME is a null-terminated string, so we can use CStr to read it safely.
-                            let func_name =
-                                CStr::from_ptr((*import_by_name).Name.as_ptr() as *const i8)
-                                    .to_string_lossy();
-                            // Compare the function name with the target function name
-                            if func_name == target_func {
-                                is_match = true;
-                            }
+                                let import_by_name = (h_module as usize
+                                    + (*original_thunk).u1.AddressOfData as usize)
+                                    as *const IMAGE_IMPORT_BY_NAME;
+                                // The Name field of IMAGE_IMPORT_BY_NAME is a null-terminated string, so we can use CStr to read it safely.
+                                let func_name =
+                                    CStr::from_ptr((*import_by_name).Name.as_ptr() as *const i8)
+                                        .to_string_lossy();
+                                // Compare the function name with the target function name
+                                if func_name == target_func {
+                                    is_match = true;
+                                }
                             }
                         }
 
@@ -161,5 +165,23 @@ impl IatHook {
         }
         // If we reach here, it means we didn't find the target DLL or function in the IAT
         None
+    }
+
+    /// Safe wrapper that returns a Result and maps None to `DetourError::InvalidParameter`.
+    pub fn hook_import_safe(
+        h_module: HMODULE,
+        target_dll: &str,
+        target_func: &str,
+        detour_function: *const u8,
+    ) -> Result<*mut u8, crate::DetourError> {
+        unsafe {
+            if let Some(orig) =
+                Self::hook_import(h_module, target_dll, target_func, detour_function)
+            {
+                Ok(orig)
+            } else {
+                Err(crate::DetourError::InvalidParameter)
+            }
+        }
     }
 }
