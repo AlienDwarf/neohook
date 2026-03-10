@@ -18,7 +18,7 @@ impl ThreadEnumerator {
     ///    unsafe { SuspendThread(thread) };
     /// }
     /// ```
-    pub unsafe fn enumerate_process_threads() -> Vec<HANDLE> {
+    pub fn enumerate_process_threads() -> Vec<HANDLE> {
         let mut threads = Vec::new();
         let process_id = unsafe { GetCurrentProcessId() };
         let current_thread_id = unsafe { GetCurrentThreadId() };
@@ -52,5 +52,27 @@ impl ThreadEnumerator {
             CloseHandle(snapshot);
         }
         threads
+    }
+
+    /// Suspend all other threads and return their handles.
+    /// Caller is responsible for resuming and closing the returned handles.
+    pub fn suspend_all_other_threads() -> Vec<HANDLE> {
+        let threads = Self::enumerate_process_threads();
+        for thread in &threads {
+            unsafe {
+                SuspendThread(*thread);
+            }
+        }
+        threads
+    }
+
+    /// Resume and close a list of thread handles previously suspended.
+    pub fn resume_and_close_threads(handles: Vec<HANDLE>) {
+        unsafe {
+            for thread in handles {
+                ResumeThread(thread);
+                CloseHandle(thread);
+            }
+        }
     }
 }
