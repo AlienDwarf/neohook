@@ -14,7 +14,7 @@ impl TrampolineAlloc {
         let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         let curr = target as usize;
 
-        // We search for a free region in 2MB steps around 1GB of the target which is maxumum jump distance for x86 relative jumps
+        // We search for a free region in 2MB steps ±1GB radius of the target which is maxumum jump distance for x86 relative jumps
         for i in 1..512 {
             let offset = i * 1024 * 1024 * 2; // i * 1024 = 1KB, * 1024 = 1MB, * 2 = 2MB 
 
