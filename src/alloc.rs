@@ -1,6 +1,8 @@
 // Copyright (c) 2026 NeoHook Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use windows_sys::Win32::System::Memory::*;
+
+#[cfg(target_arch = "x86_64")]
 use windows_sys::Win32::System::SystemInformation::GetSystemInfo;
 
 /// Provides functionality to allocate memory for trampolines,
@@ -23,17 +25,19 @@ impl TrampolineAlloc {
         // For x86, we can simply allocate anywhere in the process's address space because the entire 4GB range is addressable with relative jumps.
         #[cfg(target_arch = "x86")]
         {
-            let _ = target; // prevents "unused parameter" warning but it's not needed in x86
-            let addr = VirtualAlloc(
-                std::ptr::null(),
-                size,
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_EXECUTE_READWRITE,
-            );
-            if addr.is_null() {
-                return None;
+            unsafe {
+                let _ = target; // prevents "unused parameter" warning but it's not needed in x86
+                let addr = VirtualAlloc(
+                    std::ptr::null(),
+                    size,
+                    MEM_COMMIT | MEM_RESERVE,
+                    PAGE_EXECUTE_READWRITE,
+                );
+                if addr.is_null() {
+                    return None;
+                }
+                return Some(addr as *mut u8);
             }
-            return Some(addr as *mut u8);
         }
 
         // --- x64 ---
