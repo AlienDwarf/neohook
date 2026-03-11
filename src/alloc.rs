@@ -1,3 +1,5 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
 use windows_sys::Win32::System::Memory::*;
 use windows_sys::Win32::System::SystemInformation::GetSystemInfo;
 
@@ -21,6 +23,7 @@ impl TrampolineAlloc {
         // For x86, we can simply allocate anywhere in the process's address space because the entire 4GB range is addressable with relative jumps.
         #[cfg(target_arch = "x86")]
         {
+            let _ = target; // prevents "unused parameter" warning but it's not needed in x86
             let addr = VirtualAlloc(
                 std::ptr::null(),
                 size,
@@ -159,6 +162,10 @@ impl TrampolineAlloc {
     /// Allocate a `Trampoline` structure near `target` with RWX permissions.
     /// Caller should make_rx()
     pub unsafe fn alloc_nearby_trampoline(target: *const u8, size: usize) -> Option<Trampoline> {
+        if target.is_null() {
+            return None;
+        }
+
         if let Some(p) = unsafe { Self::alloc_nearby(target, size) } {
             Some(Trampoline { ptr: p, size })
         } else {
