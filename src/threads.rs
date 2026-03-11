@@ -4,8 +4,6 @@ use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
 use windows_sys::Win32::System::Threading::*;
 
-// TODO no raw handles, use RAII wrapper that closes the handle when dropped
-
 /// Provides functionality to enumerate threads
 pub struct ThreadEnumerator;
 
