@@ -4,10 +4,11 @@
 [![License: MIT / Apache-2.0](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-blue.svg)](#license)
 [![Platform: Windows](https://img.shields.io/badge/platform-Windows-0078D6?logo=windows)](https://www.microsoft.com/windows)
 [![Arch: x86 / x86_64](https://img.shields.io/badge/arch-x86%20%7C%20x86__64-lightgrey)](https://en.wikipedia.org/wiki/X86)
+[![CI](https://github.com/aliendwarf/neohook/actions/workflows/ci.yml/badge.svg)](https://github.com/aliendwarf/neohook/actions/workflows/ci.yml)
 
 **Hook any function in one line, transactional, thread-safe in 300 KB.**
 
-NeoHook lets you intercept and redirect any function call at runtime: Win32 APIs, game engine functions, third-party DLL exports, anything with a code pointer. It brings the precision of low-level binary patching together with Rust's memory safety, type system, and RAII ownership model - packaged in a single lightweight crate.
+NeoHook lets you intercept and redirect any function call at runtime: Win32 APIs, game engine functions, third-party DLL exports, anything with a code pointer. It brings the precision of low-level binary patching together with Rust's memory safety, type system, and RAII ownership model.
 
 ---
 
@@ -18,13 +19,13 @@ NeoHook lets you intercept and redirect any function call at runtime: Win32 APIs
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Usage Examples](#usage-examples)
-    - [1. One-liner hook - `detour_inline!`](#1-one-liner-hook--detour_inline)
-    - [2. Call the original - `detour_helper!`](#2-call-the-original--detour_helper)
-    - [3. Multiple hooks - Transaction API](#3-multiple-hooks--transaction-api)
-    - [4. IAT Hooking](#4-iat-hooking)
-    - [5. Keeping hooks alive (DLL injection / DllMain)](#5-keeping-hooks-alive-dll-injection--dllmain)
-    - [6. C / C++ FFI](#6-c--c-ffi)
-- [How It Works - Under the Hood](#how-it-works--under-the-hood)
+    - [One-liner hook - `detour_inline!`](#one-liner-hook---detour_inline)
+    - [Call the original - `detour_helper!`](#call-the-original---detour_helper)
+    - [Full control - Transaction API](#full-control---transaction-api)
+    - [IAT Hooking](#iat-hooking)
+    - [Keeping hooks alive (DLL injection / DllMain)](#keeping-hooks-alive-dll-injection--dllmain)
+    - [C / C++ FFI](#c--c-ffi)
+- [How It Works - Under the Hood](#how-it-works---under-the-hood)
 - [Architecture Overview](#architecture-overview)
 - [Error Handling](#error-handling)
 - [Development](#development)
@@ -39,31 +40,39 @@ Function hooking on Windows is deceptively difficult to get right. Writing a `JM
 
 | Problem                                               |          Naive approach          |                     NeoHook                      |
 | :---------------------------------------------------- | :------------------------------: | :----------------------------------------------: |
-| Another thread executes the bytes you are patching    |       💥 Access Violation        |      ✅ All threads suspended during patch       |
-| Instruction pointer lands on overwritten bytes        |             💥 Crash             |  ✅ RIP/EIP redirected to safe trampoline copy   |
-| Return address on stack points to patched region      |        💥 Crash on return        |  ✅ Stack scanned & return addresses rewritten   |
-| Relative JMP/CALL instructions break after relocation |         💥 Wrong target          |  ✅ Full instruction relocation via `iced-x86`   |
+| Another thread executes the bytes you are patching    |       Access Violation        |      ✅ All threads suspended during patch       |
+| Instruction pointer lands on overwritten bytes        |             Crash             |  ✅ RIP/EIP redirected to safe trampoline copy   |
+| Return address on stack points to patched region      |        Crash on return        |  ✅ Stack scanned & return addresses rewritten   |
+| Relative JMP/CALL instructions break after relocation |         Wrong target          |  ✅ Full instruction relocation via `iced-x86`   |
 | One hook in a batch fails halfway through             |   Partially applied, unstable    |       ✅ Atomic rollback - all or nothing        |
 | Hook leaks after your code exits scope                | Permanent patch, crash on unload |       ✅ RAII: automatic unhook on `Drop`        |
-| Calling into C/C++ hooking code                       |   Requires a large C++ runtime   | ✅ Stable C ABI, auto-generated headers, ~300 KB |
-
-NeoHook solves all of the above as first-class design goals, not afterthoughts.
 
 ---
 
 ## Features
 
 - **Atomic Transactions** - Queue multiple hooks and commit them in one step. If any hook fails, every previously applied change in the same transaction is rolled back automatically, leaving the process in a known-good state.
+
 - **Full Thread Safety** - Enumerates and suspends every thread in the process before applying patches. Threads are resumed immediately after.
+
 - **RIP / EIP Redirection** - If a suspended thread's instruction pointer falls within the bytes being overwritten, it is relocated to the equivalent position in the trampoline.
+
 - **Stack Scanning** - Scans the top 512 stack slots (4 KB / one page) per thread for return addresses pointing into the patch area and rewrites them to the trampoline equivalent.
+
 - **Instruction Relocation** - Uses [`iced-x86`](https://github.com/icedland/iced) to accurately decode, relocate, and re-encode stolen instructions including RIP-relative memory operands, branches, and calls.
+
 - **Smart Trampoline Allocation** - On x64, allocates trampoline memory within ±2 GB of the target so that a compact 5-byte relative jump suffices. Falls back to a 14-byte absolute jump (FF 25) when the distance exceeds 2 GB.
+
 - **IAT Hooking** - Rewrites Import Address Table entries to redirect calls to entire DLL exports without touching function preambles.
+
 - **Hook Chaining** - Detour the trampoline of an already-installed hook to layer multiple interceptors in a defined order.
+
 - **RAII Ownership** - The `Vec<Hook>` returned by `commit()` unhooks and restores original memory automatically when dropped.
+
 - **Zero-Boilerplate Macros** - `detour_inline!` and `detour_helper!` install a complete hook with a single expression.
+
 - **C FFI** - Exposes a stable C ABI with auto-generated headers (`cbindgen`), usable from C, C++, Python (`ctypes`), or any FFI-capable language.
+
 - **Tiny Footprint** - Stripped release binary under 300 KB. The `iced-x86` decoder is compiled with AVX / AVX-512 / XOP / 3DNow! support removed to minimise size.
 
 ---
@@ -77,18 +86,11 @@ Add the crate to your `Cargo.toml`:
 NeoHook = { git = "https://github.com/AlienDwarf/neohook" }
 ```
 
-For DLL projects, make sure your crate type includes `cdylib`:
-
-```toml
-[lib]
-crate-type = ["cdylib"]
-```
-
 ---
 
 ## Quick Start
 
-### 1. One-liner hook - `detour_inline!`
+### One-liner hook - `detour_inline!`
 
 Use this when you want to completely replace a function and do not need to call the original.
 
@@ -258,40 +260,7 @@ NeoHook exposes a stable C ABI. Generate the header with:
 cargo build --features generate-headers
 ```
 
-The header is written to `include/neohook.h` (C) and `include/neohook.hpp` (C++).
-
-**C++ usage example:**
-
-```cpp
-#include "neohook.hpp"
-#include <cstdio>
-
-typedef int (*AddFn)(int, int);
-AddFn pOriginalAdd = nullptr;
-
-int MyDetour(int a, int b) {
-    return pOriginalAdd(a, b) + 100;
-}
-
-int add(int a, int b) { return a + b; }
-
-int main() {
-    auto* tx = detours_transaction_begin();
-
-    // attach() returns the trampoline - store it to call the original
-    pOriginalAdd = reinterpret_cast<AddFn>(
-        detours_transaction_attach(tx, reinterpret_cast<void*>(add), reinterpret_cast<void*>(MyDetour))
-    );
-
-    auto* handle = detours_transaction_commit(tx);
-    if (handle) {
-        printf("add(1, 2) = %d\n", add(1, 2)); // prints 103
-
-        // Must be called manually - C has no destructors
-        detours_handle_unhook_and_free(handle);
-    }
-}
-```
+The header is written to `include` directory.
 
 **Notes on FFI ownership:**
 
@@ -397,21 +366,6 @@ cargo test -- --test-threads=1
 ```
 
 You have to make sure that you use one thread or you risk race conditions.
-
-### Generating C/C++ headers
-
-```bash
-cargo build --features generate-headers
-# Output: include/neohook.h  and  include/neohook.hpp
-```
-
-### Release build (size-optimised)
-
-```bash
-cargo build --release
-```
-
-The release binary strips AVX / AVX-512 / XOP / 3DNow! from the embedded `iced-x86` decoder, keeping the footprint 300 KB.
 
 ---
 
