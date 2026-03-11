@@ -1,8 +1,21 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
 use crate::DetourError;
 use crate::alloc::{Trampoline, TrampolineAlloc};
 use crate::disasm;
 use windows_sys::Win32::Foundation::*;
+use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, GetThreadContext, SetThreadContext};
 use windows_sys::Win32::System::Threading::*;
+
+/// The number of usize slots to scan on the stack for return addresses.
+/// Default: 512 (corresponds to 4KB / one memory page on x64).
+const STACK_SCAN_DEPTH: usize = 512;
+
+#[cfg(target_arch = "x86_64")]
+const CONTEXT_FLAGS: u32 = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_ALL_AMD64;
+
+#[cfg(target_arch = "x86")]
+const CONTEXT_FLAGS: u32 = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_ALL_X86;
 
 /// Main struct to manage a detour transaction, which can include multiple hooks
 /// - `Relative5` is a 5-byte relative jump `E9 xx xx xx xx` that can be used when the detour target is within +/- 2GB of the hook site.
@@ -16,7 +29,7 @@ pub enum JumpType {
 /// Struct to hold data for an inline hook, which includes the target function address,
 /// the detour function address, the trampoline address,
 /// the length of given bytes, the type of jump to use, and the original bytes that were overwritten.
-pub struct HookData {
+pub struct InlineData {
     pub target: *mut u8,
     pub detour: *const u8,
     pub trampoline: Trampoline,
@@ -28,7 +41,7 @@ pub struct HookData {
 /// Enum, used internally in DetourTransaction, to represent either
 /// an inline hook or an IAT hook that is pending to be committed.
 pub enum PendingHook {
-    Inline(HookData),
+    Inline(InlineData),
     Iat {
         module: HMODULE,
         target_dll: String,
@@ -40,33 +53,33 @@ pub enum PendingHook {
 
 /// Enum to represent an installed detour, which can be either an inline hook or an IAT hook.
 #[derive(Debug)]
-pub enum Detour {
-    Inline(InstalledHook),
-    Iat(IatDetour),
+pub enum Hook {
+    Inline(InlineHook),
+    Iat(IatHook),
 }
 
-impl Detour {
+impl Hook {
     /// Returns the original function pointer for this detour, which can be used to call the original function.
     /// For an inline hook, this is the pointer to the trampoline. For an IAT hook, this is the original function pointer stored in the IAT.
     pub fn original_ptr(&self) -> *const u8 {
         match self {
-            Detour::Inline(h) => h.original_ptr(),
-            Detour::Iat(h) => h.original_ptr,
+            Hook::Inline(h) => h.original_ptr(),
+            Hook::Iat(h) => h.original_ptr,
         }
     }
 
     /// Unhooks this detour restoring the original bytes or original ptr
     pub fn unhook(self) -> Result<(), DetourError> {
         match self {
-            Detour::Inline(h) => h.unhook(),
-            Detour::Iat(h) => h.unhook(),
+            Hook::Inline(h) => h.unhook(),
+            Hook::Iat(h) => h.unhook(),
         }
     }
 }
 
 /// Helper struct to manage the allocation of trampolines, which are used for inline hooks.
 #[derive(Debug)]
-pub struct InstalledHook {
+pub struct InlineHook {
     pub target: *mut u8,
     pub trampoline: Trampoline,
     pub stolen_len: usize,
@@ -74,7 +87,7 @@ pub struct InstalledHook {
     pub jump_type: JumpType,
 }
 
-impl InstalledHook {
+impl InlineHook {
     /// Returns the original function pointer for this inline hook, which is the address of the trampoline.
     pub fn original_ptr(&self) -> *const u8 {
         // .ptr is  *mut u8, we cast to *const u8
@@ -83,6 +96,14 @@ impl InstalledHook {
 
     /// Unhooks this inline hook by restoring the original bytes at the target address.
     pub fn unhook(self) -> Result<(), DetourError> {
+        let result = self.perform_unhook();
+        // We drop the trampoline after unhooking to free the allocated memory
+        std::mem::forget(self);
+
+        result
+    }
+
+    fn perform_unhook(&self) -> Result<(), DetourError> {
         unsafe {
             let mut old = 0u32;
             // Get current protection and add execute permissions
@@ -115,15 +136,22 @@ impl InstalledHook {
     }
 }
 
+impl Drop for InlineHook {
+    fn drop(&mut self) {
+        // auto unhook when dropped, best effort, ignore errors
+        let _ = self.perform_unhook();
+    }
+}
+
 #[derive(Debug)]
-pub struct IatDetour {
+pub struct IatHook {
     pub module: HMODULE,
     pub dll_name: String,
     pub func_name: String,
     pub original_ptr: *mut u8,
 }
 
-impl IatDetour {
+impl IatHook {
     pub fn unhook(&self) -> Result<(), DetourError> {
         unsafe {
             crate::iat::IatHook::hook_import(
@@ -138,47 +166,82 @@ impl IatDetour {
     }
 }
 
-impl Drop for IatDetour {
+impl Drop for IatHook {
     fn drop(&mut self) {
         // Auto-unhook when dropped, best effort, ignore errors
         let _ = self.unhook();
     }
 }
 
-pub struct DetourTransaction {
+pub struct TransactionCore {
     threads: Vec<HANDLE>,
     pending_hooks: Vec<PendingHook>,
     is_pending: bool,
+    redirected_threads: Vec<(HANDLE, u64)>, // for safety, we store the original RIP of redirected threads so we can restore it if needed
+    redirected_stacks: Vec<(HANDLE, usize, usize)>, // for safety, we store the original stack pointer and size of redirected threads so we can restore it if needed
 }
 
-impl DetourTransaction {
+impl TransactionCore {
     pub fn begin() -> Self {
         Self {
             threads: Vec::new(),
             pending_hooks: Vec::new(),
             is_pending: true,
+            redirected_threads: Vec::new(),
+            redirected_stacks: Vec::new(),
         }
     }
 
+    /// Suspends the given thread and adds it to the list of threads to be resumed later.
     pub fn update_thread(&mut self, h_thread: HANDLE) -> Result<(), DetourError> {
         if !self.is_pending {
             return Err(DetourError::NotStarted);
         }
+        unsafe {
+            // 1. Check: ignore current thread
+            let tid = GetThreadId(h_thread);
+            if tid == 0 || tid == GetCurrentThreadId() {
+                // if tid = 0 then handle is invalid, ignore it
+                if tid == 0 {
+                    CloseHandle(h_thread);
+                }
+                return Ok(());
+            }
+
+            // 2. Suspend the thread
+            if SuspendThread(h_thread) == u32::MAX {
+                // If we cant suspend the thread, we ignore it and close the handle
+                CloseHandle(h_thread);
+                return Ok(());
+            }
+        }
+
         self.threads.push(h_thread);
         Ok(())
     }
 
     pub fn update_all_threads(&mut self) {
-        let items = crate::threads::ThreadEnumerator::enumerate_process_threads();
-        let threads = items;
+        let threads = crate::threads::ThreadEnumerator::enumerate_process_threads();
         for h in threads {
-            self.threads.push(h);
+            // we ignore errors here
+            // so a single system threads cant cause the entire transaction to fail
+            let _ = self.update_thread(h);
         }
     }
 
+    /// Creates a pending inline hook for this transaction. The hook will not be applied until `commit()` is called.
+    /// # Parameters
+    /// - `target`: The address of the function to hook.
+    /// - `detour`: The address of the detour function that will be called instead of the original function.
+    /// # Returns
+    /// On success, returns a pointer to the trampoline that can be used to call the original function. On failure, returns a `DetourError`.
     pub fn attach(&mut self, target: *mut u8, detour: *const u8) -> Result<*mut u8, DetourError> {
         if !self.is_pending {
             return Err(DetourError::NotStarted);
+        }
+
+        if target.is_null() || detour.is_null() {
+            return Err(DetourError::InvalidParameter);
         }
 
         // --- architecture ---
@@ -229,7 +292,7 @@ impl DetourTransaction {
         let _ = trampoline_handle.make_rx();
         // ---------------------------------
 
-        let data = HookData {
+        let data = InlineData {
             target,
             detour,
             trampoline: trampoline_handle,
@@ -244,6 +307,15 @@ impl DetourTransaction {
         Ok(trampoline)
     }
 
+    /// Creates a pending IAT hook for this transaction. The hook will not be applied until `commit()` is called.
+    /// # Parameters
+    /// - `h_module`: The handle to the module whose IAT should be hooked.
+    /// - `target_dll`: The name of the target DLL that is imported by the module.
+    /// - `target_func`: The name of the target function that is imported from the target DLL.
+    /// - `detour`: The address of the detour function that will be called instead of the original function.
+    /// - `orig_out`: A pointer to a variable that will receive the original function pointer from the IAT. This can be used to call the original function from the detour.
+    /// # Returns
+    /// On success, returns `Ok(())`. On failure, returns a `DetourError`.
     pub fn attach_iat(
         &mut self,
         h_module: HMODULE,
@@ -255,6 +327,38 @@ impl DetourTransaction {
         if !self.is_pending {
             return Err(DetourError::NotStarted);
         }
+
+        // Pointer validity checks
+        unsafe {
+            let mut mbi: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION =
+                std::mem::zeroed();
+            let res = windows_sys::Win32::System::Memory::VirtualQuery(
+                h_module as *const _,
+                &mut mbi,
+                std::mem::size_of::<windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION>(),
+            );
+
+            // If VirtualQuery fails, we return an error or if memory is not readable
+            if res == 0
+                || (mbi.Protect
+                    & (windows_sys::Win32::System::Memory::PAGE_READONLY
+                        | windows_sys::Win32::System::Memory::PAGE_READWRITE
+                        | windows_sys::Win32::System::Memory::PAGE_EXECUTE_READ
+                        | windows_sys::Win32::System::Memory::PAGE_EXECUTE_READWRITE))
+                    == 0
+            {
+                return Err(DetourError::InvalidParameter);
+            }
+        }
+
+        // Check if we can find the import
+        // if find_import_address returns None it means there is no such dll or function in the IAT, so we return an error
+        if crate::iat::IatHook::find_import_address(h_module, target_dll, target_func).is_none() {
+            return Err(DetourError::InvalidParameter);
+        }
+
+        // NOW WE CAN SAFELY PUSH THE HOOK TO THE PENDING LIST, THE COMMIT FUNCTION WILL TAKE CARE OF INSTALLING IT
+
         self.pending_hooks.push(PendingHook::Iat {
             module: h_module,
             target_dll: target_dll.to_string(),
@@ -265,61 +369,83 @@ impl DetourTransaction {
         Ok(())
     }
 
-    pub fn commit(&mut self) -> Result<Vec<Detour>, DetourError> {
+    // Commits the current detour transaction and returns the installed hooks.
+    ///
+    /// Pending inline hooks are installed after tracked threads have been checked
+    /// and, if necessary, redirected from the overwritten instruction range to the
+    /// trampoline. Pending IAT hooks are then applied by replacing the matching
+    /// import entry with the detour function.
+    ///
+    /// If any step fails, all hooks installed during this call are rolled back and
+    /// tracked threads are resumed before returning the error.
+    ///
+    /// # Errors
+    ///
+    /// - `DetourError::NotStarted` if the transaction is no longer pending.
+    /// - Any error produced while redirecting threads or applying hooks.
+    ///
+    /// On success, all tracked threads are resumed and the transaction is finalized.
+    pub fn commit(&mut self) -> Result<Vec<Hook>, DetourError> {
         if !self.is_pending {
             return Err(DetourError::NotStarted);
         }
 
-        // Suspend threads
-        for &h_thread in &self.threads {
-            unsafe { SuspendThread(h_thread) };
-        }
+        #[cfg(debug_assertions)]
+        println!(
+            "[Commit] Starting transaction with {} Hooks and {} threads...",
+            self.pending_hooks.len(),
+            self.threads.len()
+        );
 
         let pending = std::mem::take(&mut self.pending_hooks);
-        let mut installed: Vec<Detour> = Vec::new();
+        let mut installed: Vec<Hook> = Vec::new();
 
         // Apply hooks
         for hook in pending {
             match hook {
-                PendingHook::Inline(data) => match self.apply_inline_hook(data) {
-                    Ok(inst) => installed.push(Detour::Inline(inst)),
-                    Err(e) => {
-                        self.rollback(&mut installed);
-                        self.cleanup_threads();
-                        return Err(e);
+                PendingHook::Inline(data) => {
+                    // Borrow
+                    let thread_handles = self.threads.clone();
+                    // check if any thread is executing in the range of the original bytes, and if so, redirect them to the trampoline before we overwrite the code
+                    for h_thread in thread_handles {
+                        self.redirect_rip_relative_threads(h_thread, &data)?;
                     }
-                },
+
+                    match self.apply_inline_hook(data) {
+                        Ok(inst) => installed.push(Hook::Inline(inst)),
+                        Err(e) => {
+                            self.rollback(&mut installed);
+                            self.cleanup_threads();
+                            return Err(e);
+                        }
+                    }
+                }
                 PendingHook::Iat {
                     module,
                     target_dll,
                     target_func,
                     detour,
                     orig_out,
-                } => {
-                    unsafe {
-                        if let Some(original) = crate::iat::IatHook::hook_import(
-                            module,
-                            &target_dll,
-                            &target_func,
-                            detour,
-                        ) {
-                            if !orig_out.is_null() {
-                                *orig_out = original;
-                            }
-                            // We push the IAT detour to the installed list so it can be unhooked later if needed. The original pointer is stored in the IatDetour struct.
-                            installed.push(Detour::Iat(IatDetour {
-                                module,
-                                dll_name: target_dll,
-                                func_name: target_func,
-                                original_ptr: original,
-                            }));
-                        } else {
-                            self.rollback(&mut installed);
-                            self.cleanup_threads();
-                            return Err(DetourError::InvalidParameter);
+                } => unsafe {
+                    if let Some(original) =
+                        crate::iat::IatHook::hook_import(module, &target_dll, &target_func, detour)
+                    {
+                        if !orig_out.is_null() {
+                            *orig_out = original;
                         }
+
+                        installed.push(Hook::Iat(IatHook {
+                            module,
+                            dll_name: target_dll,
+                            func_name: target_func,
+                            original_ptr: original,
+                        }));
+                    } else {
+                        self.rollback(&mut installed);
+                        self.cleanup_threads();
+                        return Err(DetourError::InvalidParameter);
                     }
-                }
+                },
             }
         }
 
@@ -332,10 +458,189 @@ impl DetourTransaction {
             );
         }
 
+        #[cfg(debug_assertions)]
+        println!(
+            "[Commit] transaction successfully committed with {} hooks installed.",
+            installed.len()
+        );
+
         // resume threads
         self.cleanup_threads();
         self.is_pending = false;
         Ok(installed)
+    }
+
+    /// This function inspects the thread's instruction pointer and a portion of its
+    /// stack to detect addresses that still point into the overwritten instruction
+    /// range of `data.target`.
+    ///
+    /// If the current instruction pointer lies within the stolen byte range, it is
+    /// updated to point to the corresponding offset inside `data.trampoline`.
+    ///
+    /// The stack is also scanned for potential return addresses that still point
+    /// into the stolen range. Matching addresses are rewritten so execution returns
+    /// into the trampoline instead of the patched original code.
+    ///
+    /// Any successful instruction-pointer or stack redirection is recorded in
+    /// `self.redirected_threads` or `self.redirected_stacks` so it can later be
+    /// restored if needed.
+    ///
+    /// # Parameters
+    ///
+    /// - `h_thread`: A handle to the suspended thread whose context should be
+    ///   inspected and adjusted.
+    /// - `data`: Metadata describing the inline hook, including the target address,
+    ///   trampoline address, and stolen instruction length.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(DetourError::RelocationFailed)` if the thread context could be
+    /// updated after modifying the instruction pointer.
+    ///
+    /// If the thread context cannot be read via `GetThreadContext`, the function
+    /// does **not** fail and instead returns `Ok(())`, treating the thread as
+    /// skipped.
+    ///
+    /// # Notes
+    ///
+    /// - Only a limited of the stack is scanned, as defined by
+    ///   `STACK_SCAN_DEPTH`. Automatically detects when the stack frame ends to avoid invalid access
+    /// - This function assumes the thread is already suspended before being passed
+    ///   in.
+    /// - On x86_64, the instruction pointer and stack pointer are taken from `Rip`
+    ///   and `Rsp`; on x86, `Eip` and `Esp` are used instead.
+    fn redirect_rip_relative_threads(
+        &mut self,
+        h_thread: HANDLE,
+        data: &InlineData,
+    ) -> Result<(), DetourError> {
+        unsafe {
+            #[repr(align(16))]
+            struct AlignedContext(CONTEXT);
+            let mut ctx_wrapper: AlignedContext = std::mem::zeroed();
+            let context = &mut ctx_wrapper.0;
+            context.ContextFlags = CONTEXT_FLAGS;
+
+            // fill context struct with current thread
+            if GetThreadContext(h_thread, context) == 0 {
+                #[cfg(debug_assertions)]
+                eprintln!("[Debug] Couldn't read context for thread {:?}", h_thread);
+                // Skip if we can't get the context
+                return Ok(());
+            }
+
+            #[cfg(debug_assertions)]
+            let tid = windows_sys::Win32::System::Threading::GetThreadId(h_thread);
+
+            #[cfg(target_arch = "x86_64")]
+            let original_rip = context.Rip as usize;
+            #[cfg(target_arch = "x86")]
+            let original_rip = context.Eip as usize;
+
+            let target_start = data.target as usize;
+            let target_end = target_start + data.stolen_len;
+
+            #[cfg(debug_assertions)]
+            println!(
+                "[Scan] Thread {} at RIP: 0x{:X} | Target: 0x{:X}-0x{:X}",
+                tid, original_rip, target_start, target_end
+            );
+
+            // 1. RIP Redirection
+            if original_rip >= target_start && original_rip < target_end {
+                #[cfg(debug_assertions)]
+                println!(
+                    "[DEBUG] Thread {} Instruction Pointer has been redirected",
+                    tid
+                );
+
+                self.redirected_threads
+                    .push((h_thread, original_rip as u64));
+                let offset = original_rip - target_start;
+
+                #[cfg(target_arch = "x86_64")]
+                {
+                    #[cfg(debug_assertions)]
+                    println!(
+                        "RIP: 0x{:X} -> 0x{:X} (Trampoline + {})",
+                        original_rip, data.trampoline.ptr as usize, offset
+                    );
+                    context.Rip = (data.trampoline.ptr as u64) + (offset as u64);
+                }
+                #[cfg(target_arch = "x86")]
+                {
+                    println!(
+                        "EIP: 0x{:X} -> 0x{:X} (Trampoline + {})",
+                        original_rip,
+                        data.trampoline.ptr as u32,
+                        (offset as u32)
+                    );
+                    context.Eip = (data.trampoline.ptr as u32) + (offset as u32);
+                }
+
+                if SetThreadContext(h_thread, context) == 0 {
+                    return Err(DetourError::RelocationFailed);
+                }
+            }
+
+            // 2. STACK Redirection
+            #[cfg(target_arch = "x86_64")]
+            let stack_ptr = context.Rsp as usize;
+            #[cfg(target_arch = "x86")]
+            let stack_ptr = context.Esp as usize;
+
+            let mut mbi: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION =
+                std::mem::zeroed();
+            if windows_sys::Win32::System::Memory::VirtualQuery(
+                stack_ptr as *const _,
+                &mut mbi,
+                std::mem::size_of::<windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION>(),
+            ) != 0
+            {
+                let stack_segment_top = mbi.BaseAddress as usize + mbi.RegionSize;
+
+                for i in 0..STACK_SCAN_DEPTH {
+                    let current_stack_addr = stack_ptr + (i * std::mem::size_of::<usize>());
+                    if current_stack_addr + std::mem::size_of::<usize>() > stack_segment_top {
+                        break;
+                    }
+
+                    let mut stack_value: usize = 0;
+                    std::ptr::copy_nonoverlapping(
+                        current_stack_addr as *const usize,
+                        &mut stack_value,
+                        1,
+                    );
+
+                    if stack_value >= target_start && stack_value <= target_end {
+                        let offset = stack_value - target_start;
+                        let new_return_addr = (data.trampoline.ptr as usize) + offset;
+
+                        #[cfg(debug_assertions)]
+                        println!(
+                            "[Stack] Thread {} return address found on stack at 0x{:X}:",
+                            tid, current_stack_addr
+                        );
+                        #[cfg(debug_assertions)]
+                        println!(
+                            "        0x{:X} -> 0x{:X} (Trampoline + {})",
+                            stack_value, new_return_addr, offset
+                        );
+
+                        self.redirected_stacks
+                            .push((h_thread, current_stack_addr, stack_value));
+
+                        // Nur einmal kopieren!
+                        std::ptr::copy_nonoverlapping(
+                            &new_return_addr,
+                            current_stack_addr as *mut usize,
+                            1,
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
     }
 
     pub fn abort(&mut self) {
@@ -348,17 +653,53 @@ impl DetourTransaction {
     }
 
     /// Rollback function to undo all installed hooks in case of an error during commit. It takes a mutable reference to the list of installed hooks and unhooks each one.
-    fn rollback(&self, installed: &mut Vec<Detour>) {
+    fn rollback(&mut self, installed: &mut Vec<Hook>) {
+        // restore threads first before unhook
+        for (h_thread, original_rip) in self.redirected_threads.drain(..) {
+            unsafe {
+                #[repr(align(16))]
+                struct AlignedContext(CONTEXT);
+                let mut ctx_wrapper: AlignedContext = std::mem::zeroed();
+                let context = &mut ctx_wrapper.0;
+                context.ContextFlags = CONTEXT_FLAGS;
+
+                // Get context, restore original RIP, set context
+                if GetThreadContext(h_thread, context) != 0 {
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        context.Rip = original_rip;
+                    }
+                    #[cfg(target_arch = "x86")]
+                    {
+                        context.Eip = original_rip as u32;
+                    }
+
+                    SetThreadContext(h_thread, context);
+                    println!(
+                        "[Rollback] Thread restored to Original-IP 0x{:X}",
+                        original_rip
+                    );
+                }
+            }
+        }
+
+        for (_h_thread, stack_addr, original_value) in self.redirected_stacks.drain(..) {
+            unsafe {
+                std::ptr::copy_nonoverlapping(&original_value, stack_addr as *mut usize, 1);
+            }
+        }
+
+        // Restore original bytes or IAT entries for each installed hook
         for detour in installed.drain(..) {
             match detour {
-                Detour::Inline(hook) => unsafe {
+                Hook::Inline(hook) => unsafe {
                     crate::mem::write_memory_atomic(
                         hook.target,
                         hook.orig_bytes.as_ptr(),
                         hook.stolen_len,
                     );
                 },
-                Detour::Iat(hook) => {
+                Hook::Iat(hook) => {
                     let _ = hook.unhook();
                 }
             }
@@ -376,7 +717,7 @@ impl DetourTransaction {
     }
 
     // Apply an inline hook, returning an InstalledHook on success.
-    fn apply_inline_hook(&mut self, data: HookData) -> Result<InstalledHook, DetourError> {
+    fn apply_inline_hook(&mut self, data: InlineData) -> Result<InlineHook, DetourError> {
         unsafe {
             let target = data.target;
             let dest = data.detour;
@@ -418,7 +759,7 @@ impl DetourTransaction {
 
             // we write atomic to ensure a thread-safe patching. If something fails we return an error
             if crate::mem::write_memory_atomic(target, patch_buffer.as_ptr(), patch_len).is_some() {
-                Ok(InstalledHook {
+                Ok(InlineHook {
                     target: data.target,
                     trampoline: data.trampoline,
                     stolen_len: data.stolen_len,
@@ -431,9 +772,57 @@ impl DetourTransaction {
             }
         }
     }
+
+    #[cfg(debug_assertions)]
+    pub fn dump_state(&self) {
+        println!("\n--- [DETOUR TRANSACTION DEBUG] ---");
+        println!(
+            "Status: {}",
+            if self.is_pending {
+                "PENDING"
+            } else {
+                "COMMITTED/ABORTED"
+            }
+        );
+
+        println!("Threads ({}):", self.threads.len());
+        for &h in &self.threads {
+            let tid = unsafe { windows_sys::Win32::System::Threading::GetThreadId(h) };
+            println!("  [Thread] TID: {} (Handle: {:?})", tid, h);
+        }
+
+        println!("Geplante Hooks ({}):", self.pending_hooks.len());
+        for (i, hook) in self.pending_hooks.iter().enumerate() {
+            match hook {
+                PendingHook::Inline(data) => {
+                    println!(
+                        "  [{}] INLINE: Target {:p} -> Detour {:p} (Type: {:?})",
+                        i, data.target, data.detour, data.jump_type
+                    );
+                }
+                PendingHook::Iat {
+                    target_dll,
+                    target_func,
+                    ..
+                } => {
+                    println!("  [{}] IAT: {}!{}", i, target_dll, target_func);
+                }
+            }
+        }
+
+        if !self.redirected_threads.is_empty() {
+            println!("RIP-Redirections: {}", self.redirected_threads.len());
+        }
+
+        if !self.redirected_stacks.is_empty() {
+            println!("Stack-Redirections: {}", self.redirected_stacks.len());
+        }
+
+        println!("----------------------------------\n");
+    }
 }
 
-impl Drop for DetourTransaction {
+impl Drop for TransactionCore {
     fn drop(&mut self) {
         // If the transaction is still pending when the DetourTransaction struct is dropped, we call abort() to clean up any pending hook
         if self.is_pending {
