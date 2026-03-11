@@ -1,8 +1,7 @@
 use neohook::mem::virtual_protect_same_execute;
 use windows_sys::Win32::System::Memory::{
-    VirtualAlloc, VirtualFree, VirtualQuery, MEMORY_BASIC_INFORMATION,
-    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
-    PAGE_EXECUTE_READWRITE, PAGE_READWRITE,
+    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE,
+    PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualQuery,
 };
 
 #[test]
@@ -23,14 +22,10 @@ fn changes_protection_and_returns_old_protect() {
 
         let mut old_protect = 0u32;
 
-        // Change the protection to readwrite, but since the original page had execute permissions, 
+        // Change the protection to readwrite, but since the original page had execute permissions,
         // we expect it to keep them.
-        let ok = virtual_protect_same_execute(
-            ptr,
-            size,
-            PAGE_READWRITE,
-            &mut old_protect as *mut u32,
-        );
+        let ok =
+            virtual_protect_same_execute(ptr, size, PAGE_READWRITE, &mut old_protect as *mut u32);
 
         // Ensure the protection change succeeded and that the old protection is what we set initially.
         assert_ne!(ok, 0);
