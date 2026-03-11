@@ -1,3 +1,5 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
 use windows_sys::Win32::System::Threading::*;
@@ -10,8 +12,8 @@ pub struct ThreadEnumerator;
 impl ThreadEnumerator {
     /// Enumerates all threads of the current process, excluding the calling thread,
     /// and returns their handles.
-    /// ## Example
-    /// ```rust
+    /// # Examples
+    /// ```rust,ignore
     /// let threads = ThreadEnumerator::enumerate_process_threads();
     /// for thread in threads {
     ///     // Do something with the thread handle, e.g., suspend or resume the thread
@@ -38,7 +40,12 @@ impl ThreadEnumerator {
                     if entry.th32OwnerProcessID == process_id
                         && entry.th32ThreadID != current_thread_id
                     {
-                        let h_thread = OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID);
+                        let access_flags = THREAD_SUSPEND_RESUME
+                            | THREAD_GET_CONTEXT
+                            | THREAD_SET_CONTEXT
+                            | THREAD_QUERY_INFORMATION;
+
+                        let h_thread = OpenThread(access_flags, 0, entry.th32ThreadID);
                         if !h_thread.is_null() {
                             threads.push(h_thread);
                         }
@@ -52,27 +59,5 @@ impl ThreadEnumerator {
             CloseHandle(snapshot);
         }
         threads
-    }
-
-    /// Suspend all other threads and return their handles.
-    /// Caller is responsible for resuming and closing the returned handles.
-    pub fn suspend_all_other_threads() -> Vec<HANDLE> {
-        let threads = Self::enumerate_process_threads();
-        for thread in &threads {
-            unsafe {
-                SuspendThread(*thread);
-            }
-        }
-        threads
-    }
-
-    /// Resume and close a list of thread handles previously suspended.
-    pub fn resume_and_close_threads(handles: Vec<HANDLE>) {
-        unsafe {
-            for thread in handles {
-                ResumeThread(thread);
-                CloseHandle(thread);
-            }
-        }
     }
 }
