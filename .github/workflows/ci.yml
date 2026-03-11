@@ -14,12 +14,22 @@ concurrency:
 jobs:
   test:
     runs-on: windows-latest
+    strategy:
+      matrix:
+        target: [x86_64-pc-windows-msvc, i686-pc-windows-msvc]
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Install x86 target
-        run: rustup target add i686-pc-windows-msvc
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add ${{ matrix.target }}
+      
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
       - name: Show toolchain
         run: rustc -Vv && cargo -V
@@ -30,11 +40,8 @@ jobs:
       #- name: Clippy
         #run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Test (x64)
-        run: cargo test --all-features -- --test-threads=1
-
-      - name: Test (x86)
-        run: cargo test --target i686-pc-windows-msvc --all-features -- --test-threads=1
+      - name: Test
+        run: cargo test --target ${{ matrix.target }} --all-features
 
       - name: Build release
         run: cargo build --release
