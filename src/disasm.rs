@@ -1,3 +1,5 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
 use iced_x86::{
     BlockEncoder, BlockEncoderOptions, Code, Decoder, DecoderOptions, Instruction, InstructionBlock,
 };
@@ -37,9 +39,12 @@ impl Disassembler {
         while decoder.can_decode() && total_bytes < min_size {
             let mut instruction = Instruction::default();
             decoder.decode_out(&mut instruction);
-            
+
             if instruction.is_invalid() {
-                return Err("Invalid instruction encountered while calculating instruction length".to_string());
+                return Err(
+                    "Invalid instruction encountered while calculating instruction length"
+                        .to_string(),
+                );
             }
 
             total_bytes += instruction.len();

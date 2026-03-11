@@ -1,3 +1,5 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
 use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
 use windows_sys::Win32::System::Memory::*;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;

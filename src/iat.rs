@@ -1,10 +1,10 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
 use std::ffi::CStr;
 use windows_sys::Win32::Foundation::*;
-use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64;
 use windows_sys::Win32::System::Diagnostics::Debug::*;
 use windows_sys::Win32::System::Memory::*;
 use windows_sys::Win32::System::SystemServices::*;
-use windows_sys::Win32::System::WindowsProgramming::*;
 
 // --- Architecture-specific imports ---
 
@@ -183,5 +183,91 @@ impl IatHook {
                 Err(crate::DetourError::InvalidParameter)
             }
         }
+    }
+
+    /// This function is similar to `hook_import`, but instead of writing the detour, it just finds the address of the IAT slot for the specified imported function. This can be used for more advanced hooking techniques where you want to write a custom jump or trampoline instead of a direct detour.
+    pub fn find_import_address(
+        h_module: HMODULE,
+        target_dll: &str,
+        target_func: &str,
+    ) -> Option<*mut *mut u8> {
+        if h_module.is_null() {
+            return None;
+        }
+
+        let dos_header = h_module as *const IMAGE_DOS_HEADER;
+
+        let e_magic = unsafe { (*dos_header).e_magic };
+        if e_magic != IMAGE_DOS_SIGNATURE {
+            return None;
+        }
+
+        let e_lfanew = unsafe { (*dos_header).e_lfanew as usize };
+        let nt_headers = (h_module as usize + e_lfanew) as *const IMAGE_NT_HEADERS;
+
+        let import_dir = unsafe {
+            (*nt_headers).OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT as usize]
+        };
+        if import_dir.Size == 0 {
+            return None;
+        }
+
+        let mut import_desc = (h_module as usize + import_dir.VirtualAddress as usize)
+            as *mut IMAGE_IMPORT_DESCRIPTOR;
+
+        while unsafe { (*import_desc).Name } != 0 {
+            let name_rva = unsafe { (*import_desc).Name as usize };
+            let name_ptr = (h_module as usize + name_rva) as *const i8;
+            let dll_name = unsafe { CStr::from_ptr(name_ptr) }.to_string_lossy();
+
+            if dll_name.eq_ignore_ascii_case(target_dll) {
+                let mut thunk = unsafe { h_module as usize + (*import_desc).FirstThunk as usize }
+                    as *mut IMAGE_THUNK_DATA;
+                let mut original_thunk = (h_module as usize
+                    + unsafe { (*import_desc).Anonymous.OriginalFirstThunk } as usize)
+                    as *const IMAGE_THUNK_DATA;
+
+                if unsafe { (*import_desc).Anonymous.OriginalFirstThunk } == 0 {
+                    original_thunk = thunk as *const IMAGE_THUNK_DATA;
+                }
+
+                while unsafe { (*thunk).u1.Function } != 0
+                    && !original_thunk.is_null()
+                    && unsafe { (*original_thunk).u1.Ordinal } != 0
+                {
+                    let mut is_match = false;
+
+                    #[cfg(target_arch = "x86")]
+                    let is_ordinal = (unsafe { (*original_thunk).u1.Ordinal } & 0x8000_0000) != 0;
+                    #[cfg(target_arch = "x86_64")]
+                    let is_ordinal = (unsafe { (*original_thunk).u1.Ordinal } & (1 << 63)) != 0;
+
+                    if !is_ordinal {
+                        let addr_of_data = unsafe { (*original_thunk).u1.AddressOfData } as usize;
+                        if addr_of_data != 0 {
+                            let import_by_name =
+                                (h_module as usize + addr_of_data) as *const IMAGE_IMPORT_BY_NAME;
+                            let func_name = unsafe {
+                                CStr::from_ptr((*import_by_name).Name.as_ptr() as *const i8)
+                                    .to_string_lossy()
+                            };
+                            if func_name == target_func {
+                                is_match = true;
+                            }
+                        }
+                    }
+
+                    if is_match {
+                        // Return the address of the IAT slot
+                        return Some(thunk as *mut *mut u8);
+                    }
+
+                    thunk = unsafe { thunk.add(1) };
+                    original_thunk = unsafe { original_thunk.add(1) };
+                }
+            }
+            import_desc = unsafe { import_desc.add(1) };
+        }
+        None
     }
 }
