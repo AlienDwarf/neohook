@@ -85,6 +85,7 @@ pub struct InlineHook {
     pub stolen_len: usize,
     pub orig_bytes: Vec<u8>,
     pub jump_type: JumpType,
+    active: bool,
 }
 
 impl InlineHook {
@@ -95,10 +96,9 @@ impl InlineHook {
     }
 
     /// Unhooks this inline hook by restoring the original bytes at the target address.
-    pub fn unhook(self) -> Result<(), DetourError> {
+    pub fn unhook(mut self) -> Result<(), DetourError> {
         let result = self.perform_unhook();
-        // We drop the trampoline after unhooking to free the allocated memory
-        std::mem::forget(self);
+        self.active = false;
 
         result
     }
@@ -138,8 +138,10 @@ impl InlineHook {
 
 impl Drop for InlineHook {
     fn drop(&mut self) {
-        // auto unhook when dropped, best effort, ignore errors
-        let _ = self.perform_unhook();
+        if self.active {
+            // auto unhook when dropped, best effort, ignore errors
+            let _ = self.perform_unhook();
+        }
     }
 }
 
@@ -149,18 +151,25 @@ pub struct IatHook {
     pub dll_name: String,
     pub func_name: String,
     pub original_ptr: *mut u8,
+    active: bool,
 }
 
 impl IatHook {
-    pub fn unhook(&self) -> Result<(), DetourError> {
+    pub fn unhook(mut self) -> Result<(), DetourError> {
+        let result = self.perform_unhook();
+        self.active = false;
+
+        result
+    }
+
+    fn perform_unhook(&self) -> Result<(), DetourError> {
         unsafe {
             crate::iat::IatHook::hook_import(
                 self.module,
                 &self.dll_name,
                 &self.func_name,
                 self.original_ptr,
-            )
-            .ok_or(DetourError::InvalidParameter)?;
+            )?;
             Ok(())
         }
     }
@@ -168,8 +177,10 @@ impl IatHook {
 
 impl Drop for IatHook {
     fn drop(&mut self) {
-        // Auto-unhook when dropped, best effort, ignore errors
-        let _ = self.unhook();
+        if self.active {
+            // auto unhook when dropped, best effort, ignore errors
+            let _ = self.perform_unhook();
+        }
     }
 }
 
@@ -353,8 +364,9 @@ impl TransactionCore {
 
         // Check if we can find the import
         // if find_import_address returns None it means there is no such dll or function in the IAT, so we return an error
-        if crate::iat::IatHook::find_import_address(h_module, target_dll, target_func).is_none() {
-            return Err(DetourError::InvalidParameter);
+
+        unsafe {
+            crate::iat::IatHook::find_import_address(h_module, target_dll, target_func)?;
         }
 
         // NOW WE CAN SAFELY PUSH THE HOOK TO THE PENDING LIST, THE COMMIT FUNCTION WILL TAKE CARE OF INSTALLING IT
@@ -408,7 +420,11 @@ impl TransactionCore {
                     let thread_handles = self.threads.clone();
                     // check if any thread is executing in the range of the original bytes, and if so, redirect them to the trampoline before we overwrite the code
                     for h_thread in thread_handles {
-                        self.redirect_rip_relative_threads(h_thread, &data)?;
+                        if let Err(e) = self.redirect_rip_relative_threads(h_thread, &data) {
+                            self.rollback(&mut installed);
+                            self.cleanup_threads();
+                            return Err(e);
+                        }
                     }
 
                     match self.apply_inline_hook(data) {
@@ -427,23 +443,30 @@ impl TransactionCore {
                     detour,
                     orig_out,
                 } => unsafe {
-                    if let Some(original) =
-                        crate::iat::IatHook::hook_import(module, &target_dll, &target_func, detour)
-                    {
-                        if !orig_out.is_null() {
-                            *orig_out = original;
-                        }
+                    match crate::iat::IatHook::hook_import(
+                        module,
+                        &target_dll,
+                        &target_func,
+                        detour,
+                    ) {
+                        Ok(original) => {
+                            if !orig_out.is_null() {
+                                *orig_out = original;
+                            }
 
-                        installed.push(Hook::Iat(IatHook {
-                            module,
-                            dll_name: target_dll,
-                            func_name: target_func,
-                            original_ptr: original,
-                        }));
-                    } else {
-                        self.rollback(&mut installed);
-                        self.cleanup_threads();
-                        return Err(DetourError::InvalidParameter);
+                            installed.push(Hook::Iat(IatHook {
+                                module,
+                                dll_name: target_dll,
+                                func_name: target_func,
+                                original_ptr: original,
+                                active: true,
+                            }));
+                        }
+                        Err(err) => {
+                            self.rollback(&mut installed);
+                            self.cleanup_threads();
+                            return Err(err.into());
+                        }
                     }
                 },
             }
@@ -569,6 +592,7 @@ impl TransactionCore {
                 }
                 #[cfg(target_arch = "x86")]
                 {
+                    #[cfg(debug_assertions)]
                     println!(
                         "EIP: 0x{:X} -> 0x{:X} (Trampoline + {})",
                         original_rip,
@@ -612,7 +636,7 @@ impl TransactionCore {
                         1,
                     );
 
-                    if stack_value >= target_start && stack_value <= target_end {
+                    if stack_value >= target_start && stack_value < target_end  {
                         let offset = stack_value - target_start;
                         let new_return_addr = (data.trampoline.ptr as usize) + offset;
 
@@ -630,7 +654,6 @@ impl TransactionCore {
                         self.redirected_stacks
                             .push((h_thread, current_stack_addr, stack_value));
 
-                        // Nur einmal kopieren!
                         std::ptr::copy_nonoverlapping(
                             &new_return_addr,
                             current_stack_addr as *mut usize,
@@ -675,6 +698,8 @@ impl TransactionCore {
                     }
 
                     SetThreadContext(h_thread, context);
+
+                    #[cfg(debug_assertions)]
                     println!(
                         "[Rollback] Thread restored to Original-IP 0x{:X}",
                         original_rip
@@ -692,13 +717,9 @@ impl TransactionCore {
         // Restore original bytes or IAT entries for each installed hook
         for detour in installed.drain(..) {
             match detour {
-                Hook::Inline(hook) => unsafe {
-                    crate::mem::write_memory_atomic(
-                        hook.target,
-                        hook.orig_bytes.as_ptr(),
-                        hook.stolen_len,
-                    );
-                },
+                Hook::Inline(hook) => {
+                    let _ = hook.unhook();
+                }
                 Hook::Iat(hook) => {
                     let _ = hook.unhook();
                 }
@@ -765,6 +786,7 @@ impl TransactionCore {
                     stolen_len: data.stolen_len,
                     orig_bytes: data.orig_bytes,
                     jump_type: data.jump_type,
+                    active: true,
                 })
             } else {
                 // If the write fails, we return an error. The commit() function will catch this and call rollback() to undo any hooks that were already installed.
@@ -791,7 +813,7 @@ impl TransactionCore {
             println!("  [Thread] TID: {} (Handle: {:?})", tid, h);
         }
 
-        println!("Geplante Hooks ({}):", self.pending_hooks.len());
+        println!("Planned Hooks ({}):", self.pending_hooks.len());
         for (i, hook) in self.pending_hooks.iter().enumerate() {
             match hook {
                 PendingHook::Inline(data) => {
