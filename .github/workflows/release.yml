@@ -1,0 +1,22 @@
+name: Publish to Crates.io
+
+on:
+  push:
+    # Trigger when a new tag is pushed that starts with 'v', e.g., 'v1.0.0'
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    name: Publish Library
+    runs-on: windows-latest # WICHTIG: Auf Windows geändert!
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo Publish
+        run: cargo publish --token ${{ secrets.CRATES_TOKEN }}

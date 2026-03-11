@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions: read-all
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install x86 target
+        run: rustup target add i686-pc-windows-msvc
+
+      - name: Show toolchain
+        run: rustc -Vv && cargo -V
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test (x64)
+        run: cargo test --all-features -- --test-threads=1
+
+      - name: Test (x86)
+        run: cargo test --target i686-pc-windows-msvc --all-features -- --test-threads=1
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Build docs
+        run: cargo doc --no-deps
