@@ -13,8 +13,9 @@ fn main() {
     let value = 5;
     println!("Original result: {}", double_value(value)); // Should print 10
 
-    let _hook = detour_inline!(double_value, hook_double_value).expect("Failed to hook double_value");
-    
+    let _hook =
+        detour_inline!(double_value, hook_double_value).expect("Failed to hook double_value");
+
     println!("Hooked result: {}", double_value(value)); // Should print -10
 
     // Hooks will be automatically removed when `hook` goes out of scope
