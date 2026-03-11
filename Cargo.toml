@@ -2,9 +2,18 @@
 name = "neohook"
 version = "0.1.0"
 edition = "2024"
+authors = ["AlienDwarf"]
+description = "Powerful, transactional, thread-safe function hooking for Windows (x86/x64), written in Rust."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/aliendwarf/neohook"
+readme = "README.md"
+keywords = ["hooking", "detours", "win32", "x86", "x86_64", "neohook", "reverse-engineering", "debugging"]
+categories = ["os::windows-apis", "development-tools::debugging"]
+exclude = ["/.github"]
 
 [lib]
 crate-type = ["rlib", "cdylib"]
+doctest = false
 
 [dependencies]
 windows-sys = { version = "0.61.2", features = [
@@ -17,5 +26,29 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_WindowsProgramming",
     "Win32_System_SystemInformation",
+    "Win32_System_Kernel",
 ] }
-iced-x86 = { version = "1.21.0"}
+iced-x86 = { version = "1.21.0", default-features = false, features = [
+    "decoder",
+    "instr_info",
+    "no_std",
+    "encoder",
+    "block_encoder",
+    "no_vex",
+    "no_evex",
+    "no_xop",
+    "no_d3now",
+] }
+
+[build-dependencies]
+cbindgen = { version = "0.29.2", optional = true }
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+strip = true
+
+[package.metadata.docs.rs]
+default-target = "x86_64-pc-windows-msvc"
+targets = []
