@@ -33,6 +33,8 @@ pub enum DetourError {
     RelocationFailed,
     /// One or more parameters were invalid.
     InvalidParameter,
+    /// An error occurred while installing an IAT hook.
+    Iat(crate::iat::IatHookError),
 }
 
 impl fmt::Display for DetourError {
@@ -42,7 +44,14 @@ impl fmt::Display for DetourError {
             Self::AllocationFailed => write!(f, "Failed to allocate memory for trampoline"),
             Self::RelocationFailed => write!(f, "Failed to relocate instructions to trampoline"),
             Self::InvalidParameter => write!(f, "One or more parameters were invalid"),
+            Self::Iat(err) => write!(f, "IAT hook error: {err}"),
         }
+    }
+}
+
+impl From<crate::iat::IatHookError> for DetourError {
+    fn from(err: crate::iat::IatHookError) -> Self {
+        Self::Iat(err)
     }
 }
 
@@ -66,7 +75,6 @@ macro_rules! detour_inline {
     ($target:expr, $detour:expr) => {{
         let mut session = $crate::DetourTransaction::begin();
         session.update_all_threads();
-        // Wir führen attach aus und merken uns das Ergebnis
         match session.attach($target as *mut u8, $detour as *const u8) {
             Ok(_) => session.commit(),
             Err(e) => Err(e),
