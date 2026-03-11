@@ -1,7 +1,8 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
 use std::ffi::CString;
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::LibraryLoader::*;
-use windows_sys::Win32::System::Memory::*;
 use windows_sys::Win32::System::SystemServices::*;
 
 // --- Architecture-specific imports ---
@@ -71,4 +72,28 @@ pub fn find_function(module_name: &str, function_name: &str) -> Option<*const u8
     // If the function is not found, GetProcAddress returns null. We return None in that case.
     // If the function is found, we return its address as a pointer to first byte of the function
     func_address.map(|addr| addr as *const u8)
+}
+
+/// Gets a (pseudo) handle to a loaded module by its name. This is a simple wrapper around `GetModuleHandleW` that returns an Option type for better error handling.
+/// # Parameters
+/// - `module_name`: The name of the module (DLL) to get the handle for. This should be the filename of the module, e.g., "kernel32.dll".
+/// # Returns
+/// `Some(HMODULE)` if the module is found, or `None` if the module is not loaded in the process.
+pub fn get_module_handle(module_name: &str) -> Option<HMODULE> {
+    unsafe {
+        // Encode the module name as UTF-16, which is required by Windows APIs.
+        let module_wide: Vec<u16> = module_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        // Get a handle to the module
+        let h_module = GetModuleHandleW(module_wide.as_ptr());
+        if !h_module.is_null() {
+            // If the module is found, return its handle
+            Some(h_module)
+        } else {
+            None
+        }
+    }
 }
