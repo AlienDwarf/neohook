@@ -3,13 +3,22 @@ name = "neohook"
 version = "0.1.0"
 edition = "2024"
 authors = ["AlienDwarf"]
-description = "Powerful, transactional, thread-safe function hooking for Windows (x86/x64), written in Rust."
+description = "Powerful, transactional, thread-safe function hooking library for Windows (x86/x64), written in Rust."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/aliendwarf/neohook"
 readme = "README.md"
-keywords = ["hooking", "detours", "win32", "x86", "x86_64", "neohook", "reverse-engineering", "debugging"]
+keywords = [
+    "hooking",
+    "detours",
+    "win32",
+    "x86",
+    "x86_64",
+    "neohook",
+    "reverse-engineering",
+    "debugging",
+]
 categories = ["os::windows-apis", "development-tools::debugging"]
-exclude = ["/.github"]
+exclude = ["/.github", "/.gitignore", "/*.pdb", "/.vscode", "/target"]
 
 [lib]
 crate-type = ["rlib", "cdylib"]
