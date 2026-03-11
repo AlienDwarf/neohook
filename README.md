@@ -12,38 +12,16 @@ NeoHook lets you intercept and redirect any function call at runtime: Win32 APIs
 
 ---
 
-## Table of Contents
-
-- [Why NeoHook?](#why-NeoHook)
-- [Features](#features)
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [Usage Examples](#usage-examples)
-    - [One-liner hook - `detour_inline!`](#one-liner-hook---detour_inline)
-    - [Call the original - `detour_helper!`](#call-the-original---detour_helper)
-    - [Full control - Transaction API](#full-control---transaction-api)
-    - [IAT Hooking](#iat-hooking)
-    - [Keeping hooks alive (DLL injection / DllMain)](#keeping-hooks-alive-dll-injection--dllmain)
-    - [C / C++ FFI](#c--c-ffi)
-- [How It Works - Under the Hood](#how-it-works---under-the-hood)
-- [Architecture Overview](#architecture-overview)
-- [Error Handling](#error-handling)
-- [Development](#development)
-- [Disclaimer](#disclaimer)
-- [License](#license)
-
----
-
 ## Why NeoHook?
 
-Function hooking on Windows is deceptively difficult to get right. Writing a `JMP` patch is only a few lines of assembly - but doing it safely in a live, multi-threaded process requires solving several hard problems at once:
+Function hooking is deceptively difficult to get right. Writing a `JMP` patch is only a few lines of assembly - but doing it safely in a live, multi-threaded process requires solving multiple problems at once:
 
 | Problem                                               |          Naive approach          |                     NeoHook                      |
 | :---------------------------------------------------- | :------------------------------: | :----------------------------------------------: |
 | Another thread executes the bytes you are patching    |       Access Violation        |      ✅ All threads suspended during patch       |
-| Instruction pointer lands on overwritten bytes        |             Crash             |  ✅ RIP/EIP redirected to safe trampoline copy   |
-| Return address on stack points to patched region      |        Crash on return        |  ✅ Stack scanned & return addresses rewritten   |
-| Relative JMP/CALL instructions break after relocation |         Wrong target          |  ✅ Full instruction relocation via `iced-x86`   |
+| Instruction pointer on overwritten bytes        |             Crash             |  ✅ IP redirected to safe trampoline copy   |
+| Return address on stack points to patched region      |        Crash on return        |  ✅ Stack scanned & redirected   |
+| JMP/CALL instructions break after relocation |         Wrong target          |  ✅ Full instruction relocation via `iced-x86`   |
 | One hook in a batch fails halfway through             |   Partially applied, unstable    |       ✅ Atomic rollback - all or nothing        |
 | Hook leaks after your code exits scope                | Permanent patch, crash on unload |       ✅ RAII: automatic unhook on `Drop`        |
 
@@ -337,7 +315,7 @@ neohook/
 │   └── thread.rs      - ThreadEnumerator: toolhelp32 snapshot, open/suspend threads
 └── include/
     ├── neohook.h    - Auto-generated C header (cbindgen)
-    └── neohook.hpp  - Auto-generated C++ header (cbindgen)
+    └── neohook.hpp  - C++ header
 ```
 
 ---
