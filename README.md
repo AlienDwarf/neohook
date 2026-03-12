@@ -1,4 +1,7 @@
-# NeoHook 🪝🦀
+  <img src="assets/logo.png" alt="NeoHook logo" width="320">
+</p>
+
+<h1 align="center">NeoHook 🪝🦀</h1>
 
 [![Crates.io](https://img.shields.io/crates/v/neohook.svg)](https://crates.io/crates/neohook)
 [![License: MIT / Apache-2.0](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-blue.svg)](#license)
