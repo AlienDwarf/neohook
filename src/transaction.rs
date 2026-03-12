@@ -971,14 +971,16 @@ fn is_managed_gateway(ptr: *mut u8) -> bool {
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn write_managed_gateway_stub(src: *mut u8, dst: *const u8) {
-    // FF 25 00 00 00 00 [u64 addr]
-    *src.add(0) = 0xFF;
-    *src.add(1) = 0x25;
-    *src.add(2) = 0x00;
-    *src.add(3) = 0x00;
-    *src.add(4) = 0x00;
-    *src.add(5) = 0x00;
-    std::ptr::copy_nonoverlapping(&(dst as u64).to_le_bytes()[0], src.add(6), 8);
+    unsafe {
+        // FF 25 00 00 00 00 [u64 addr]
+        *src.add(0) = 0xFF;
+        *src.add(1) = 0x25;
+        *src.add(2) = 0x00;
+        *src.add(3) = 0x00;
+        *src.add(4) = 0x00;
+        *src.add(5) = 0x00;
+        std::ptr::copy_nonoverlapping(&(dst as u64).to_le_bytes()[0], src.add(6), 8);
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
