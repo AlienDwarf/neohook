@@ -1,13 +1,13 @@
-  <img src="assets/logo.png" alt="NeoHook logo" width="320">
-</p>
-
-<h1 align="center">NeoHook 🪝🦀</h1>
+# NeoHook 🪝🦀
 
 [![Crates.io](https://img.shields.io/crates/v/neohook.svg)](https://crates.io/crates/neohook)
 [![License: MIT / Apache-2.0](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-blue.svg)](#license)
 [![Platform: Windows](https://img.shields.io/badge/platform-Windows-0078D6?logo=windows)](https://www.microsoft.com/windows)
 [![Arch: x86 / x86_64](https://img.shields.io/badge/arch-x86%20%7C%20x86__64-lightgrey)](https://en.wikipedia.org/wiki/X86)
 [![CI](https://github.com/aliendwarf/neohook/actions/workflows/ci.yml/badge.svg)](https://github.com/aliendwarf/neohook/actions/workflows/ci.yml)
+
+<img align="right" width="320px" height="320px" src="logo.png">
+
 
 **Hook any function in one line, transactional, thread-safe in 300 KB.**
 
