@@ -6,6 +6,9 @@
 [![Arch: x86 / x86_64](https://img.shields.io/badge/arch-x86%20%7C%20x86__64-lightgrey)](https://en.wikipedia.org/wiki/X86)
 [![CI](https://github.com/aliendwarf/neohook/actions/workflows/ci.yml/badge.svg)](https://github.com/aliendwarf/neohook/actions/workflows/ci.yml)
 
+<img align="right" width="320px" height="320px" src="logo.png">
+
+
 **Hook any function in one line, transactional, thread-safe in 300 KB.**
 
 NeoHook lets you intercept and redirect any function call at runtime: Win32 APIs, game engine functions, third-party DLL exports, anything with a code pointer. It brings the precision of low-level binary patching together with Rust's memory safety, type system, and RAII ownership model.

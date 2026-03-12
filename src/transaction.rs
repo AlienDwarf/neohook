@@ -34,13 +34,23 @@ pub enum JumpType {
     Absolute14,
 }
 
-/// Internal enum to differentiate between normal targets and managed gateways.
-/// Managed gateways are special stubs that allow hooking of managed methods and chaining of hooks without the need for disassembly
-/// - `Normal` function targets require disassembly to determine the length of stolen bytes and proper relocation, and are used for typical inline hooks
-/// - `ManagedGateway` targets are pre-allocated stubs that can be directly overwritte
+/// Describes what kind of code location an inline hook is attached to.
+///
+/// This is used to keep managed gateway registration in sync across
+/// hook, rehook, and unhook operations.
 #[derive(Debug)]
 enum TargetKind {
+    /// A regular inline hook target.
+    ///
+    /// Normal targets are patched by stealing and relocating instructions
+    /// from the original code region.
     Normal,
+
+    /// A managed gateway stub created by NeoHook.
+    ///
+    /// Managed gateways act as chainable jump stubs. When such a target is
+    /// hooked again, the old gateway must be removed from the managed gateway
+    /// registry and restored on unhook.
     ManagedGateway,
 }
 
