@@ -34,6 +34,16 @@ pub enum JumpType {
     Absolute14,
 }
 
+/// Internal enum to differentiate between normal targets and managed gateways.
+/// Managed gateways are special stubs that allow hooking of managed methods and chaining of hooks without the need for disassembly
+/// - `Normal` function targets require disassembly to determine the length of stolen bytes and proper relocation, and are used for typical inline hooks
+/// - `ManagedGateway` targets are pre-allocated stubs that can be directly overwritte
+#[derive(Debug)]
+enum TargetKind {
+    Normal,
+    ManagedGateway,
+}
+
 /// Struct to hold data for an inline hook, which includes the target function address,
 /// the detour function address, the trampoline address,
 /// the length of given bytes, the type of jump to use, and the original bytes that were overwritten.
@@ -45,6 +55,7 @@ pub struct InlineData {
     pub stolen_len: usize,
     pub jump_type: JumpType,
     pub orig_bytes: Vec<u8>,
+    target_kind: TargetKind,
 }
 
 /// Enum, used internally in DetourTransaction, to represent either
@@ -95,6 +106,7 @@ pub struct InlineHook {
     pub orig_bytes: Vec<u8>,
     pub jump_type: JumpType,
     active: bool,
+    target_kind: TargetKind,
 }
 
 impl InlineHook {
@@ -134,6 +146,12 @@ impl InlineHook {
 
             // copy the original bytes back to the target function
             std::ptr::copy_nonoverlapping(self.orig_bytes.as_ptr(), self.target, self.stolen_len);
+
+            // If this hook had overwritten a managed gateway, restoring the original bytes
+            // makes the target a managed gateway again
+            if matches!(self.target_kind, TargetKind::ManagedGateway) {
+                register_managed_gateway(self.target);
+            }
 
             // CPU-Cache flush so CPU has to read from RAM not from L1 L2 L3 cache
             let flush_ok = windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache(
@@ -326,6 +344,7 @@ impl TransactionCore {
                     std::slice::from_raw_parts(target as *const u8, MANAGED_GATEWAY_LEN).to_vec()
                 },
                 redirect_base: gateway,
+                target_kind: TargetKind::ManagedGateway,
             };
 
             self.pending_hooks.push(PendingHook::Inline(data));
@@ -395,6 +414,7 @@ impl TransactionCore {
                 std::slice::from_raw_parts(target as *const u8, stolen_len).to_vec()
             },
             redirect_base: body,
+            target_kind: TargetKind::Normal,
         };
 
         self.pending_hooks.push(PendingHook::Inline(data));
@@ -869,6 +889,11 @@ impl TransactionCore {
             if crate::mem::write_memory_atomic(target, full_patch.as_ptr(), data.stolen_len)
                 .is_some()
             {
+                // If this hook is overwriting a managed gateway, we need to unregister it
+                if matches!(data.target_kind, TargetKind::ManagedGateway) {
+                    unregister_managed_gateway(data.target);
+                }
+
                 // Write was successful now we register the trampoline as a managed gateway so it can be hooked itself
                 register_managed_gateway(data.trampoline.ptr);
 
@@ -879,6 +904,7 @@ impl TransactionCore {
                     orig_bytes: data.orig_bytes,
                     jump_type: data.jump_type,
                     active: true,
+                    target_kind: data.target_kind,
                 })
             } else {
                 // If the write fails, we return an error. The commit() function will catch this and call rollback() to undo any hooks that were already installed.
