@@ -3,6 +3,8 @@
 use crate::DetourError;
 use crate::alloc::{Trampoline, TrampolineAlloc};
 use crate::disasm;
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, GetThreadContext, SetThreadContext};
 use windows_sys::Win32::System::Threading::*;
@@ -16,6 +18,12 @@ const CONTEXT_FLAGS: u32 = windows_sys::Win32::System::Diagnostics::Debug::CONTE
 
 #[cfg(target_arch = "x86")]
 const CONTEXT_FLAGS: u32 = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_ALL_X86;
+
+#[cfg(target_arch = "x86_64")]
+const MANAGED_GATEWAY_LEN: usize = 14;
+
+#[cfg(target_arch = "x86")]
+const MANAGED_GATEWAY_LEN: usize = 5;
 
 /// Main struct to manage a detour transaction, which can include multiple hooks
 /// - `Relative5` is a 5-byte relative jump `E9 xx xx xx xx` that can be used when the detour target is within +/- 2GB of the hook site.
@@ -33,6 +41,7 @@ pub struct InlineData {
     pub target: *mut u8,
     pub detour: *const u8,
     pub trampoline: Trampoline,
+    pub redirect_base: *mut u8,
     pub stolen_len: usize,
     pub jump_type: JumpType,
     pub orig_bytes: Vec<u8>,
@@ -98,6 +107,7 @@ impl InlineHook {
     /// Unhooks this inline hook by restoring the original bytes at the target address.
     pub fn unhook(mut self) -> Result<(), DetourError> {
         self.perform_unhook()?;
+        unregister_managed_gateway(self.trampoline.ptr);
         self.active = false;
 
         Ok(())
@@ -155,6 +165,7 @@ impl Drop for InlineHook {
             // auto unhook when dropped, best effort, ignore errors
             let _ = self.perform_unhook();
         }
+        unregister_managed_gateway(self.trampoline.ptr);
     }
 }
 
@@ -268,6 +279,59 @@ impl TransactionCore {
             return Err(DetourError::InvalidParameter);
         }
 
+        // If the target function is a managed gateway, we use a special hooking method that does not require disassembly or stolen bytes, as the gateway is designed to be overwritten with a jump to the trampoline. This allows us to hook methods that would otherwise be difficult or impossible to hook.
+        // The trampoline will contain a stub that jumps to the original target after executing the detour, allowing for proper chaining of hooks
+        if is_managed_gateway(target) {
+            let previous_target = unsafe {
+                read_managed_gateway_target(target as *const u8)
+                    .ok_or(DetourError::InvalidParameter)?
+            };
+
+            let jump_type = {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let rel = (detour as i64) - (target as i64) - 5;
+                    if (i32::MIN as i64..=i32::MAX as i64).contains(&rel) {
+                        JumpType::Relative5
+                    } else {
+                        JumpType::Absolute14
+                    }
+                }
+                #[cfg(target_arch = "x86")]
+                {
+                    JumpType::Relative5
+                }
+            };
+
+            let trampoline_handle = unsafe {
+                TrampolineAlloc::alloc_nearby_trampoline(target, MANAGED_GATEWAY_LEN.max(64))
+                    .ok_or(DetourError::AllocationFailed)?
+            };
+
+            let gateway = trampoline_handle.ptr;
+
+            unsafe {
+                write_managed_gateway_stub(gateway, previous_target);
+            }
+
+            let _ = trampoline_handle.make_rx();
+
+            let data = InlineData {
+                target,
+                detour,
+                trampoline: trampoline_handle,
+                stolen_len: MANAGED_GATEWAY_LEN,
+                jump_type,
+                orig_bytes: unsafe {
+                    std::slice::from_raw_parts(target as *const u8, MANAGED_GATEWAY_LEN).to_vec()
+                },
+                redirect_base: gateway,
+            };
+
+            self.pending_hooks.push(PendingHook::Inline(data));
+            return Ok(gateway);
+        }
+
         // --- architecture ---
 
         // case A: 64-Bit (x86_64)
@@ -294,27 +358,32 @@ impl TransactionCore {
                 .map_err(|_| DetourError::InvalidParameter)
         }?;
 
-        // Allocate memory. rwx is required for the trampoline, we switch to rx later
-        let tramp_capacity = 64usize;
+        // MANAGED GATEWAYS FOR HOOK CHAINING
+        let tramp_capacity = 128 as usize;
         let trampoline_handle = unsafe {
-            TrampolineAlloc::alloc_nearby_trampoline(target, 64)
+            // Allocate memory. rwx is required for the trampoline, we switch to rx later
+            TrampolineAlloc::alloc_nearby_trampoline(target, tramp_capacity)
                 .ok_or(DetourError::AllocationFailed)?
         };
-        let trampoline = trampoline_handle.ptr;
 
-        // Relocation
-        let tramp_len = unsafe {
-            disasm::Disassembler::relocate(target, trampoline, stolen_len)
+        let gateway = trampoline_handle.ptr;
+        let body = unsafe { gateway.add(MANAGED_GATEWAY_LEN) };
+
+        let body_len = unsafe {
+            // Relocation
+            disasm::Disassembler::relocate(target, body, stolen_len)
                 .map_err(|_| DetourError::RelocationFailed)
         }?;
 
-        if tramp_len > tramp_capacity {
+        if MANAGED_GATEWAY_LEN + body_len > tramp_capacity {
             return Err(DetourError::RelocationFailed);
         }
 
-        // Switch to RX via helper
+        unsafe {
+            write_managed_gateway_stub(gateway, body as *const u8);
+        }
+
         let _ = trampoline_handle.make_rx();
-        // ---------------------------------
 
         let data = InlineData {
             target,
@@ -325,10 +394,11 @@ impl TransactionCore {
             orig_bytes: unsafe {
                 std::slice::from_raw_parts(target as *const u8, stolen_len).to_vec()
             },
+            redirect_base: body,
         };
 
         self.pending_hooks.push(PendingHook::Inline(data));
-        Ok(trampoline)
+        Ok(gateway)
     }
 
     /// Creates a pending IAT hook for this transaction. The hook will not be applied until `commit()` is called.
@@ -601,7 +671,7 @@ impl TransactionCore {
                         "RIP: 0x{:X} -> 0x{:X} (Trampoline + {})",
                         original_rip, data.trampoline.ptr as usize, offset
                     );
-                    context.Rip = (data.trampoline.ptr as u64) + (offset as u64);
+                    context.Rip = (data.redirect_base as u64) + (offset as u64);
                 }
                 #[cfg(target_arch = "x86")]
                 {
@@ -612,7 +682,7 @@ impl TransactionCore {
                         data.trampoline.ptr as u32,
                         (offset as u32)
                     );
-                    context.Eip = (data.trampoline.ptr as u32) + (offset as u32);
+                    context.Eip = (data.redirect_base as u32) + (offset as u32);
                 }
 
                 if SetThreadContext(h_thread, context) == 0 {
@@ -651,7 +721,7 @@ impl TransactionCore {
 
                     if stack_value >= target_start && stack_value < target_end {
                         let offset = stack_value - target_start;
-                        let new_return_addr = (data.trampoline.ptr as usize) + offset;
+                        let new_return_addr = (data.redirect_base as usize) + offset;
 
                         #[cfg(debug_assertions)]
                         println!(
@@ -799,6 +869,9 @@ impl TransactionCore {
             if crate::mem::write_memory_atomic(target, full_patch.as_ptr(), data.stolen_len)
                 .is_some()
             {
+                // Write was successful now we register the trampoline as a managed gateway so it can be hooked itself
+                register_managed_gateway(data.trampoline.ptr);
+
                 Ok(InlineHook {
                     target: data.target,
                     trampoline: data.trampoline,
@@ -870,4 +943,80 @@ impl Drop for TransactionCore {
             self.abort();
         }
     }
+}
+
+fn managed_gateways() -> &'static Mutex<HashSet<usize>> {
+    static GATEWAYS: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+    GATEWAYS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn register_managed_gateway(ptr: *mut u8) {
+    let _ = managed_gateways().lock().map(|mut s| {
+        s.insert(ptr as usize);
+    });
+}
+
+fn unregister_managed_gateway(ptr: *mut u8) {
+    let _ = managed_gateways().lock().map(|mut s| {
+        s.remove(&(ptr as usize));
+    });
+}
+
+fn is_managed_gateway(ptr: *mut u8) -> bool {
+    managed_gateways()
+        .lock()
+        .map(|s| s.contains(&(ptr as usize)))
+        .unwrap_or(false)
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn write_managed_gateway_stub(src: *mut u8, dst: *const u8) {
+    unsafe {
+        // FF 25 00 00 00 00 [u64 addr]
+        *src.add(0) = 0xFF;
+        *src.add(1) = 0x25;
+        *src.add(2) = 0x00;
+        *src.add(3) = 0x00;
+        *src.add(4) = 0x00;
+        *src.add(5) = 0x00;
+        std::ptr::copy_nonoverlapping(&(dst as u64).to_le_bytes()[0], src.add(6), 8);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn read_managed_gateway_target(src: *const u8) -> Option<*const u8> {
+    unsafe {
+        if *src.add(0) != 0xFF
+            || *src.add(1) != 0x25
+            || *src.add(2) != 0x00
+            || *src.add(3) != 0x00
+            || *src.add(4) != 0x00
+            || *src.add(5) != 0x00
+        {
+            return None;
+        }
+
+        let mut addr = [0u8; 8];
+        std::ptr::copy_nonoverlapping(src.add(6), addr.as_mut_ptr(), 8);
+        Some(u64::from_le_bytes(addr) as *const u8)
+    }
+}
+
+#[cfg(target_arch = "x86")]
+unsafe fn write_managed_gateway_stub(src: *mut u8, dst: *const u8) {
+    let rel = (dst as isize).wrapping_sub(src as isize).wrapping_sub(5);
+    *src.add(0) = 0xE9;
+    std::ptr::copy_nonoverlapping(&(rel as i32).to_le_bytes()[0], src.add(1), 4);
+}
+
+#[cfg(target_arch = "x86")]
+unsafe fn read_managed_gateway_target(src: *const u8) -> Option<*const u8> {
+    if *src.add(0) != 0xE9 {
+        return None;
+    }
+
+    let mut rel = [0u8; 4];
+    std::ptr::copy_nonoverlapping(src.add(1), rel.as_mut_ptr(), 4);
+    let rel = i32::from_le_bytes(rel) as isize;
+    Some(src.offset(5 + rel) as *const u8)
 }
