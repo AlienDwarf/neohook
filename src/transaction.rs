@@ -80,7 +80,6 @@ pub enum PendingHook {
         target_dll: String,
         target_func: String,
         detour: *const u8,
-        orig_out: *mut *mut u8,
     },
 }
 
@@ -92,10 +91,11 @@ pub enum Hook {
 }
 
 impl Hook {
-    /// Returns the original function pointer for this inline hook.
+    /// Returns the original function pointer associated with this hook.
     ///
-    /// This is the address of the trampoline managed by NeoHook. Calling it enters
-    /// the original function.   
+    /// For inline hooks, this is the trampoline entry managed by NeoHook.
+    /// For IAT hooks, this is the original imported function pointer that was
+    /// stored in the import table before patching.
     pub fn original_ptr(&self) -> *const u8 {
         match self {
             Hook::Inline(h) => h.original_ptr(),
@@ -487,9 +487,8 @@ impl TransactionCore {
     /// The matching import entry is resolved immediately during preparation so the
     /// transaction can fail early if the requested import does not exist.
     ///
-    /// If `orig_out` is non-null, it receives the original imported function
-    /// pointer once the hook has been installed successfully during
-    /// [`Self::commit`].
+    /// The original imported function pointer becomes available through the
+    /// installed [`Hook`] returned by [`Self::commit`].
     ///
     /// # Parameters
     ///
@@ -497,7 +496,6 @@ impl TransactionCore {
     /// - `target_dll`: Name of the imported DLL to match.
     /// - `target_func`: Name of the imported function to match.
     /// - `detour`: Address of the detour function.
-    /// - `orig_out`: Optional output pointer for the original imported function.
     ///
     /// # Errors
     ///
@@ -512,7 +510,6 @@ impl TransactionCore {
         target_dll: &str,
         target_func: &str,
         detour: *const u8,
-        orig_out: *mut *mut u8,
     ) -> Result<(), DetourError> {
         if !self.is_pending {
             return Err(DetourError::NotStarted);
@@ -555,7 +552,6 @@ impl TransactionCore {
             target_dll: target_dll.to_string(),
             target_func: target_func.to_string(),
             detour,
-            orig_out,
         });
         Ok(())
     }
@@ -620,7 +616,6 @@ impl TransactionCore {
                     target_dll,
                     target_func,
                     detour,
-                    orig_out,
                 } => unsafe {
                     match crate::iat::IatHook::hook_import(
                         module,
@@ -629,10 +624,6 @@ impl TransactionCore {
                         detour,
                     ) {
                         Ok(original) => {
-                            if !orig_out.is_null() {
-                                *orig_out = original;
-                            }
-
                             installed.push(Hook::Iat(IatHook {
                                 module,
                                 dll_name: target_dll,
