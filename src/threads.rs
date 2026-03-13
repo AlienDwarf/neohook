@@ -8,24 +8,28 @@ use windows_sys::Win32::System::Threading::*;
 pub struct ThreadEnumerator;
 
 impl ThreadEnumerator {
-    /// Enumerates all threads of the current process, excluding the calling thread,
-    /// and returns their handles.
+    /// Enumerates all thread IDs of the current process, excluding the calling thread.
+    ///
+    /// This function returns thread IDs
+    ///
+    /// If a thread snapshot cannot be created, an empty vector is returned.
+    ///
     /// # Examples
     /// ```rust,ignore
-    /// let threads = ThreadEnumerator::enumerate_process_threads();
-    /// for thread in threads {
-    ///     // Do something with the thread handle, e.g., suspend or resume the thread
-    ///    unsafe { SuspendThread(thread) };
+    /// let thread_ids = ThreadEnumerator::enumerate_process_threads();
+    ///
+    /// for tid in thread_ids {
+    ///     println!("found thread id: {}", tid);
     /// }
     /// ```
-    pub fn enumerate_process_threads() -> Vec<HANDLE> {
-        let mut threads = Vec::new();
+    pub fn enumerate_process_threads() -> Vec<u32> {
+        let mut thread_ids = Vec::new();
         let process_id = unsafe { GetCurrentProcessId() };
         let current_thread_id = unsafe { GetCurrentThreadId() };
 
         let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
         if snapshot == INVALID_HANDLE_VALUE {
-            return threads;
+            return thread_ids;
         }
 
         let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
@@ -34,19 +38,10 @@ impl ThreadEnumerator {
         unsafe {
             if Thread32First(snapshot, &mut entry) != 0 {
                 loop {
-                    // Check if the thread belongs to the current process and is not the calling thread
                     if entry.th32OwnerProcessID == process_id
                         && entry.th32ThreadID != current_thread_id
                     {
-                        let access_flags = THREAD_SUSPEND_RESUME
-                            | THREAD_GET_CONTEXT
-                            | THREAD_SET_CONTEXT
-                            | THREAD_QUERY_INFORMATION;
-
-                        let h_thread = OpenThread(access_flags, 0, entry.th32ThreadID);
-                        if !h_thread.is_null() {
-                            threads.push(h_thread);
-                        }
+                        thread_ids.push(entry.th32ThreadID);
                     }
 
                     if Thread32Next(snapshot, &mut entry) == 0 {
@@ -54,8 +49,10 @@ impl ThreadEnumerator {
                     }
                 }
             }
+
             CloseHandle(snapshot);
         }
-        threads
+
+        thread_ids
     }
 }
