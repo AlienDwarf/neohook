@@ -2,10 +2,9 @@
 
 use neohook::DetourError;
 use neohook::api::*;
+use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use std::hint::black_box;
 use std::ptr;
-use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-use windows_sys::Win32::System::Threading::GetCurrentThread;
 
 #[inline(never)]
 pub fn target_func(a: i32) -> i32 {
@@ -61,15 +60,15 @@ fn ffi_get_trampoline_returns_null_for_out_of_bounds_index() {
 fn transaction_update_thread_accepts_current_thread() {
     let mut tx = DetourTransaction::begin();
 
-    let result = tx.update_thread(unsafe { GetCurrentThread() });
+    let result = tx.update_thread(unsafe { GetCurrentThreadId() });
     assert!(result.is_ok());
 }
 
 #[test]
-fn transaction_update_thread_ignores_invalid_handle() {
+fn transaction_update_thread_ignores_invalid_thread_id() {
     let mut tx = DetourTransaction::begin();
 
-    let result = tx.update_thread(INVALID_HANDLE_VALUE);
+    let result = tx.update_thread(unsafe { GetCurrentThreadId() } + 99999);
     assert!(result.is_ok());
 }
 
@@ -78,7 +77,7 @@ fn transaction_update_thread_fails_after_abort() {
     let mut tx = DetourTransaction::begin();
     tx.abort();
 
-    let result = tx.update_thread(unsafe { GetCurrentThread() });
+    let result = tx.update_thread(unsafe { GetCurrentThreadId() });
     assert!(matches!(result, Err(DetourError::NotStarted)));
 }
 

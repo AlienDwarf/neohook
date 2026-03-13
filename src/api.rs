@@ -33,8 +33,10 @@ impl DetourTransaction {
         }
     }
 
-    /// Suspends the given thread and adds it to the set of threads that will be
-    /// resumed when the transaction is committed or aborted.
+    /// Suspends the given thread and tracks it for the duration of the transaction.
+    /// Will be resumed when the transaction is committed or aborted.
+    /// 
+    /// The caller only provides the thread ID. NeoHook opens and owns the required thread handle internally. 
     ///
     /// This can be used to keep other threads from executing code while hooks
     /// are being installed.
@@ -45,12 +47,12 @@ impl DetourTransaction {
     /// been committed or aborted.
     pub fn update_thread(
         &mut self,
-        h: windows_sys::Win32::Foundation::HANDLE,
+        thread_id: u32,
     ) -> Result<(), DetourError> {
         self.inner
             .as_mut()
             .ok_or(DetourError::NotStarted)?
-            .update_thread(h)
+            .update_thread(thread_id)
     }
 
     /// Suspends all threads in the current process except the calling thread and
@@ -157,6 +159,19 @@ impl Drop for DetourTransaction {
 #[unsafe(no_mangle)]
 pub extern "C" fn detours_transaction_begin() -> *mut DetourTransaction {
     Box::into_raw(Box::new(DetourTransaction::begin()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn detours_transaction_update_thread(
+    tx: *mut DetourTransaction,
+    thread_id: u32,
+) -> i32 {
+    if tx.is_null() {
+        return 0;
+    }
+
+    let tx_ref = unsafe { &mut *tx };
+    tx_ref.update_thread(thread_id).map(|_| 1).unwrap_or(0)
 }
 
 /// Attaches an inline detour to the given transaction.

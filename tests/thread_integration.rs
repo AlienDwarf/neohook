@@ -6,10 +6,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
-use windows_sys::Win32::Foundation::CloseHandle;
 
 #[test]
-fn enumerate_process_threads_finds_spawned_threads() {
+fn enumerate_process_thread_ids_finds_spawned_threads() {
     let stop = Arc::new(AtomicBool::new(false));
     let mut workers = Vec::new();
 
@@ -23,22 +22,16 @@ fn enumerate_process_threads_finds_spawned_threads() {
         }));
     }
 
-    let threads = ThreadEnumerator::enumerate_process_threads();
+    let thread_ids = ThreadEnumerator::enumerate_process_threads();
 
     // We expect at least the spawned worker threads to be visible.
     assert!(
-        threads.len() >= 10,
+        thread_ids.len() >= 10,
         "expected to find at least the spawned worker threads, found {}",
-        threads.len()
+        thread_ids.len()
     );
 
     stop.store(true, Ordering::Relaxed);
-
-    for handle in threads {
-        unsafe {
-            CloseHandle(handle);
-        }
-    }
 
     for worker in workers {
         worker.join().expect("worker thread panicked");
