@@ -2,9 +2,9 @@
 
 use neohook::DetourError;
 use neohook::api::*;
-use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use std::hint::black_box;
 use std::ptr;
+use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 
 #[inline(never)]
 pub fn target_func(a: i32) -> i32 {

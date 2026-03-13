@@ -35,8 +35,8 @@ impl DetourTransaction {
 
     /// Suspends the given thread and tracks it for the duration of the transaction.
     /// Will be resumed when the transaction is committed or aborted.
-    /// 
-    /// The caller only provides the thread ID. NeoHook opens and owns the required thread handle internally. 
+    ///
+    /// The caller only provides the thread ID. NeoHook opens and owns the required thread handle internally.
     ///
     /// This can be used to keep other threads from executing code while hooks
     /// are being installed.
@@ -45,10 +45,7 @@ impl DetourTransaction {
     ///
     /// Returns `Err(DetourError::NotStarted)` if the transaction has already
     /// been committed or aborted.
-    pub fn update_thread(
-        &mut self,
-        thread_id: u32,
-    ) -> Result<(), DetourError> {
+    pub fn update_thread(&mut self, thread_id: u32) -> Result<(), DetourError> {
         self.inner
             .as_mut()
             .ok_or(DetourError::NotStarted)?

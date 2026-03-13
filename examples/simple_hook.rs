@@ -21,5 +21,5 @@ fn main() {
     // Hooks will be automatically removed when `hook` goes out of scope
     // To prevent this we can intentionally leak with std::mem::forget
     // or we can use a global static variable (recommended to use OnceLock)
-    // You can also use Option<> to store the hook 
+    // You can also use Option<> to store the hook
 }

@@ -30,8 +30,7 @@ unsafe extern "system" fn message_box_a_detour(
 ) -> INT {
     println!("[iat detour] MessageBoxA intercepted");
 
-    let original =
-        unsafe { ORIGINAL_MESSAGEBOXA.expect("ORIGINAL_MESSAGEBOXA not initialized") };
+    let original = unsafe { ORIGINAL_MESSAGEBOXA.expect("ORIGINAL_MESSAGEBOXA not initialized") };
 
     let new_text = b"Hooked by NeoHook via IAT!\0";
     let new_caption = b"NeoHook IAT Example\0";

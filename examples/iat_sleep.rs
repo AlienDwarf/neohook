@@ -39,7 +39,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let before = Instant::now();
     unsafe { Sleep(500) };
-    println!("before hook: slept for ~{} ms", before.elapsed().as_millis());
+    println!(
+        "before hook: slept for ~{} ms",
+        before.elapsed().as_millis()
+    );
 
     let mut original: *mut u8 = ptr::null_mut();
     let mut tx = TransactionCore::begin();
