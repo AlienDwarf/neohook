@@ -78,7 +78,10 @@ fn ffi_update_thread_accepts_current_thread_id() {
 #[test]
 fn ffi_update_thread_rejects_null_transaction() {
     let current_tid = unsafe { GetCurrentThreadId() };
-    assert_eq!(detours_transaction_update_thread(ptr::null_mut(), current_tid), 0);
+    assert_eq!(
+        detours_transaction_update_thread(ptr::null_mut(), current_tid),
+        0
+    );
 }
 
 #[test]
