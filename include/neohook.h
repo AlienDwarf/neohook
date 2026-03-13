@@ -32,29 +32,30 @@ DetourTransaction *detours_transaction_begin(void);
 /**
  * Opens, suspends, and tracks the thread identified by `thread_id`.
  *
- * `tx` must be a valid transaction pointer previously returned by
- * `detours_transaction_begin()`.
- *
- * `thread_id` must be a Win32 thread ID, not a thread handle.
- *
  * Returns `1` if the transaction pointer is valid and the request was accepted,
  * or `0` if `tx` is null or the transaction is no longer pending.
  *
  * Invalid, inaccessible, or skipped thread IDs are treated as non-fatal and
  * still return `1`, matching NeoHook's best-effort thread tracking behavior.
+ *
+ * # Safety
+ * `tx` must be a valid transaction pointer previously returned by
+ * `detours_transaction_begin()`.
  */
 int32_t detours_transaction_update_thread(DetourTransaction *tx, uint32_t thread_id);
 
 /**
  * Attaches an inline detour to the given transaction.
  *
- * `tx` must be a valid transaction pointer previously returned by
- * `detours_transaction_begin()`.
  *
  * Returns the trampoline pointer for the original function on success, or
  * null on failure.
  *
  * The returned trampoline can be used to call the original function body.
+ *
+ * # Safety
+ * `tx` must be a valid transaction pointer previously returned by
+ * `detours_transaction_begin()`.
  */
 uint8_t *detours_transaction_attach(DetourTransaction *tx, uint8_t *target, const uint8_t *detour);
 
@@ -62,25 +63,27 @@ uint8_t *detours_transaction_attach(DetourTransaction *tx, uint8_t *target, cons
  * Commits a detour transaction and returns an opaque handle to the installed
  * hooks.
  *
- * `tx` must be a valid transaction pointer previously returned by
- * `detours_transaction_begin()`. Ownership of `tx` is consumed by this
- * function, regardless of success or failure.
- *
  * On success, returns a non-null opaque handle that can be queried with
  * `detours_handle_len()` and `detours_handle_get_trampoline()`, and must
  * eventually be released with `detours_handle_unhook_and_free()`.
  *
  * Returns null if the transaction could not be committed.
+ *
+ * # Safety
+ * `tx` must be a valid transaction pointer previously returned by
+ * `detours_transaction_begin()`. Ownership of `tx` is consumed by this
+ * function, regardless of success or failure.
  */
 void *detours_transaction_commit(DetourTransaction *tx);
 
 /**
  * Returns the number of installed hooks stored in an opaque hook handle.
  *
+ * Returns `0` if `handle` is null.
+ *
+ * # Safety
  * `handle` must be a valid handle previously returned by
  * `detours_transaction_commit()`.
- *
- * Returns `0` if `handle` is null.
  */
 uintptr_t detours_handle_len(void *handle);
 
@@ -90,33 +93,65 @@ uintptr_t detours_handle_len(void *handle);
  * For inline hooks, this is the trampoline entry managed by NeoHook.
  * For IAT hooks, this is the original imported function pointer.
  *
+ * Returns null if `handle` is null or if `idx` is out of bounds.
+ *
+ * # Safety
  * `handle` must be a valid handle previously returned by
  * `detours_transaction_commit()`.
- *
- * Returns null if `handle` is null or if `idx` is out of bounds.
  */
 const uint8_t *detours_handle_get_original_ptr(void *handle, uintptr_t idx);
 
 /**
  * Unhooks all installed hooks referenced by `handle` and frees the handle.
  *
- * `handle` must be a valid handle previously returned by
- * `detours_transaction_commit()`.
- *
  * Dropping the internal hook vector triggers unhooking through RAII.
  *
  * Returns `1` on success and `0` if `handle` is null.
+ *
+ * # Safety
+ * `handle` must be a valid handle previously returned by
+ * `detours_transaction_commit()`.
  */
 int32_t detours_handle_unhook_and_free(void *handle);
 
+/**
+ * Attaches an IAT detour to the given transaction.
+ *
+ * Returns `1` on success and `0` on failure.
+ *
+ * # Safety
+ * `tx` must be a valid transaction pointer previously returned by
+ * `detours_transaction_begin()`. `h_module` must be a valid module handle
+ */
 int32_t detours_transaction_attach_iat(DetourTransaction *tx,
                                        void *h_module,
                                        const char *target_dll,
                                        const char *target_func,
                                        const uint8_t *detour);
 
+/**
+ * Suspends all threads in the current process except the calling thread and
+ * registers them to be resumed later as part of the transaction.
+ *
+ * Returns `1` if the transaction pointer is valid and the request was accepted,
+ * or `0` if `tx` is null or the transaction is no longer pending.
+ *
+ * # Safety
+ * `tx` must be a valid transaction pointer previously returned by
+ * `detours_transaction_begin()`.
+ */
 int32_t detours_transaction_update_all_threads(DetourTransaction *tx);
 
+/**
+ * Aborts the given transaction, discarding all pending hooks and resuming any
+ * tracked threads.
+ *
+ * Calling this on an already finished transaction has no effect.
+ *
+ * # Safety
+ *
+ * `tx` must be a valid transaction pointer previously returned by
+ */
 int32_t detours_transaction_abort(DetourTransaction *tx);
 
 #endif  /* NEOHOOK_H */
