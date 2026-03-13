@@ -1,6 +1,7 @@
 use neohook::TransactionCore;
 use std::error::Error;
 use std::ptr;
+use std::sync::OnceLock;
 
 type HWND = *mut core::ffi::c_void;
 type UINT = u32;
@@ -20,7 +21,7 @@ unsafe extern "system" {
 
 type MessageBoxAFn = unsafe extern "system" fn(HWND, *const u8, *const u8, UINT) -> INT;
 
-static mut ORIGINAL_MESSAGEBOXA: Option<MessageBoxAFn> = None;
+static ORIGINAL_MESSAGEBOXA: OnceLock<MessageBoxAFn> = OnceLock::new();
 
 unsafe extern "system" fn message_box_a_detour(
     hwnd: HWND,
@@ -30,7 +31,10 @@ unsafe extern "system" fn message_box_a_detour(
 ) -> INT {
     println!("[iat detour] MessageBoxA intercepted");
 
-    let original = unsafe { ORIGINAL_MESSAGEBOXA.expect("ORIGINAL_MESSAGEBOXA not initialized") };
+    let original = ORIGINAL_MESSAGEBOXA
+        .get()
+        .copied()
+        .expect("ORIGINAL_MESSAGEBOXA not initialized");
 
     let new_text = b"Hooked by NeoHook via IAT!\0";
     let new_caption = b"NeoHook IAT Example\0";
@@ -53,22 +57,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("GetModuleHandleA(NULL) failed".into());
     }
 
-    let mut original: *mut u8 = ptr::null_mut();
-
     let mut tx = TransactionCore::begin();
     tx.attach_iat(
         module,
         "USER32.dll",
         "MessageBoxA",
         message_box_a_detour as *const () as *const u8,
-        &mut original as *mut *mut u8,
     )?;
 
     let hooks = tx.commit()?;
 
-    unsafe {
-        ORIGINAL_MESSAGEBOXA = Some(std::mem::transmute::<*mut u8, MessageBoxAFn>(original));
-    }
+    let original =
+        unsafe { std::mem::transmute::<*const u8, MessageBoxAFn>(hooks[0].original_ptr()) };
+
+    let _ = ORIGINAL_MESSAGEBOXA.set(original);
 
     unsafe {
         MessageBoxA(

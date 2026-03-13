@@ -12,18 +12,22 @@
 use neohook::TransactionCore;
 use std::error::Error;
 use std::ptr;
+use std::sync::OnceLock;
 use std::time::Instant;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleA;
 use windows_sys::Win32::System::Threading::Sleep;
 
 type SleepFn = unsafe extern "system" fn(u32);
 
-static mut ORIGINAL_SLEEP: Option<SleepFn> = None;
+static ORIGINAL_SLEEP: OnceLock<SleepFn> = OnceLock::new();
 
 unsafe extern "system" fn sleep_detour(ms: u32) {
     println!("[iat detour] Sleep({ms}) intercepted");
 
-    let original = unsafe { ORIGINAL_SLEEP.expect("ORIGINAL_SLEEP not initialized") };
+    let original = ORIGINAL_SLEEP
+        .get()
+        .copied()
+        .expect("ORIGINAL_SLEEP not initialized");
 
     let shortened = ms.min(100);
     println!("[iat detour] forwarding to original Sleep({shortened})");
@@ -44,7 +48,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         before.elapsed().as_millis()
     );
 
-    let mut original: *mut u8 = ptr::null_mut();
     let mut tx = TransactionCore::begin();
 
     let dll_candidates = [
@@ -57,13 +60,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     for dll in dll_candidates {
         if tx
-            .attach_iat(
-                module,
-                dll,
-                "Sleep",
-                sleep_detour as *const () as *const u8,
-                &mut original as *mut *mut u8,
-            )
+            .attach_iat(module, dll, "Sleep", sleep_detour as *const () as *const u8)
             .is_ok()
         {
             hooked_from = Some(dll);
@@ -76,9 +73,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let hooks = tx.commit()?;
 
-    unsafe {
-        ORIGINAL_SLEEP = Some(std::mem::transmute::<*mut u8, SleepFn>(original));
-    }
+    let original = unsafe { std::mem::transmute::<*const u8, SleepFn>(hooks[0].original_ptr()) };
+    let _ = ORIGINAL_SLEEP.set(original);
 
     let after = Instant::now();
     unsafe { Sleep(500) };

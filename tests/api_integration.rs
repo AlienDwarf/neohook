@@ -31,27 +31,27 @@ fn ffi_transaction_happy_path_and_null_guards() {
 
     assert_eq!(detours_handle_len(handle), 1);
 
-    let trampoline = detours_handle_get_trampoline(handle, 0);
-    assert!(!trampoline.is_null());
+    let original = detours_handle_get_original_ptr(handle, 0);
+    assert!(!original.is_null());
 
     assert_eq!(detours_handle_unhook_and_free(handle), 1);
 
     assert!(detours_transaction_attach(ptr::null_mut(), ptr::null_mut(), ptr::null()).is_null());
     assert!(detours_transaction_commit(ptr::null_mut()).is_null());
     assert_eq!(detours_handle_len(ptr::null_mut()), 0);
-    assert!(detours_handle_get_trampoline(ptr::null_mut(), 0).is_null());
+    assert!(detours_handle_get_original_ptr(ptr::null_mut(), 0).is_null());
     assert_eq!(detours_handle_unhook_and_free(ptr::null_mut()), 0);
 }
 
 #[test]
-fn ffi_get_trampoline_returns_null_for_out_of_bounds_index() {
+fn ffi_get_original_ptr_returns_null_for_out_of_bounds_index() {
     let tx = detours_transaction_begin();
     assert!(!tx.is_null());
 
     let handle = detours_transaction_commit(tx);
     assert!(!handle.is_null());
 
-    assert!(detours_handle_get_trampoline(handle, 99).is_null());
+    assert!(detours_handle_get_original_ptr(handle, 99).is_null());
 
     assert_eq!(detours_handle_unhook_and_free(handle), 1);
 }
