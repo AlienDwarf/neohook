@@ -19,43 +19,47 @@ pub fn detour_func(a: i32) -> i32 {
 
 #[test]
 fn ffi_transaction_happy_path_and_null_guards() {
-    let tx = detours_transaction_begin();
-    assert!(!tx.is_null());
+    unsafe {
+        let tx = detours_transaction_begin();
+        assert!(!tx.is_null());
 
-    let target = target_func as *mut u8;
-    let tramp = detours_transaction_attach(tx, target, detour_func as *const u8);
-    assert!(!tramp.is_null());
+        let target = target_func as *mut u8;
+        let tramp = detours_transaction_attach(tx, target, detour_func as *const u8);
+        assert!(!tramp.is_null());
 
-    let handle = detours_transaction_commit(tx);
-    assert!(!handle.is_null());
+        let handle = detours_transaction_commit(tx);
+        assert!(!handle.is_null());
 
-    assert_eq!(detours_handle_len(handle), 1);
+        assert_eq!(detours_handle_len(handle), 1);
 
-    let original = detours_handle_get_original_ptr(handle, 0);
-    assert!(!original.is_null());
+        let original = detours_handle_get_original_ptr(handle, 0);
+        assert!(!original.is_null());
 
-    assert_eq!(detours_handle_unhook_and_free(handle), 1);
+        assert_eq!(detours_handle_unhook_and_free(handle), 1);
 
-    assert!(detours_transaction_attach(ptr::null_mut(), ptr::null_mut(), ptr::null()).is_null());
-    assert!(detours_transaction_commit(ptr::null_mut()).is_null());
-    assert_eq!(detours_handle_len(ptr::null_mut()), 0);
-    assert!(detours_handle_get_original_ptr(ptr::null_mut(), 0).is_null());
-    assert_eq!(detours_handle_unhook_and_free(ptr::null_mut()), 0);
+        assert!(
+            detours_transaction_attach(ptr::null_mut(), ptr::null_mut(), ptr::null()).is_null()
+        );
+        assert!(detours_transaction_commit(ptr::null_mut()).is_null());
+        assert_eq!(detours_handle_len(ptr::null_mut()), 0);
+        assert!(detours_handle_get_original_ptr(ptr::null_mut(), 0).is_null());
+        assert_eq!(detours_handle_unhook_and_free(ptr::null_mut()), 0);
+    }
 }
 
 #[test]
 fn ffi_get_original_ptr_returns_null_for_out_of_bounds_index() {
     let tx = detours_transaction_begin();
     assert!(!tx.is_null());
+    unsafe {
+        let handle = detours_transaction_commit(tx);
+        assert!(!handle.is_null());
 
-    let handle = detours_transaction_commit(tx);
-    assert!(!handle.is_null());
+        assert!(detours_handle_get_original_ptr(handle, 99).is_null());
 
-    assert!(detours_handle_get_original_ptr(handle, 99).is_null());
-
-    assert_eq!(detours_handle_unhook_and_free(handle), 1);
+        assert_eq!(detours_handle_unhook_and_free(handle), 1);
+    }
 }
-
 #[test]
 fn transaction_update_thread_accepts_current_thread() {
     let mut tx = DetourTransaction::begin();
