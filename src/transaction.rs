@@ -54,9 +54,12 @@ enum TargetKind {
     ManagedGateway,
 }
 
-/// Struct to hold data for an inline hook, which includes the target function address,
-/// the detour function address, the trampoline address,
-/// the length of given bytes, the type of jump to use, and the original bytes that were overwritten.
+/// Prepared metadata for a pending inline hook.
+///
+/// This contains everything needed to install an inline hook during
+/// [`TransactionCore::commit`], including the target and detour addresses,
+/// trampoline allocation, stolen byte information, and the original bytes
+/// required for rollback or unhook.
 pub struct InlineData {
     pub target: *mut u8,
     pub detour: *const u8,
@@ -77,7 +80,6 @@ pub enum PendingHook {
         target_dll: String,
         target_func: String,
         detour: *const u8,
-        orig_out: *mut *mut u8,
     },
 }
 
@@ -89,8 +91,11 @@ pub enum Hook {
 }
 
 impl Hook {
-    /// Returns the original function pointer for this detour, which can be used to call the original function.
-    /// For an inline hook, this is the pointer to the trampoline. For an IAT hook, this is the original function pointer stored in the IAT.
+    /// Returns the original function pointer associated with this hook.
+    ///
+    /// For inline hooks, this is the trampoline entry managed by NeoHook.
+    /// For IAT hooks, this is the original imported function pointer that was
+    /// stored in the import table before patching.
     pub fn original_ptr(&self) -> *const u8 {
         match self {
             Hook::Inline(h) => h.original_ptr(),
@@ -245,6 +250,13 @@ pub struct TransactionCore {
 }
 
 impl TransactionCore {
+    /// Creates a new pending detour transaction.
+    ///
+    /// The transaction can collect inline and IAT hooks, suspend threads,
+    /// and later apply all queued hooks atomically with [`Self::commit`].
+    ///
+    /// Any tracked resources are cleaned up automatically if the transaction
+    /// is dropped while still pending.
     pub fn begin() -> Self {
         Self {
             threads: Vec::new(),
@@ -255,49 +267,88 @@ impl TransactionCore {
         }
     }
 
-    /// Suspends the given thread and adds it to the list of threads to be resumed later.
-    pub fn update_thread(&mut self, h_thread: HANDLE) -> Result<(), DetourError> {
+    /// Opens, suspends, and tracks the thread identified by `thread_id`.
+    ///
+    /// Note: `thread_id` must be a Win32 thread ID, not a `HANDLE`.
+    ///
+    /// NeoHook opens the thread handle internally and owns it for the remainder of the transaction.
+    ///
+    /// The calling thread is ignored and will never be suspended. Invalid or
+    /// inaccessible thread IDs are also ignored so they do not abort the
+    /// transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(DetourError::NotStarted)` if the transaction is no longer
+    /// pending.
+    pub fn update_thread(&mut self, thread_id: u32) -> Result<(), DetourError> {
         if !self.is_pending {
             return Err(DetourError::NotStarted);
         }
         unsafe {
-            // 1. Check: ignore current thread
-            let tid = GetThreadId(h_thread);
-            if tid == 0 || tid == GetCurrentThreadId() {
-                // if tid = 0 then handle is invalid, ignore it
-                if tid == 0 {
-                    CloseHandle(h_thread);
-                }
+            if thread_id == 0 || thread_id == GetCurrentThreadId() {
                 return Ok(());
             }
 
-            // 2. Suspend the thread
+            let access_flags = THREAD_SUSPEND_RESUME
+                | THREAD_GET_CONTEXT
+                | THREAD_SET_CONTEXT
+                | THREAD_QUERY_INFORMATION;
+
+            let h_thread = OpenThread(access_flags, 0, thread_id);
+            if h_thread.is_null() {
+                // Ignore invalid thread IDs or inaccessible threads
+                return Ok(());
+            }
+
             if SuspendThread(h_thread) == u32::MAX {
-                // If we cant suspend the thread, we ignore it and close the handle
                 CloseHandle(h_thread);
                 return Ok(());
             }
-        }
 
-        self.threads.push(h_thread);
-        Ok(())
+            self.threads.push(h_thread);
+            Ok(())
+        }
     }
 
+    /// Suspends and tracks all threads in the current process except the calling
+    /// thread.
+    ///
+    /// Thread IDs are collected through [`crate::threads::ThreadEnumerator`], then
+    /// each thread is opened and suspended internally. Threads that cannot be
+    /// opened or suspended are skipped so that a single inaccessible thread does
+    /// not abort the transaction.
     pub fn update_all_threads(&mut self) {
-        let threads = crate::threads::ThreadEnumerator::enumerate_process_threads();
-        for h in threads {
-            // we ignore errors here
-            // so a single system threads cant cause the entire transaction to fail
-            let _ = self.update_thread(h);
+        let thread_ids = crate::threads::ThreadEnumerator::enumerate_process_threads();
+        for tid in thread_ids {
+            // Ignore per-thread failures so one inaccessible thread does not
+            // abort the whole transaction.
+            let _ = self.update_thread(tid);
         }
     }
 
-    /// Creates a pending inline hook for this transaction. The hook will not be applied until `commit()` is called.
+    /// Queues an inline hook.
+    ///
+    /// On success, returns a trampoline pointer that can be used to call the
+    /// original function.
+    ///
+    /// If the target is a managed gateway created by NeoHook, the hook is prepared
+    /// using gateway chaining instead of normal instruction stealing and
+    /// relocation.
+    ///
     /// # Parameters
-    /// - `target`: The address of the function to hook.
-    /// - `detour`: The address of the detour function that will be called instead of the original function.
-    /// # Returns
-    /// On success, returns a pointer to the trampoline that can be used to call the original function. On failure, returns a `DetourError`.
+    ///
+    /// - `target`: Address of the function or managed gateway to hook.
+    /// - `detour`: Address of the detour function.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(DetourError::NotStarted)` if the transaction is no longer
+    /// pending.
+    ///
+    /// Returns an error if the target or detour pointer is invalid, if the stolen
+    /// instruction sequence cannot be determined, or if trampoline allocation or
+    /// relocation fails.    
     pub fn attach(&mut self, target: *mut u8, detour: *const u8) -> Result<*mut u8, DetourError> {
         if !self.is_pending {
             return Err(DetourError::NotStarted);
@@ -431,22 +482,34 @@ impl TransactionCore {
         Ok(gateway)
     }
 
-    /// Creates a pending IAT hook for this transaction. The hook will not be applied until `commit()` is called.
+    /// Queues an IAT hook.
+    ///
+    /// The matching import entry is resolved immediately during preparation so the
+    /// transaction can fail early if the requested import does not exist.
+    ///
+    /// The original imported function pointer becomes available through the
+    /// installed [`Hook`] returned by [`Self::commit`].
+    ///
     /// # Parameters
-    /// - `h_module`: The handle to the module whose IAT should be hooked.
-    /// - `target_dll`: The name of the target DLL that is imported by the module.
-    /// - `target_func`: The name of the target function that is imported from the target DLL.
-    /// - `detour`: The address of the detour function that will be called instead of the original function.
-    /// - `orig_out`: A pointer to a variable that will receive the original function pointer from the IAT. This can be used to call the original function from the detour.
-    /// # Returns
-    /// On success, returns `Result<()>`. On failure, returns a `DetourError`.
+    ///
+    /// - `h_module`: Base handle of the module whose import table should be patched.
+    /// - `target_dll`: Name of the imported DLL to match.
+    /// - `target_func`: Name of the imported function to match.
+    /// - `detour`: Address of the detour function.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(DetourError::NotStarted)` if the transaction is no longer
+    /// pending.
+    ///
+    /// Returns an error if the module is invalid, if the import cannot be found,
+    /// or if the IAT hook cannot be prepared.
     pub fn attach_iat(
         &mut self,
         h_module: HMODULE,
         target_dll: &str,
         target_func: &str,
         detour: *const u8,
-        orig_out: *mut *mut u8,
     ) -> Result<(), DetourError> {
         if !self.is_pending {
             return Err(DetourError::NotStarted);
@@ -489,7 +552,6 @@ impl TransactionCore {
             target_dll: target_dll.to_string(),
             target_func: target_func.to_string(),
             detour,
-            orig_out,
         });
         Ok(())
     }
@@ -554,7 +616,6 @@ impl TransactionCore {
                     target_dll,
                     target_func,
                     detour,
-                    orig_out,
                 } => unsafe {
                     match crate::iat::IatHook::hook_import(
                         module,
@@ -563,10 +624,6 @@ impl TransactionCore {
                         detour,
                     ) {
                         Ok(original) => {
-                            if !orig_out.is_null() {
-                                *orig_out = original;
-                            }
-
                             installed.push(Hook::Iat(IatHook {
                                 module,
                                 dll_name: target_dll,
@@ -779,6 +836,10 @@ impl TransactionCore {
         }
     }
 
+    /// Aborts the transaction and discards all pending hooks.
+    ///
+    /// Any tracked threads are resumed and all temporary transaction state is
+    /// cleared. Calling this on a finished transaction has no effect.
     pub fn abort(&mut self) {
         if !self.is_pending {
             return;

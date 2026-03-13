@@ -128,9 +128,10 @@ impl IatHook {
         let image = unsafe { parse_loaded_module(h_module)? };
         let thunk = unsafe { find_import_thunk(&image, target_dll, target_func)? };
 
-        let original_fn = unsafe { thunk_function(thunk) as *mut u8 };
         let slot_ptr = unsafe { thunk_function_slot_ptr(thunk) };
         let slot_size = std::mem::size_of::<usize>();
+
+        let original_fn = unsafe { thunk_function(thunk) as *mut u8 };
 
         // Change the protection of the memory page containing the IAT entry to allow writing
         let mut old_protect = 0;
@@ -145,7 +146,9 @@ impl IatHook {
         }
 
         // HERE WE INSTALL THE HOOK
-        unsafe { set_thunk_function(thunk, detour_function) };
+        unsafe {
+            write_thunk_function_slot(slot_ptr, detour_function);
+        };
 
         let mut ignored: u32 = 0;
         let restore_success =
@@ -176,7 +179,7 @@ impl IatHook {
     ) -> Result<*mut *mut u8, IatHookError> {
         let image = unsafe { parse_loaded_module(h_module)? };
         let thunk = unsafe { find_import_thunk(&image, target_dll, target_func)? };
-        Ok(thunk as *mut *mut u8)
+        Ok(unsafe { thunk_function_slot_ptr(thunk) } as *mut *mut u8)
     }
 }
 
@@ -452,16 +455,16 @@ unsafe fn thunk_function_slot_ptr(thunk: *mut IMAGE_THUNK_DATA) -> *mut core::ff
     (unsafe { &mut (*thunk).u1.Function }) as *mut _ as *mut core::ffi::c_void
 }
 
+fn map_err(err: InternalIatHookError) -> IatHookError {
+    err.into()
+}
+
 #[cfg(target_arch = "x86")]
-unsafe fn set_thunk_function(thunk: *mut IMAGE_THUNK_DATA, detour: *const u8) {
-    (unsafe { *thunk }).u1.Function = detour as u32;
+unsafe fn write_thunk_function_slot(slot_ptr: *mut core::ffi::c_void, detour: *const u8) {
+    unsafe { std::ptr::write(slot_ptr as *mut u32, detour as u32) }
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe fn set_thunk_function(thunk: *mut IMAGE_THUNK_DATA, detour: *const u8) {
-    (unsafe { *thunk }).u1.Function = detour as u64;
-}
-
-fn map_err(err: InternalIatHookError) -> IatHookError {
-    err.into()
+unsafe fn write_thunk_function_slot(slot_ptr: *mut core::ffi::c_void, detour: *const u8) {
+    unsafe { std::ptr::write(slot_ptr as *mut u64, detour as u64) };
 }

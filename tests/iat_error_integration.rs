@@ -16,7 +16,6 @@ extern "system" fn dummy_detour() -> u32 {
 #[test]
 fn iat_attach_rejects_invalid_module_handles() {
     let mut tx = DetourTransaction::begin();
-    let mut orig_out: *mut u8 = ptr::null_mut();
 
     // Stack memory is not a valid PE module base.
     let mut dummy_data = 0u32;
@@ -27,7 +26,6 @@ fn iat_attach_rejects_invalid_module_handles() {
         "kernel32.dll",
         "GetTickCount",
         dummy_detour as *const u8,
-        &mut orig_out,
     );
     assert!(res_fake.is_err());
 
@@ -36,7 +34,6 @@ fn iat_attach_rejects_invalid_module_handles() {
         "kernel32.dll",
         "GetTickCount",
         dummy_detour as *const u8,
-        &mut orig_out,
     );
     assert!(res_null.is_err());
 }
@@ -44,7 +41,6 @@ fn iat_attach_rejects_invalid_module_handles() {
 #[test]
 fn iat_attach_rejects_nonexistent_import_name() {
     let mut tx = DetourTransaction::begin();
-    let mut orig_out: *mut u8 = ptr::null_mut();
 
     let kernel32_w = wide_null("kernel32.dll");
     let h_k32 = unsafe { GetModuleHandleW(kernel32_w.as_ptr()) };
@@ -55,7 +51,6 @@ fn iat_attach_rejects_nonexistent_import_name() {
         "kernel32.dll",
         "FunctionThatDoesNotExist_123",
         dummy_detour as *const u8,
-        &mut orig_out,
     );
 
     assert!(res.is_err());
@@ -64,7 +59,6 @@ fn iat_attach_rejects_nonexistent_import_name() {
 #[test]
 fn iat_attach_can_hook_known_import_if_present() {
     let mut tx = DetourTransaction::begin();
-    let mut orig_ptr: *mut u8 = ptr::null_mut();
 
     let h_exe: HMODULE = unsafe { GetModuleHandleW(ptr::null()) };
     assert!(!h_exe.is_null());
@@ -81,7 +75,7 @@ fn iat_attach_can_hook_known_import_if_present() {
     let mut attached = false;
 
     for (dll, func) in candidates {
-        let res = tx.attach_iat(h_exe, dll, func, dummy_detour as *const u8, &mut orig_ptr);
+        let res = tx.attach_iat(h_exe, dll, func, dummy_detour as *const u8);
 
         if res.is_ok() {
             attached = true;

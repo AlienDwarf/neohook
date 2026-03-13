@@ -30,6 +30,22 @@ typedef struct DetourTransaction DetourTransaction;
 DetourTransaction *detours_transaction_begin(void);
 
 /**
+ * Opens, suspends, and tracks the thread identified by `thread_id`.
+ *
+ * `tx` must be a valid transaction pointer previously returned by
+ * `detours_transaction_begin()`.
+ *
+ * `thread_id` must be a Win32 thread ID, not a thread handle.
+ *
+ * Returns `1` if the transaction pointer is valid and the request was accepted,
+ * or `0` if `tx` is null or the transaction is no longer pending.
+ *
+ * Invalid, inaccessible, or skipped thread IDs are treated as non-fatal and
+ * still return `1`, matching NeoHook's best-effort thread tracking behavior.
+ */
+int32_t detours_transaction_update_thread(DetourTransaction *tx, uint32_t thread_id);
+
+/**
  * Attaches an inline detour to the given transaction.
  *
  * `tx` must be a valid transaction pointer previously returned by
@@ -69,17 +85,17 @@ void *detours_transaction_commit(DetourTransaction *tx);
 uintptr_t detours_handle_len(void *handle);
 
 /**
- * Returns the trampoline pointer (that is, the original function entry) for
- * the hook at `idx`.
+ * Returns the original function pointer associated with the hook at `idx`.
  *
- * This works for both inline hooks and IAT hooks.
+ * For inline hooks, this is the trampoline entry managed by NeoHook.
+ * For IAT hooks, this is the original imported function pointer.
  *
  * `handle` must be a valid handle previously returned by
  * `detours_transaction_commit()`.
  *
  * Returns null if `handle` is null or if `idx` is out of bounds.
  */
-const uint8_t *detours_handle_get_trampoline(void *handle, uintptr_t idx);
+const uint8_t *detours_handle_get_original_ptr(void *handle, uintptr_t idx);
 
 /**
  * Unhooks all installed hooks referenced by `handle` and frees the handle.
@@ -92,5 +108,15 @@ const uint8_t *detours_handle_get_trampoline(void *handle, uintptr_t idx);
  * Returns `1` on success and `0` if `handle` is null.
  */
 int32_t detours_handle_unhook_and_free(void *handle);
+
+int32_t detours_transaction_attach_iat(DetourTransaction *tx,
+                                       void *h_module,
+                                       const char *target_dll,
+                                       const char *target_func,
+                                       const uint8_t *detour);
+
+int32_t detours_transaction_update_all_threads(DetourTransaction *tx);
+
+int32_t detours_transaction_abort(DetourTransaction *tx);
 
 #endif  /* NEOHOOK_H */

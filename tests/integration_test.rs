@@ -1,7 +1,6 @@
 #[cfg(all(test, windows))]
 mod tests {
     use neohook::alloc::TrampolineAlloc;
-    use neohook::api;
     use neohook::disasm::Disassembler;
     use neohook::mem;
     use neohook::{DetourError, DetourTransaction};
@@ -15,18 +14,6 @@ mod tests {
     fn detour_1() -> i32 {
         std::hint::black_box(100);
         1
-    }
-
-    #[inline(never)]
-    fn target_func_add(a: i32, b: i32) -> i32 {
-        std::hint::black_box(a) + std::hint::black_box(b)
-    }
-
-    #[inline(never)]
-    fn hook_func_add(a: i32, b: i32) -> i32 {
-        std::hint::black_box(a);
-        std::hint::black_box(b);
-        1000
     }
 
     #[inline(never)]
@@ -177,40 +164,6 @@ mod tests {
         hook.unhook().expect("unhook failed");
 
         assert_eq!(target_for_lifecycle(10, 10), 21);
-    }
-
-    #[test]
-    #[ignore]
-    fn ffi_handle_smoke() {
-        let tx = api::detours_transaction_begin();
-        assert!(!tx.is_null(), "detours_transaction_begin returned null");
-
-        let target_ptr = target_func_add as *mut u8;
-        let hook_ptr = hook_func_add as *const u8;
-
-        let trampoline = api::detours_transaction_attach(tx, target_ptr, hook_ptr);
-        assert!(
-            !trampoline.is_null(),
-            "detours_transaction_attach returned null"
-        );
-
-        let handle = api::detours_transaction_commit(tx);
-        assert!(
-            !handle.is_null(),
-            "detours_transaction_commit returned null"
-        );
-
-        let len = api::detours_handle_len(handle);
-        assert_eq!(len, 1, "expected exactly one installed detour");
-
-        let trampoline_ptr = api::detours_handle_get_trampoline(handle, 0);
-        assert!(
-            !trampoline_ptr.is_null(),
-            "detours_handle_get_trampoline returned null"
-        );
-
-        let res = api::detours_handle_unhook_and_free(handle);
-        assert_eq!(res, 1, "detours_handle_unhook_and_free failed");
     }
 
     #[test]

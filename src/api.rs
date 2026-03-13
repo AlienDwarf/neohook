@@ -33,8 +33,10 @@ impl DetourTransaction {
         }
     }
 
-    /// Suspends the given thread and adds it to the set of threads that will be
-    /// resumed when the transaction is committed or aborted.
+    /// Suspends the given thread and tracks it for the duration of the transaction.
+    /// Will be resumed when the transaction is committed or aborted.
+    ///
+    /// The caller only provides the thread ID. NeoHook opens and owns the required thread handle internally.
     ///
     /// This can be used to keep other threads from executing code while hooks
     /// are being installed.
@@ -43,14 +45,11 @@ impl DetourTransaction {
     ///
     /// Returns `Err(DetourError::NotStarted)` if the transaction has already
     /// been committed or aborted.
-    pub fn update_thread(
-        &mut self,
-        h: windows_sys::Win32::Foundation::HANDLE,
-    ) -> Result<(), DetourError> {
+    pub fn update_thread(&mut self, thread_id: u32) -> Result<(), DetourError> {
         self.inner
             .as_mut()
             .ok_or(DetourError::NotStarted)?
-            .update_thread(h)
+            .update_thread(thread_id)
     }
 
     /// Suspends all threads in the current process except the calling thread and
@@ -100,12 +99,11 @@ impl DetourTransaction {
         target_dll: &str,
         target_func: &str,
         detour: *const u8,
-        orig_out: *mut *mut u8,
     ) -> Result<(), DetourError> {
         self.inner
             .as_mut()
             .ok_or(DetourError::NotStarted)?
-            .attach_iat(h_module, target_dll, target_func, detour, orig_out)
+            .attach_iat(h_module, target_dll, target_func, detour)
     }
 
     /// Commits the transaction and returns the installed hooks.
@@ -157,6 +155,31 @@ impl Drop for DetourTransaction {
 #[unsafe(no_mangle)]
 pub extern "C" fn detours_transaction_begin() -> *mut DetourTransaction {
     Box::into_raw(Box::new(DetourTransaction::begin()))
+}
+
+/// Opens, suspends, and tracks the thread identified by `thread_id`.
+///
+/// `tx` must be a valid transaction pointer previously returned by
+/// `detours_transaction_begin()`.
+///
+/// `thread_id` must be a Win32 thread ID, not a thread handle.
+///
+/// Returns `1` if the transaction pointer is valid and the request was accepted,
+/// or `0` if `tx` is null or the transaction is no longer pending.
+///
+/// Invalid, inaccessible, or skipped thread IDs are treated as non-fatal and
+/// still return `1`, matching NeoHook's best-effort thread tracking behavior.
+#[unsafe(no_mangle)]
+pub extern "C" fn detours_transaction_update_thread(
+    tx: *mut DetourTransaction,
+    thread_id: u32,
+) -> i32 {
+    if tx.is_null() {
+        return 0;
+    }
+
+    let tx_ref = unsafe { &mut *tx };
+    tx_ref.update_thread(thread_id).map(|_| 1).unwrap_or(0)
 }
 
 /// Attaches an inline detour to the given transaction.
@@ -223,17 +246,17 @@ pub extern "C" fn detours_handle_len(handle: *mut c_void) -> usize {
     vec.len()
 }
 
-/// Returns the trampoline pointer (that is, the original function entry) for
-/// the hook at `idx`.
+/// Returns the original function pointer associated with the hook at `idx`.
 ///
-/// This works for both inline hooks and IAT hooks.
+/// For inline hooks, this is the trampoline entry managed by NeoHook.
+/// For IAT hooks, this is the original imported function pointer.
 ///
 /// `handle` must be a valid handle previously returned by
 /// `detours_transaction_commit()`.
 ///
 /// Returns null if `handle` is null or if `idx` is out of bounds.
 #[unsafe(no_mangle)]
-pub extern "C" fn detours_handle_get_trampoline(handle: *mut c_void, idx: usize) -> *const u8 {
+pub extern "C" fn detours_handle_get_original_ptr(handle: *mut c_void, idx: usize) -> *const u8 {
     if handle.is_null() {
         return std::ptr::null();
     }
@@ -259,5 +282,62 @@ pub extern "C" fn detours_handle_unhook_and_free(handle: *mut c_void) -> i32 {
     }
     let _vec_box = unsafe { Box::from_raw(handle as *mut Vec<Hook>) };
     // Dropping the vector drops all hooks, which triggers unhooking via RAII.
+    1
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn detours_transaction_attach_iat(
+    tx: *mut DetourTransaction,
+    h_module: *mut core::ffi::c_void,
+    target_dll: *const std::ffi::c_char,
+    target_func: *const std::ffi::c_char,
+    detour: *const u8,
+) -> i32 {
+    if tx.is_null() || target_dll.is_null() || target_func.is_null() || detour.is_null() {
+        return 0;
+    }
+
+    let tx_ref = unsafe { &mut *tx };
+
+    let target_dll = match unsafe { std::ffi::CStr::from_ptr(target_dll) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+
+    let target_func = match unsafe { std::ffi::CStr::from_ptr(target_func) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+
+    tx_ref
+        .attach_iat(
+            h_module as windows_sys::Win32::Foundation::HMODULE,
+            target_dll,
+            target_func,
+            detour,
+        )
+        .map(|_| 1)
+        .unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn detours_transaction_update_all_threads(tx: *mut DetourTransaction) -> i32 {
+    if tx.is_null() {
+        return 0;
+    }
+
+    let tx_ref = unsafe { &mut *tx };
+    tx_ref.update_all_threads();
+    1
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn detours_transaction_abort(tx: *mut DetourTransaction) -> i32 {
+    if tx.is_null() {
+        return 0;
+    }
+
+    let mut tx_box = unsafe { Box::from_raw(tx) };
+    tx_box.abort();
     1
 }
