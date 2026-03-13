@@ -349,6 +349,10 @@ impl TransactionCore {
     /// Returns an error if the target or detour pointer is invalid, if the stolen
     /// instruction sequence cannot be determined, or if trampoline allocation or
     /// relocation fails.    
+    ///
+    /// # Safety
+    /// The caller must ensure that `target` and `detour` are valid pointers. NeoHook performs basic validation but does not guarantee that the pointers are valid or that the memory they point to is properly aligned or accessible. Invalid pointers may cause undefined behavior, including crashes.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn attach(&mut self, target: *mut u8, detour: *const u8) -> Result<*mut u8, DetourError> {
         if !self.is_pending {
             return Err(DetourError::NotStarted);
@@ -439,7 +443,7 @@ impl TransactionCore {
         }?;
 
         // MANAGED GATEWAYS FOR HOOK CHAINING
-        let tramp_capacity = 128 as usize;
+        let tramp_capacity: usize = 128;
         let trampoline_handle = unsafe {
             // Allocate memory. rwx is required for the trampoline, we switch to rx later
             TrampolineAlloc::alloc_nearby_trampoline(target, tramp_capacity)
@@ -504,6 +508,10 @@ impl TransactionCore {
     ///
     /// Returns an error if the module is invalid, if the import cannot be found,
     /// or if the IAT hook cannot be prepared.
+    ///
+    /// # Safety
+    /// The caller must ensure that `h_module` is a valid module handle, that `target_dll` and `target_func` are valid strings corresponding to an import in the module's IAT, and that `detour` is a valid function pointer. NeoHook performs basic validation but does not guarantee that the parameters are valid or that the memory they point to is properly aligned or accessible. Invalid parameters may cause undefined behavior, including crashes.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn attach_iat(
         &mut self,
         h_module: HMODULE,

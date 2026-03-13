@@ -20,6 +20,9 @@ impl Disassembler {
         }
     }
     /// Calculates the total length of instructions at `address` until at least `min_size` bytes are covered.
+    ///
+    /// # Safety
+    /// The caller must ensure that `address` is a valid pointer
     pub unsafe fn get_instruction_len(
         address: *const u8,
         min_size: usize,
@@ -63,6 +66,9 @@ impl Disassembler {
 
     /// Checks if the instruction at `address` is a relative instruction (e.g., JMP, CALL with relative addressing).
     /// This is important because such instructions need to be relocated when moved to a trampoline.
+    ///
+    /// # Safety
+    /// The caller must ensure that `address` is a valid pointer
     pub unsafe fn is_relative(address: *const u8) -> bool {
         let bitness = Self::bitness();
         // We only analyze the first instruction at the address, so we read a buffer of 15 bytes (max instruction length) for analysis

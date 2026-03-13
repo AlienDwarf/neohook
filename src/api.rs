@@ -159,18 +159,17 @@ pub extern "C" fn detours_transaction_begin() -> *mut DetourTransaction {
 
 /// Opens, suspends, and tracks the thread identified by `thread_id`.
 ///
-/// `tx` must be a valid transaction pointer previously returned by
-/// `detours_transaction_begin()`.
-///
-/// `thread_id` must be a Win32 thread ID, not a thread handle.
-///
 /// Returns `1` if the transaction pointer is valid and the request was accepted,
 /// or `0` if `tx` is null or the transaction is no longer pending.
 ///
 /// Invalid, inaccessible, or skipped thread IDs are treated as non-fatal and
 /// still return `1`, matching NeoHook's best-effort thread tracking behavior.
+///
+/// # Safety
+/// `tx` must be a valid transaction pointer previously returned by
+/// `detours_transaction_begin()`.
 #[unsafe(no_mangle)]
-pub extern "C" fn detours_transaction_update_thread(
+pub unsafe extern "C" fn detours_transaction_update_thread(
     tx: *mut DetourTransaction,
     thread_id: u32,
 ) -> i32 {
@@ -184,15 +183,17 @@ pub extern "C" fn detours_transaction_update_thread(
 
 /// Attaches an inline detour to the given transaction.
 ///
-/// `tx` must be a valid transaction pointer previously returned by
-/// `detours_transaction_begin()`.
 ///
 /// Returns the trampoline pointer for the original function on success, or
 /// null on failure.
 ///
 /// The returned trampoline can be used to call the original function body.
+///
+/// # Safety
+/// `tx` must be a valid transaction pointer previously returned by
+/// `detours_transaction_begin()`.
 #[unsafe(no_mangle)]
-pub extern "C" fn detours_transaction_attach(
+pub unsafe extern "C" fn detours_transaction_attach(
     tx: *mut DetourTransaction,
     target: *mut u8,
     detour: *const u8,
@@ -210,17 +211,18 @@ pub extern "C" fn detours_transaction_attach(
 /// Commits a detour transaction and returns an opaque handle to the installed
 /// hooks.
 ///
-/// `tx` must be a valid transaction pointer previously returned by
-/// `detours_transaction_begin()`. Ownership of `tx` is consumed by this
-/// function, regardless of success or failure.
-///
 /// On success, returns a non-null opaque handle that can be queried with
 /// `detours_handle_len()` and `detours_handle_get_trampoline()`, and must
 /// eventually be released with `detours_handle_unhook_and_free()`.
 ///
 /// Returns null if the transaction could not be committed.
+///
+/// # Safety
+/// `tx` must be a valid transaction pointer previously returned by
+/// `detours_transaction_begin()`. Ownership of `tx` is consumed by this
+/// function, regardless of success or failure.
 #[unsafe(no_mangle)]
-pub extern "C" fn detours_transaction_commit(tx: *mut DetourTransaction) -> *mut c_void {
+pub unsafe extern "C" fn detours_transaction_commit(tx: *mut DetourTransaction) -> *mut c_void {
     if tx.is_null() {
         return std::ptr::null_mut();
     }
@@ -233,12 +235,13 @@ pub extern "C" fn detours_transaction_commit(tx: *mut DetourTransaction) -> *mut
 
 /// Returns the number of installed hooks stored in an opaque hook handle.
 ///
+/// Returns `0` if `handle` is null.
+///
+/// # Safety
 /// `handle` must be a valid handle previously returned by
 /// `detours_transaction_commit()`.
-///
-/// Returns `0` if `handle` is null.
 #[unsafe(no_mangle)]
-pub extern "C" fn detours_handle_len(handle: *mut c_void) -> usize {
+pub unsafe extern "C" fn detours_handle_len(handle: *mut c_void) -> usize {
     if handle.is_null() {
         return 0;
     }
@@ -251,12 +254,16 @@ pub extern "C" fn detours_handle_len(handle: *mut c_void) -> usize {
 /// For inline hooks, this is the trampoline entry managed by NeoHook.
 /// For IAT hooks, this is the original imported function pointer.
 ///
+/// Returns null if `handle` is null or if `idx` is out of bounds.
+///
+/// # Safety
 /// `handle` must be a valid handle previously returned by
 /// `detours_transaction_commit()`.
-///
-/// Returns null if `handle` is null or if `idx` is out of bounds.
 #[unsafe(no_mangle)]
-pub extern "C" fn detours_handle_get_original_ptr(handle: *mut c_void, idx: usize) -> *const u8 {
+pub unsafe extern "C" fn detours_handle_get_original_ptr(
+    handle: *mut c_void,
+    idx: usize,
+) -> *const u8 {
     if handle.is_null() {
         return std::ptr::null();
     }
@@ -269,14 +276,15 @@ pub extern "C" fn detours_handle_get_original_ptr(handle: *mut c_void, idx: usiz
 
 /// Unhooks all installed hooks referenced by `handle` and frees the handle.
 ///
-/// `handle` must be a valid handle previously returned by
-/// `detours_transaction_commit()`.
-///
 /// Dropping the internal hook vector triggers unhooking through RAII.
 ///
 /// Returns `1` on success and `0` if `handle` is null.
+///
+/// # Safety
+/// `handle` must be a valid handle previously returned by
+/// `detours_transaction_commit()`.
 #[unsafe(no_mangle)]
-pub extern "C" fn detours_handle_unhook_and_free(handle: *mut c_void) -> i32 {
+pub unsafe extern "C" fn detours_handle_unhook_and_free(handle: *mut c_void) -> i32 {
     if handle.is_null() {
         return 0;
     }
@@ -285,8 +293,15 @@ pub extern "C" fn detours_handle_unhook_and_free(handle: *mut c_void) -> i32 {
     1
 }
 
+/// Attaches an IAT detour to the given transaction.
+///
+/// Returns `1` on success and `0` on failure.
+///
+/// # Safety
+/// `tx` must be a valid transaction pointer previously returned by
+/// `detours_transaction_begin()`. `h_module` must be a valid module handle
 #[unsafe(no_mangle)]
-pub extern "C" fn detours_transaction_attach_iat(
+pub unsafe extern "C" fn detours_transaction_attach_iat(
     tx: *mut DetourTransaction,
     h_module: *mut core::ffi::c_void,
     target_dll: *const std::ffi::c_char,
@@ -320,8 +335,17 @@ pub extern "C" fn detours_transaction_attach_iat(
         .unwrap_or(0)
 }
 
+/// Suspends all threads in the current process except the calling thread and
+/// registers them to be resumed later as part of the transaction.
+///
+/// Returns `1` if the transaction pointer is valid and the request was accepted,
+/// or `0` if `tx` is null or the transaction is no longer pending.
+///
+/// # Safety
+/// `tx` must be a valid transaction pointer previously returned by
+/// `detours_transaction_begin()`.
 #[unsafe(no_mangle)]
-pub extern "C" fn detours_transaction_update_all_threads(tx: *mut DetourTransaction) -> i32 {
+pub unsafe extern "C" fn detours_transaction_update_all_threads(tx: *mut DetourTransaction) -> i32 {
     if tx.is_null() {
         return 0;
     }
@@ -331,8 +355,16 @@ pub extern "C" fn detours_transaction_update_all_threads(tx: *mut DetourTransact
     1
 }
 
+/// Aborts the given transaction, discarding all pending hooks and resuming any
+/// tracked threads.
+///
+/// Calling this on an already finished transaction has no effect.
+///
+/// # Safety
+///
+/// `tx` must be a valid transaction pointer previously returned by
 #[unsafe(no_mangle)]
-pub extern "C" fn detours_transaction_abort(tx: *mut DetourTransaction) -> i32 {
+pub unsafe extern "C" fn detours_transaction_abort(tx: *mut DetourTransaction) -> i32 {
     if tx.is_null() {
         return 0;
     }

@@ -13,8 +13,9 @@ impl TrampolineAlloc {
     /// Allocates a region of memory that is within 2GB of the target address, which is necessary for x86 relative jumps.
     /// - `target`: The address of the function we want to hook
     /// - `size`: The size of the memory region we want to allocate for the trampoline
+    ///
     /// # Safety
-    /// This function performs raw pointer arithmetic. The caller must ensure that `target` is a valid pointer
+    /// The caller must ensure that `target` is a valid pointer
     pub unsafe fn alloc_nearby(target: *const u8, size: usize) -> Option<*mut u8> {
         // safety check if size is 0 return none
         if size == 0 {
@@ -165,16 +166,15 @@ impl Trampoline {
 impl TrampolineAlloc {
     /// Allocate a `Trampoline` structure near `target` with RWX permissions.
     /// Caller should make_rx()
+    ///
+    /// # Safety
+    /// The caller must ensure that `target` is a valid pointer
     pub unsafe fn alloc_nearby_trampoline(target: *const u8, size: usize) -> Option<Trampoline> {
         if target.is_null() {
             return None;
         }
 
-        if let Some(p) = unsafe { Self::alloc_nearby(target, size) } {
-            Some(Trampoline { ptr: p, size })
-        } else {
-            None
-        }
+        unsafe { Self::alloc_nearby(target, size) }.map(|p| Trampoline { ptr: p, size })
     }
 }
 

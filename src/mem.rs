@@ -26,6 +26,9 @@ fn detour_page_protect_adjust_execute(old_protect: u32, new_protect: u32) -> u32
 /// Changes the protection of a region of memory,
 /// ensuring that if the original protection included execute permissions,
 /// the new protection will also include execute permissions.
+///
+/// # Safety
+/// The caller must ensure that `address` is a valid pointer
 pub unsafe fn virtual_protect_same_execute(
     address: *mut u8,
     size: usize,
@@ -51,6 +54,9 @@ pub unsafe fn virtual_protect_same_execute(
 
 /// Atomically (as much as possible) write `len` bytes from `src` into `target`.
 /// Returns true on success. This helper preserves execute flags when changing protections.
+///
+/// # Safety
+/// The caller must ensure that `target` and `src` are valid pointers
 pub unsafe fn write_memory_atomic(target: *mut u8, src: *const u8, len: usize) -> Option<Vec<u8>> {
     if target.is_null() || src.is_null() || len == 0 {
         return None;
