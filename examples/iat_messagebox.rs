@@ -3,15 +3,15 @@ use std::error::Error;
 use std::ptr;
 use std::sync::OnceLock;
 
-type HWND = *mut core::ffi::c_void;
-type UINT = u32;
-type INT = i32;
+type Hwnd = *mut core::ffi::c_void;
+type Uint = u32;
+type Int = i32;
 
-const MB_OK: UINT = 0x0000;
+const MB_OK: Uint = 0x0000;
 
 #[link(name = "user32")]
 unsafe extern "system" {
-    fn MessageBoxA(hwnd: HWND, text: *const u8, caption: *const u8, ty: UINT) -> INT;
+    fn MessageBoxA(hwnd: Hwnd, text: *const u8, caption: *const u8, ty: Uint) -> Int;
 }
 
 #[link(name = "kernel32")]
@@ -19,16 +19,16 @@ unsafe extern "system" {
     fn GetModuleHandleA(name: *const u8) -> *mut core::ffi::c_void;
 }
 
-type MessageBoxAFn = unsafe extern "system" fn(HWND, *const u8, *const u8, UINT) -> INT;
+type MessageBoxAFn = unsafe extern "system" fn(Hwnd, *const u8, *const u8, Uint) -> Int;
 
 static ORIGINAL_MESSAGEBOXA: OnceLock<MessageBoxAFn> = OnceLock::new();
 
 unsafe extern "system" fn message_box_a_detour(
-    hwnd: HWND,
+    hwnd: Hwnd,
     _text: *const u8,
     _caption: *const u8,
-    ty: UINT,
-) -> INT {
+    ty: Uint,
+) -> Int {
     println!("[iat detour] MessageBoxA intercepted");
 
     let original = ORIGINAL_MESSAGEBOXA
@@ -46,8 +46,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     unsafe {
         MessageBoxA(
             ptr::null_mut(),
-            b"Before hook\0".as_ptr(),
-            b"NeoHook\0".as_ptr(),
+            c"Before hook".as_ptr() as *const u8,
+            c"NeoHook".as_ptr() as *const u8,
             MB_OK,
         );
     }
@@ -75,8 +75,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     unsafe {
         MessageBoxA(
             ptr::null_mut(),
-            b"This text should be replaced\0".as_ptr(),
-            b"This caption should be replaced\0".as_ptr(),
+            c"This text should be replaced".as_ptr() as *const u8,
+            c"This caption should be replaced".as_ptr() as *const u8,
             MB_OK,
         );
     }
@@ -88,8 +88,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     unsafe {
         MessageBoxA(
             ptr::null_mut(),
-            b"After unhook\0".as_ptr(),
-            b"NeoHook\0".as_ptr(),
+            c"After unhook".as_ptr() as *const u8,
+            c"NeoHook".as_ptr() as *const u8,
             MB_OK,
         );
     }
