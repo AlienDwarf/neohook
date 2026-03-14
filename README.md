@@ -8,7 +8,6 @@
 
 <img align="right" width="320px" height="320px" src="logo.png">
 
-
 Hook any function in one line — transactional, and thread-safe. Leave pointer-to-pointer chaos behind.
 
 NeoHook makes runtime function hooking simple and reliable: Win32 APIs, game engine functions, third-party DLL exports, anything with a code pointer. It brings the precision of low-level binary patching together with Rust's memory safety, type system, and RAII ownership model.
@@ -19,14 +18,14 @@ NeoHook makes runtime function hooking simple and reliable: Win32 APIs, game eng
 
 Function hooking is deceptively difficult to get right. Writing a `JMP` patch is only a few lines of assembly - but doing it safely in a live, multi-threaded process requires solving multiple problems at once:
 
-| Problem                                               |          Naive approach          |                     NeoHook                      |
-| :---------------------------------------------------- | :------------------------------: | :----------------------------------------------: |
-| Another thread executes the bytes you are patching    |       Access Violation        |      ✅ Threads suspended during patch       |
-| Instruction pointer on overwritten bytes        |             Crash             |  ✅ IP redirected   |
-| Return address on stack points to patched region      |        Crash on return        |  ✅ Stack redirected   |
-| JMP/CALL instructions break after relocation |         Wrong target          |  ✅ Instruction relocation via `iced-x86`   |
-| One hook in a batch fails            |   Unstable    |       ✅ Atomic rollback - all or nothing        |
-| Hook leaks after your code exits scope                | Permanent patch, crash on unload |       ✅ RAII: automatic unhook on `Drop`        |
+| Problem                                            |          Naive approach          |                 NeoHook                  |
+| :------------------------------------------------- | :------------------------------: | :--------------------------------------: |
+| Another thread executes the bytes you are patching |         Access Violation         |    ✅ Threads suspended during patch     |
+| Instruction pointer on overwritten bytes           |              Crash               |             ✅ IP redirected             |
+| Return address on stack points to patched region   |         Crash on return          |           ✅ Stack redirected            |
+| JMP/CALL instructions break after relocation       |           Wrong target           | ✅ Instruction relocation via `iced-x86` |
+| One hook in a batch fails                          |             Unstable             |   ✅ Atomic rollback - all or nothing    |
+| Hook leaks after your code exits scope             | Permanent patch, crash on unload |   ✅ RAII: automatic unhook on `Drop`    |
 
 ---
 
@@ -52,7 +51,7 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 
 - **Zero-Boilerplate Macros** - `detour_inline!` and `detour_helper!` install a complete hook with a single expression.
 
-- **C FFI** - Exposes a stable C ABI with auto-generated headers (`cbindgen`), usable from C, C++, Python (`ctypes`), or any FFI-capable language.
+- **C FFI** - Exposes a C ABI with auto-generated headers (`cbindgen`), usable from C, C++, Python (`ctypes`), or any FFI-capable language.
 
 ---
 
@@ -61,8 +60,7 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 Add the crate to your `Cargo.toml`:
 
 ```toml
-[dependencies]
-NeoHook = { git = "https://github.com/AlienDwarf/neohook" }
+neohook = "0.1.0"
 ```
 
 ---
@@ -177,12 +175,13 @@ fn main() {
                 "KERNEL32.dll",
                 "Sleep",
                 hooked_sleep as *const u8,
-                &mut orig_ptr,
             )
             .expect("IAT hook failed");
 
-        let _guard = session.commit().expect("transaction failed");
-        ORIG_SLEEP = Some(std::mem::transmute(orig_ptr));
+        let hooks = session.commit().expect("transaction failed");
+        let original_ptr = hooks[0].original_ptr();
+        let original: SleepFn = std::mem::transmute(original_ptr);
+        let _ = ORIG_SLEEP.set(original);
 
         // Sleep is now intercepted for this module
         windows_sys::Win32::System::Threading::Sleep(1000); // returns immediately
@@ -200,7 +199,7 @@ The correct pattern is to move the hook guard into a `OnceLock<Vec<Hook>>` globa
 
 ```rust
 use std::sync::OnceLock;
-use neohook::{DetourTransaction, transaction::Hook};
+use neohook::{DetourTransaction, Hook};
 
 static ACTIVE_HOOKS: OnceLock<Vec<Hook>> = OnceLock::new();
 
@@ -229,7 +228,7 @@ fn install_hooks() {
 
 ### C / C++ FFI
 
-NeoHook exposes a stable C ABI. Generate the header with:
+NeoHook exposes a C ABI. Generate the header with:
 
 ```bash
 cargo build --features generate-headers
@@ -252,12 +251,15 @@ The header is written to `include` directory.
 Writing a `JMP` takes multiple bytes. On a live system, another CPU core may be executing those exact bytes as you overwrite them - causing an immediate crash. Even if you get lucky and avoid the race, a relative jump instruction (`E9 xx xx xx xx`) encodes a _distance from its own address_. Copy it verbatim to a new location and it jumps to the wrong place.
 
 ### The NeoHook Commit Sequence
+
 For every inline hook, NeoHook builds a trampoline near the target function.
 
 That trampoline contains two parts:
+
 1. a managed gateway
 2. a relocated body
-The managed gateway is a small NeoHook-owned jump stub that acts as a stable original_ptr() and can itself be hooked again later.
+   The managed gateway is a small NeoHook-owned jump stub that acts as a stable original_ptr() and can itself be hooked again later.
+
 ```
 Original target
     │
@@ -267,7 +269,9 @@ Original target
          ├── managed gateway
          └── relocated original instructions + jump back
 ```
+
 Conceptually, the trampoline looks like this:
+
 ```
 trampoline:
 +-------------------------------+
@@ -287,7 +291,7 @@ DetourTransaction::commit()
 ├─ 2. SCAN    ──── For each suspended thread:
 │                   a. Read thread context with GetThreadContext()
 │                   b. If RIP/EIP points into the bytes that will be overwritten:
-│                        redirect it to trampoline/body + same offset
+│                        redirect it to trampoline/body + offset
 │                   c. Scan the top part of the stack for stale return addresses
 │                      that still point into the soon-to-be-patched range
 │                   d. Rewrite those return addresses to the relocated body
@@ -315,10 +319,12 @@ A back-jump is appended at the end of the trampoline to return execution to the 
 On x86_64, a 5-byte `E9 rel32` jump can only reach ±2 GB. `TrampolineAlloc::alloc_nearby` scans free memory regions outward from the target using `VirtualQuery` and allocates within that window. If no suitable region exists within ±2 GB, the engine upgrades to a 14-byte indirect absolute jump (`FF 25 00000000 <abs64>`).
 
 ### Hook chaining
+
 A managed gateway can itself be used as the target of another inline hook. That is how hook chaining works.
 First hook
 
 Suppose we hook target with detour_A.
+
 ```
 Before:
 target
@@ -326,7 +332,9 @@ target
   v
 [ original function ]
 ```
+
 After the first hook:
+
 ```
 target -----------------------> detour_A
 
@@ -340,6 +348,7 @@ gateway_A --------------------> trampoline_body_A
 ```
 
 Now suppose `target` is hooked again with `detour_B`. That means the new target is no longer the real function entry. The new target is `gateway_A`. NeoHook reads the destination of gateway_A, then creates a new gateway:
+
 ```
 gateway_B --------------------> previous target of gateway_A
                               = trampoline_body_A
@@ -360,7 +369,7 @@ neohook/
 │   ├── iat.rs          - IatHook: IAT parsing and pointer rewriting
 │   ├── mem.rs          - Memory helpers: VirtualProtect wrapper, atomic write
 │   ├── module.rs      - Module utilities: find_function, get_module_handle
-│   └── thread.rs      - ThreadEnumerator: toolhelp32 snapshot, open/suspend threads
+│   └── threads.rs      - ThreadEnumerator: toolhelp32 snapshot, open/suspend threads
 └── include/
     ├── neohook.h    - Auto-generated C header (cbindgen)
     └── neohook.hpp  - C++ header
