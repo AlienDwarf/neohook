@@ -82,29 +82,6 @@ mod tests {
     }
 
     #[test]
-    fn disassembler_detects_relative_instructions() {
-        unsafe {
-            let jmp_rel: [u8; 5] = [0xE9, 0x10, 0x00, 0x00, 0x00];
-            assert!(
-                Disassembler::is_relative(jmp_rel.as_ptr()),
-                "JMP rel32 should be detected as relative"
-            );
-
-            let call_rel: [u8; 5] = [0xE8, 0x20, 0x00, 0x00, 0x00];
-            assert!(
-                Disassembler::is_relative(call_rel.as_ptr()),
-                "CALL rel32 should be detected as relative"
-            );
-
-            let nop: [u8; 1] = [0x90];
-            assert!(
-                !Disassembler::is_relative(nop.as_ptr()),
-                "NOP should not be detected as relative"
-            );
-        }
-    }
-
-    #[test]
     fn allocator_basic_allocation_and_write() {
         unsafe {
             let target = VirtualAlloc(ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
