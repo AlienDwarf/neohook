@@ -34,6 +34,12 @@ pub enum JumpType {
     Absolute14,
 }
 
+#[derive(Debug)]
+struct RedirectMap {
+    old_instruction_offsets: Vec<u32>,
+    new_instruction_offsets: Vec<u32>,
+}
+
 /// Describes what kind of code location an inline hook is attached to.
 ///
 /// This is used to keep managed gateway registration in sync across
@@ -69,6 +75,7 @@ pub struct InlineData {
     pub jump_type: JumpType,
     pub orig_bytes: Vec<u8>,
     target_kind: TargetKind,
+    redirect_map: Option<RedirectMap>,
 }
 
 /// Enum, used internally in DetourTransaction, to represent either
@@ -410,6 +417,7 @@ impl TransactionCore {
                 },
                 redirect_base: gateway,
                 target_kind: TargetKind::ManagedGateway,
+                redirect_map: None,
             };
 
             self.pending_hooks.push(PendingHook::Inline(data));
@@ -453,11 +461,12 @@ impl TransactionCore {
         let gateway = trampoline_handle.ptr;
         let body = unsafe { gateway.add(MANAGED_GATEWAY_LEN) };
 
-        let body_len = unsafe {
-            // Relocation
+        let relocation = unsafe {
             disasm::Disassembler::relocate(target, body, stolen_len)
                 .map_err(|_| DetourError::RelocationFailed)
         }?;
+
+        let body_len = relocation.written_len;
 
         if MANAGED_GATEWAY_LEN + body_len > tramp_capacity {
             return Err(DetourError::RelocationFailed);
@@ -480,6 +489,10 @@ impl TransactionCore {
             },
             redirect_base: body,
             target_kind: TargetKind::Normal,
+            redirect_map: Some(RedirectMap {
+                old_instruction_offsets: relocation.old_instruction_offsets,
+                new_instruction_offsets: relocation.new_instruction_offsets,
+            }),
         };
 
         self.pending_hooks.push(PendingHook::Inline(data));
@@ -754,30 +767,30 @@ impl TransactionCore {
                     "[DEBUG] Thread {} Instruction Pointer has been redirected",
                     tid
                 );
+                let redirected_ip = Self::map_redirect_address_exact(data, original_rip)?
+                    .ok_or(DetourError::RelocationFailed)?;
 
                 self.redirected_threads
                     .push((h_thread, original_rip as u64));
-                let offset = original_rip - target_start;
 
                 #[cfg(target_arch = "x86_64")]
                 {
                     #[cfg(debug_assertions)]
                     println!(
                         "RIP: 0x{:X} -> 0x{:X} (Trampoline + {})",
-                        original_rip, data.trampoline.ptr as usize, offset
+                        original_rip, data.trampoline.ptr as usize, redirected_ip
                     );
-                    context.Rip = (data.redirect_base as u64) + (offset as u64);
+                    context.Rip = redirected_ip as u64;
                 }
+
                 #[cfg(target_arch = "x86")]
                 {
                     #[cfg(debug_assertions)]
                     println!(
                         "EIP: 0x{:X} -> 0x{:X} (Trampoline + {})",
-                        original_rip,
-                        data.trampoline.ptr as u32,
-                        (offset as u32)
+                        original_rip, data.trampoline.ptr as u32, redirected_ip
                     );
-                    context.Eip = (data.redirect_base as u32) + (offset as u32);
+                    context.Eip = redirected_ip as u32;
                 }
 
                 if SetThreadContext(h_thread, context) == 0 {
@@ -814,20 +827,16 @@ impl TransactionCore {
                         1,
                     );
 
-                    if stack_value >= target_start && stack_value < target_end {
-                        let offset = stack_value - target_start;
-                        let new_return_addr = (data.redirect_base as usize) + offset;
-
+                    if let Some(new_return_addr) =
+                        Self::map_redirect_address_exact(data, stack_value)?
+                    {
                         #[cfg(debug_assertions)]
                         println!(
                             "[Stack] Thread {} return address found on stack at 0x{:X}:",
                             tid, current_stack_addr
                         );
                         #[cfg(debug_assertions)]
-                        println!(
-                            "        0x{:X} -> 0x{:X} (Trampoline + {})",
-                            stack_value, new_return_addr, offset
-                        );
+                        println!("        0x{:X} -> 0x{:X}", stack_value, new_return_addr);
 
                         self.redirected_stacks
                             .push((h_thread, current_stack_addr, stack_value));
@@ -1038,6 +1047,49 @@ impl TransactionCore {
         }
 
         println!("----------------------------------\n");
+    }
+
+    fn map_redirect_address_exact(
+        data: &InlineData,
+        old_addr: usize,
+    ) -> Result<Option<usize>, DetourError> {
+        let target_start = data.target as usize;
+        let target_end = target_start + data.stolen_len;
+
+        if old_addr < target_start || old_addr >= target_end {
+            return Ok(None);
+        }
+
+        match data.target_kind {
+            TargetKind::ManagedGateway => {
+                // alter und neuer Stub sind bytegleich
+                let offset = old_addr - target_start;
+                Ok(Some(data.redirect_base as usize + offset))
+            }
+            TargetKind::Normal => {
+                let map = data
+                    .redirect_map
+                    .as_ref()
+                    .ok_or(DetourError::RelocationFailed)?;
+                let old_rel = u32::try_from(old_addr - target_start)
+                    .map_err(|_| DetourError::RelocationFailed)?;
+
+                let Some(index) = map
+                    .old_instruction_offsets
+                    .iter()
+                    .position(|&off| off == old_rel)
+                else {
+                    return Ok(None);
+                };
+
+                let new_rel = map.new_instruction_offsets[index];
+                if new_rel == u32::MAX {
+                    return Err(DetourError::RelocationFailed);
+                }
+
+                Ok(Some(data.redirect_base as usize + new_rel as usize))
+            }
+        }
     }
 }
 

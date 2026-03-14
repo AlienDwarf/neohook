@@ -187,3 +187,161 @@ impl Drop for Trampoline {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::TrampolineAlloc;
+    use std::ptr;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_FREE, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION,
+        PAGE_EXECUTE_READ, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualQuery,
+    };
+
+    #[test]
+    fn alloc_nearby_basic_conditions() {
+        unsafe {
+            let res_null = TrampolineAlloc::alloc_nearby_trampoline(ptr::null(), 64);
+            assert!(res_null.is_none(), "null target should return None");
+
+            let target = VirtualAlloc(ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+                as *mut u8;
+
+            assert!(!target.is_null(), "target allocation failed");
+
+            let res_zero = TrampolineAlloc::alloc_nearby_trampoline(target, 0);
+            assert!(res_zero.is_none(), "size 0 should return None");
+
+            let tramp = TrampolineAlloc::alloc_nearby_trampoline(target, 64);
+            assert!(
+                tramp.is_some(),
+                "expected nearby trampoline allocation to succeed"
+            );
+
+            let free_ok = VirtualFree(target as _, 0, MEM_RELEASE);
+            assert_ne!(free_ok, 0, "failed to free target allocation");
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn alloc_nearby_stays_within_rel32_range() {
+        unsafe {
+            let target = VirtualAlloc(ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+                as *mut u8;
+            assert!(!target.is_null(), "target allocation failed");
+
+            let tramp = TrampolineAlloc::alloc_nearby_trampoline(target, 64)
+                .expect("expected nearby trampoline allocation to succeed");
+
+            let distance = (tramp.ptr as usize).abs_diff(target as usize);
+            assert!(
+                distance <= i32::MAX as usize,
+                "trampoline too far away: distance={distance}"
+            );
+
+            let free_ok = VirtualFree(target as _, 0, MEM_RELEASE);
+            assert_ne!(free_ok, 0, "failed to free target allocation");
+        }
+    }
+
+    #[test]
+    fn alloc_nearby_trampoline_sets_ptr_and_size() {
+        unsafe {
+            let target = VirtualAlloc(ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+                as *mut u8;
+            assert!(!target.is_null(), "target allocation failed");
+
+            let tramp = TrampolineAlloc::alloc_nearby_trampoline(target, 128)
+                .expect("expected trampoline allocation");
+
+            assert!(!tramp.ptr.is_null(), "trampoline ptr should not be null");
+            assert_eq!(tramp.size, 128, "trampoline size should match request");
+
+            let free_ok = VirtualFree(target as _, 0, MEM_RELEASE);
+            assert_ne!(free_ok, 0, "failed to free target allocation");
+        }
+    }
+
+    #[test]
+    fn trampoline_make_rx_changes_protection() {
+        unsafe {
+            let target = VirtualAlloc(ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+                as *mut u8;
+            assert!(!target.is_null(), "target allocation failed");
+
+            let tramp = TrampolineAlloc::alloc_nearby_trampoline(target, 64)
+                .expect("expected trampoline allocation");
+
+            assert!(tramp.make_rx(), "make_rx should succeed");
+
+            let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let query = VirtualQuery(
+                tramp.ptr as _,
+                &mut mbi,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            );
+            assert_ne!(query, 0, "VirtualQuery on trampoline failed");
+            assert_eq!(mbi.Protect, PAGE_EXECUTE_READ, "unexpected page protection");
+
+            let free_ok = VirtualFree(target as _, 0, MEM_RELEASE);
+            assert_ne!(free_ok, 0, "failed to free target allocation");
+        }
+    }
+
+    #[test]
+    fn trampoline_drop_releases_memory() {
+        unsafe {
+            let target = VirtualAlloc(ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+                as *mut u8;
+            assert!(!target.is_null(), "target allocation failed");
+
+            let tramp = TrampolineAlloc::alloc_nearby_trampoline(target, 64)
+                .expect("expected trampoline allocation");
+
+            let tramp_ptr = tramp.ptr;
+            drop(tramp);
+
+            let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let query = VirtualQuery(
+                tramp_ptr as _,
+                &mut mbi,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            );
+            assert_ne!(query, 0, "VirtualQuery after drop failed");
+            assert_eq!(mbi.State, MEM_FREE, "trampoline memory was not released");
+
+            let free_ok = VirtualFree(target as _, 0, MEM_RELEASE);
+            assert_ne!(free_ok, 0, "failed to free target allocation");
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn align_up_works() {
+        assert_eq!(super::align_up(0x10001, 0x10000), 0x20000);
+        assert_eq!(super::align_up(0x20000, 0x10000), 0x20000);
+    }
+
+    #[test]
+    fn allocator_basic_allocation_and_write() {
+        unsafe {
+            let target = VirtualAlloc(ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            assert!(!target.is_null(), "target allocation failed");
+
+            let memory = TrampolineAlloc::alloc_nearby(target as *const u8, 128);
+            assert!(memory.is_some(), "alloc_nearby returned None");
+
+            let ptr = memory.unwrap();
+            assert!(!ptr.is_null(), "allocated pointer must not be null");
+
+            std::ptr::write_volatile(ptr, 0xCC);
+            assert_eq!(std::ptr::read_volatile(ptr), 0xCC);
+
+            let free_alloc = VirtualFree(ptr as _, 0, MEM_RELEASE);
+            assert_ne!(free_alloc, 0, "failed to free trampoline allocation");
+
+            let free_target = VirtualFree(target, 0, MEM_RELEASE);
+            assert_ne!(free_target, 0, "failed to free target allocation");
+        }
+    }
+}

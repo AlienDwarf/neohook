@@ -7,19 +7,22 @@
 //! By leveraging a transaction-based API, it allows applications to intercept function calls and redirect execution
 //! without modifying the original source code.
 
+#[cfg(not(windows))]
+compile_error!("neohook only supports Windows.");
 use std::fmt;
 
-pub mod alloc;
+mod alloc;
 pub mod api;
-pub mod disasm;
-pub mod iat;
-pub mod mem;
-pub mod module;
-pub mod threads;
+mod disasm;
+mod iat;
+mod mem;
+mod module;
+mod threads;
 pub(crate) mod transaction;
 
 // Re-exports for public API
 pub use crate::api::DetourTransaction;
+pub use crate::module::{find_function, get_module_handle, get_module_size};
 pub use crate::transaction::{Hook, IatHook, InlineHook, JumpType, TransactionCore};
 
 /// Errors that can occur while installing or managing detours.

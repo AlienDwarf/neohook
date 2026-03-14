@@ -1,16 +1,6 @@
 #[cfg(all(test, windows))]
 mod tests {
-    use neohook::alloc::TrampolineAlloc;
-    use neohook::disasm::Disassembler;
-    use neohook::mem;
     use neohook::{DetourError, DetourTransaction};
-
-    use std::ptr;
-    use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ,
-        PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualQuery,
-    };
-
     fn detour_1() -> i32 {
         std::hint::black_box(100);
         1
@@ -29,102 +19,6 @@ mod tests {
     #[inline(never)]
     fn universal_detour(_a: i32, _b: i32) -> i32 {
         std::hint::black_box(9999)
-    }
-
-    #[test]
-    fn virtual_protect_same_execute_preserves_execute_permission() {
-        unsafe {
-            let page = VirtualAlloc(
-                ptr::null(),
-                4096,
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_EXECUTE_READ,
-            );
-            assert!(!page.is_null(), "setup allocation failed");
-
-            let mut old_protect = 0u32;
-            let ok = mem::virtual_protect_same_execute(
-                page as *mut u8,
-                4096,
-                PAGE_READWRITE,
-                &mut old_protect,
-            );
-            assert_ne!(ok, 0, "virtual_protect_same_execute failed");
-
-            let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-            let q = VirtualQuery(
-                page,
-                &mut mbi,
-                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
-            );
-            assert_ne!(q, 0, "VirtualQuery failed");
-
-            let free_ok = VirtualFree(page, 0, MEM_RELEASE);
-            assert_ne!(free_ok, 0, "VirtualFree failed");
-
-            assert_eq!(
-                mbi.Protect, PAGE_EXECUTE_READWRITE,
-                "execute permission should have been preserved"
-            );
-        }
-    }
-
-    #[test]
-    fn disassembler_returns_expected_instruction_lengths() {
-        let code: [u8; 10] = [0x90, 0x90, 0xB8, 0xAA, 0xBB, 0xCC, 0xDD, 0x90, 0x90, 0x90];
-        let ptr = code.as_ptr();
-
-        unsafe {
-            assert_eq!(Disassembler::get_instruction_len(ptr, 1).unwrap(), 1);
-            assert_eq!(Disassembler::get_instruction_len(ptr, 2).unwrap(), 2);
-            assert_eq!(Disassembler::get_instruction_len(ptr, 3).unwrap(), 7);
-        }
-    }
-
-    #[test]
-    fn disassembler_detects_relative_instructions() {
-        unsafe {
-            let jmp_rel: [u8; 5] = [0xE9, 0x10, 0x00, 0x00, 0x00];
-            assert!(
-                Disassembler::is_relative(jmp_rel.as_ptr()),
-                "JMP rel32 should be detected as relative"
-            );
-
-            let call_rel: [u8; 5] = [0xE8, 0x20, 0x00, 0x00, 0x00];
-            assert!(
-                Disassembler::is_relative(call_rel.as_ptr()),
-                "CALL rel32 should be detected as relative"
-            );
-
-            let nop: [u8; 1] = [0x90];
-            assert!(
-                !Disassembler::is_relative(nop.as_ptr()),
-                "NOP should not be detected as relative"
-            );
-        }
-    }
-
-    #[test]
-    fn allocator_basic_allocation_and_write() {
-        unsafe {
-            let target = VirtualAlloc(ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-            assert!(!target.is_null(), "target allocation failed");
-
-            let memory = TrampolineAlloc::alloc_nearby(target as *const u8, 128);
-            assert!(memory.is_some(), "alloc_nearby returned None");
-
-            let ptr = memory.unwrap();
-            assert!(!ptr.is_null(), "allocated pointer must not be null");
-
-            std::ptr::write_volatile(ptr, 0xCC);
-            assert_eq!(std::ptr::read_volatile(ptr), 0xCC);
-
-            let free_alloc = VirtualFree(ptr as _, 0, MEM_RELEASE);
-            assert_ne!(free_alloc, 0, "failed to free trampoline allocation");
-
-            let free_target = VirtualFree(target, 0, MEM_RELEASE);
-            assert_ne!(free_target, 0, "failed to free target allocation");
-        }
     }
 
     #[test]
