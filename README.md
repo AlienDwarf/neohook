@@ -9,9 +9,9 @@
 <img align="right" width="320px" height="320px" src="logo.png">
 
 
-**Hook any function in one line, transactional, thread-safe in 300 KB.**
+Hook any function in one line — transactional, and thread-safe. Leave pointer-to-pointer chaos behind.
 
-NeoHook lets you intercept and redirect any function call at runtime: Win32 APIs, game engine functions, third-party DLL exports, anything with a code pointer. It brings the precision of low-level binary patching together with Rust's memory safety, type system, and RAII ownership model.
+NeoHook makes runtime function hooking simple and reliable: Win32 APIs, game engine functions, third-party DLL exports, anything with a code pointer. It brings the precision of low-level binary patching together with Rust's memory safety, type system, and RAII ownership model.
 
 ---
 
@@ -21,11 +21,11 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 
 | Problem                                               |          Naive approach          |                     NeoHook                      |
 | :---------------------------------------------------- | :------------------------------: | :----------------------------------------------: |
-| Another thread executes the bytes you are patching    |       Access Violation        |      ✅ All threads suspended during patch       |
-| Instruction pointer on overwritten bytes        |             Crash             |  ✅ IP redirected to safe trampoline copy   |
-| Return address on stack points to patched region      |        Crash on return        |  ✅ Stack scanned & redirected   |
-| JMP/CALL instructions break after relocation |         Wrong target          |  ✅ Full instruction relocation via `iced-x86`   |
-| One hook in a batch fails halfway through             |   Partially applied, unstable    |       ✅ Atomic rollback - all or nothing        |
+| Another thread executes the bytes you are patching    |       Access Violation        |      ✅ Threads suspended during patch       |
+| Instruction pointer on overwritten bytes        |             Crash             |  ✅ IP redirected   |
+| Return address on stack points to patched region      |        Crash on return        |  ✅ Stack redirected   |
+| JMP/CALL instructions break after relocation |         Wrong target          |  ✅ Instruction relocation via `iced-x86`   |
+| One hook in a batch fails            |   Unstable    |       ✅ Atomic rollback - all or nothing        |
 | Hook leaks after your code exits scope                | Permanent patch, crash on unload |       ✅ RAII: automatic unhook on `Drop`        |
 
 ---
@@ -34,15 +34,15 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 
 - **Atomic Transactions** - Queue multiple hooks and commit them in one step. If any hook fails, every previously applied change in the same transaction is rolled back automatically, leaving the process in a known-good state.
 
-- **Full Thread Safety** - Enumerates and suspends every thread in the process before applying patches. Threads are resumed immediately after.
+- **Full Thread Safety** - Enumerates and suspends every thread in the process before applying patches.
 
-- **RIP / EIP Redirection** - If a suspended thread's instruction pointer falls within the bytes being overwritten, it is relocated to the equivalent position in the trampoline.
+- **RIP / EIP Redirection** - If a thread's instruction pointer falls within the bytes being overwritten, it is relocated.
 
-- **Stack Scanning** - Scans the top 512 stack slots (4 KB / one page) per thread for return addresses pointing into the patch area and rewrites them to the trampoline equivalent.
+- **Stack Scanning** - Scans the top 512 stack slots per thread for return addresses pointing into the patch area and rewrites them to the trampoline equivalent.
 
-- **Instruction Relocation** - Uses [`iced-x86`](https://github.com/icedland/iced) to accurately decode, relocate, and re-encode stolen instructions including RIP-relative memory operands, branches, and calls.
+- **Instruction Relocation** - Uses [`iced-x86`](https://github.com/icedland/iced) to accurately decode, relocate, and re-encode.
 
-- **Smart Trampoline Allocation** - On x64, allocates trampoline memory within ±2 GB of the target so that a compact 5-byte relative jump suffices. Falls back to a 14-byte absolute jump (FF 25) when the distance exceeds 2 GB.
+- **Smart Trampoline Allocation** - On x64, allocates trampoline memory within ±2 GB of the target so that a compact 5-byte relative jump suffices. Falls back to a 14-byte absolute jump `(FF 25)`.
 
 - **IAT Hooking** - Rewrites Import Address Table entries to redirect calls to entire DLL exports without touching function preambles.
 
@@ -53,8 +53,6 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 - **Zero-Boilerplate Macros** - `detour_inline!` and `detour_helper!` install a complete hook with a single expression.
 
 - **C FFI** - Exposes a stable C ABI with auto-generated headers (`cbindgen`), usable from C, C++, Python (`ctypes`), or any FFI-capable language.
-
-- **Tiny Footprint** - Stripped release binary under 300 KB. The `iced-x86` decoder is compiled with AVX / AVX-512 / XOP / 3DNow! support removed to minimise size.
 
 ---
 
@@ -80,15 +78,11 @@ use neohook::detour_inline;
 
 #[inline(never)]
 fn target(x: i32) -> i32 { std::hint::black_box(x) * 2 } // returns x * 2
-
 fn detour(x: i32) -> i32 { x + 100 }
 
 fn main() {
-    // One line: suspend threads, patch, resume.
-    let _hook = detour_inline!(target, detour).expect("hook failed");
-
+    let _hook = detour_inline!(target, detour).expect("hook failed"); // One line: suspend threads, patch, resume.
     assert_eq!(target(5), 105); // intercepted
-
     // _hook drops here => original bytes restored automatically
 }
 ```
@@ -258,26 +252,56 @@ The header is written to `include` directory.
 Writing a `JMP` takes multiple bytes. On a live system, another CPU core may be executing those exact bytes as you overwrite them - causing an immediate crash. Even if you get lucky and avoid the race, a relative jump instruction (`E9 xx xx xx xx`) encodes a _distance from its own address_. Copy it verbatim to a new location and it jumps to the wrong place.
 
 ### The NeoHook Commit Sequence
+For every inline hook, NeoHook builds a trampoline near the target function.
+
+That trampoline contains two parts:
+1. a managed gateway
+2. a relocated body
+The managed gateway is a small NeoHook-owned jump stub that acts as a stable original_ptr() and can itself be hooked again later.
+```
+Original target
+    │
+    ├── patched to detour
+    │
+    └── trampoline
+         ├── managed gateway
+         └── relocated original instructions + jump back
+```
+Conceptually, the trampoline looks like this:
+```
+trampoline:
++-------------------------------+
+| managed gateway               |  -> jumps to relocated body
++-------------------------------+
+| relocated stolen instructions |
+| jump back to target+stolen    |
++-------------------------------+
+```
 
 ```
 DetourTransaction::commit()
 │
-├─ 1. FREEZE  ──── SuspendThread() on every process thread (except caller)
+├─ 1. FREEZE  ──── SuspendThread() on every tracked process thread
+│                   (except the calling thread)
 │
 ├─ 2. SCAN    ──── For each suspended thread:
-│                   a. GetThreadContext => check RIP/EIP
-│                      If RIP is inside patch bytes => redirect to trampoline + offset
-│                   b. Scan top 512 stack slots for stale return addresses
-│                      Rewrite any that point into the patch area
+│                   a. Read thread context with GetThreadContext()
+│                   b. If RIP/EIP points into the bytes that will be overwritten:
+│                        redirect it to trampoline/body + same offset
+│                   c. Scan the top part of the stack for stale return addresses
+│                      that still point into the soon-to-be-patched range
+│                   d. Rewrite those return addresses to the relocated body
 │
 ├─ 3. PATCH   ──── For each queued hook:
-│                   a. VirtualProtect => PAGE_READWRITE (preserve execute flag)
-│                   b. Write JMP bytes (5-byte relative or 14-byte absolute)
-│                   c. FlushInstructionCache
-│                   d. Restore original page protection
-│                   If any step fails => rollback all previously applied hooks
+│                   a. If needed, build or prepare the trampoline
+│                   b. Write the detour jump into the original target
+│                   c. Register the trampoline gateway as the new managed gateway
+│                   d. If the patched target was itself a managed gateway:
+│                        remove the old gateway from the registry
+│                   If any step fails:
+│                        rollback applied hooks and restore redirected threads
 │
-└─ 4. THAW   ──── ResumeThread() on every suspended thread
+└─ 4. THAW    ──── ResumeThread() on every suspended thread
 ```
 
 ### Instruction Relocation
@@ -290,15 +314,36 @@ A back-jump is appended at the end of the trampoline to return execution to the 
 
 On x86_64, a 5-byte `E9 rel32` jump can only reach ±2 GB. `TrampolineAlloc::alloc_nearby` scans free memory regions outward from the target using `VirtualQuery` and allocates within that window. If no suitable region exists within ±2 GB, the engine upgrades to a 14-byte indirect absolute jump (`FF 25 00000000 <abs64>`).
 
-### Stack Scanning Depth
+### Hook chaining
+A managed gateway can itself be used as the target of another inline hook. That is how hook chaining works.
+First hook
 
-| Parameter          | Value                            | Rationale                                           |
-| :----------------- | :------------------------------- | :-------------------------------------------------- |
-| `STACK_SCAN_DEPTH` | 512 slots                        | $512 \times 8 = 4096$ bytes = 1 page on x64         |
-| Coverage           | ~99.9 % of real call stacks      | Benchmarked against typical game/engine call depths |
-| Boundary check     | `VirtualQuery` before every read | Prevents AV while scanning near guard pages         |
+Suppose we hook target with detour_A.
+```
+Before:
+target
+  |
+  v
+[ original function ]
+```
+After the first hook:
+```
+target -----------------------> detour_A
 
-The scan terminates early if it reaches the bottom of the stack segment or a guard page, preventing a secondary Access Violation while trying to prevent a primary one.
+gateway_A --------------------> trampoline_body_A
+                                  |
+                                  v
+                         relocated stolen bytes
+                                  |
+                                  v
+                            target + stolen_len
+```
+
+Now suppose `target` is hooked again with `detour_B`. That means the new target is no longer the real function entry. The new target is `gateway_A`. NeoHook reads the destination of gateway_A, then creates a new gateway:
+```
+gateway_B --------------------> previous target of gateway_A
+                              = trampoline_body_A
+```
 
 ---
 
@@ -352,7 +397,7 @@ You have to make sure that you use one thread or you risk race conditions.
 
 ## Disclaimer
 
-This library is intended for **educational purposes, debugging, legitimate game modding, and reverse engineering of software you own or have explicit permission to analyse**.
+This library is intended for **debugging, legitimate game modding, educational purposes, and reverse engineering of software you own or have explicit permission to analyse**.
 
 The authors do not endorse use of this library for developing software that violates terms of service, circumvents security measures without authorisation, or causes harm to others.
 
