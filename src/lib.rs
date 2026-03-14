@@ -7,6 +7,8 @@
 //! By leveraging a transaction-based API, it allows applications to intercept function calls and redirect execution
 //! without modifying the original source code.
 
+#[cfg(not(windows))]
+compile_error!("neohook only supports Windows.");
 use std::fmt;
 
 pub mod alloc;
