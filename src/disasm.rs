@@ -4,6 +4,13 @@ use iced_x86::{
     BlockEncoder, BlockEncoderOptions, Code, Decoder, DecoderOptions, Instruction, InstructionBlock,
 };
 
+#[derive(Debug, Clone)]
+pub(crate) struct RelocationMapping {
+    pub written_len: usize,
+    pub old_instruction_offsets: Vec<u32>,
+    pub new_instruction_offsets: Vec<u32>,
+}
+
 /// Provides functionality to disassemble and relocate instructions
 pub struct Disassembler;
 
@@ -147,4 +154,152 @@ impl Disassembler {
 
         Ok(result.code_buffer.len())
     }
+    pub(crate) unsafe fn relocate_with_mapping(
+        target: *const u8,
+        trampoline: *mut u8,
+        stolen_len: usize,
+    ) -> Result<RelocationMapping, String> {
+        let bitness = Self::bitness();
+        let code_slice = unsafe { std::slice::from_raw_parts(target, stolen_len) };
+        let mut decoder =
+            Decoder::with_ip(bitness, code_slice, target as u64, DecoderOptions::NONE);
+
+        let mut instructions = Vec::new();
+        let mut old_instruction_offsets = Vec::new();
+
+        while decoder.can_decode() {
+            let instr = decoder.decode();
+            if instr.is_invalid() {
+                return Err("Invalid instruction encountered while relocating".to_string());
+            }
+
+            let old_off = instr.ip().checked_sub(target as u64).ok_or_else(|| {
+                "Internal relocation error: negative instruction offset".to_string()
+            })?;
+
+            let old_off = u32::try_from(old_off).map_err(|_| {
+                "Internal relocation error: instruction offset overflow".to_string()
+            })?;
+
+            old_instruction_offsets.push(old_off);
+            instructions.push(instr);
+        }
+
+        let original_instruction_count = instructions.len();
+
+        let return_addr = target as u64 + stolen_len as u64;
+        let jmp_code = if bitness == 64 {
+            Code::Jmp_rel32_64
+        } else {
+            Code::Jmp_rel32_32
+        };
+
+        let jmp_back = Instruction::with_branch(jmp_code, return_addr)
+            .map_err(|_| "Error while creating JMP back".to_string())?;
+        instructions.push(jmp_back);
+
+        let block = InstructionBlock::new(&instructions, trampoline as u64);
+        let result = BlockEncoder::encode(
+            bitness,
+            block,
+            BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS,
+        )
+        .map_err(|e| format!("Relocation failed: {}", e))?;
+
+        if result.new_instruction_offsets.len() < original_instruction_count {
+            return Err(
+                "Relocation failed: encoder returned incomplete instruction offsets".to_string(),
+            );
+        }
+
+        let new_instruction_offsets =
+            result.new_instruction_offsets[..original_instruction_count].to_vec();
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                result.code_buffer.as_ptr(),
+                trampoline,
+                result.code_buffer.len(),
+            );
+        }
+
+        Ok(RelocationMapping {
+            written_len: result.code_buffer.len(),
+            old_instruction_offsets,
+            new_instruction_offsets,
+        })
+    }
+}
+
+#[test]
+fn get_instruction_len_on_nops() {
+    let code = [0x90u8; 32]; // NOPs
+    let len = unsafe { Disassembler::get_instruction_len(code.as_ptr(), 5) }
+        .expect("expected instruction length");
+    assert_eq!(len, 5);
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn get_instruction_len_respects_instruction_boundaries_x64() {
+    let mut code = [0x90u8; 32];
+    code[0..4].copy_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+
+    let len = unsafe { Disassembler::get_instruction_len(code.as_ptr(), 3) }
+        .expect("expected instruction length");
+    assert_eq!(len, 4);
+}
+
+#[test]
+fn is_relative_detects_rel32_call() {
+    let code = [0xE8, 0x00, 0x00, 0x00, 0x00]; // call next instruction
+    assert!(unsafe { Disassembler::is_relative(code.as_ptr()) });
+}
+
+#[test]
+fn is_relative_is_false_for_nop() {
+    let code = [0x90u8; 15];
+    assert!(!unsafe { Disassembler::is_relative(code.as_ptr()) });
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn is_relative_detects_rip_relative_memory_operand() {
+    let code = [0x48, 0x8B, 0x05, 0x00, 0x00, 0x00, 0x00]; // mov rax, [rip+0]
+    assert!(unsafe { Disassembler::is_relative(code.as_ptr()) });
+}
+
+#[test]
+fn relocate_appends_jump_back() {
+    let code = [0x90u8, 0x90, 0x90, 0x90, 0x90];
+    let mut tramp = [0u8; 64];
+
+    let written = unsafe { Disassembler::relocate(code.as_ptr(), tramp.as_mut_ptr(), code.len()) }
+        .expect("relocation should succeed");
+
+    assert!(written > code.len(), "expected appended jump-back");
+}
+
+#[test]
+fn relocate_preserves_relative_call_target() {
+    use iced_x86::{Decoder, DecoderOptions};
+
+    let code = [0xE8, 0x00, 0x00, 0x00, 0x00]; // call next instruction
+    let mut tramp = [0u8; 64];
+
+    unsafe {
+        Disassembler::relocate(code.as_ptr(), tramp.as_mut_ptr(), 5)
+            .expect("relocation should succeed");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    let bitness = 64;
+    #[cfg(target_arch = "x86")]
+    let bitness = 32;
+
+    let mut decoder =
+        Decoder::with_ip(bitness, &tramp, tramp.as_ptr() as u64, DecoderOptions::NONE);
+
+    let instr = decoder.decode();
+    assert_eq!(instr.near_branch_target(), code.as_ptr() as u64 + 5);
 }
