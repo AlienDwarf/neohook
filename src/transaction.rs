@@ -462,7 +462,7 @@ impl TransactionCore {
         let body = unsafe { gateway.add(MANAGED_GATEWAY_LEN) };
 
         let relocation = unsafe {
-            disasm::Disassembler::relocate_with_mapping(target, body, stolen_len)
+            disasm::Disassembler::relocate(target, body, stolen_len)
                 .map_err(|_| DetourError::RelocationFailed)
         }?;
 

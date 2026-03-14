@@ -321,4 +321,27 @@ mod tests {
         assert_eq!(super::align_up(0x10001, 0x10000), 0x20000);
         assert_eq!(super::align_up(0x20000, 0x10000), 0x20000);
     }
+
+    #[test]
+    fn allocator_basic_allocation_and_write() {
+        unsafe {
+            let target = VirtualAlloc(ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            assert!(!target.is_null(), "target allocation failed");
+
+            let memory = TrampolineAlloc::alloc_nearby(target as *const u8, 128);
+            assert!(memory.is_some(), "alloc_nearby returned None");
+
+            let ptr = memory.unwrap();
+            assert!(!ptr.is_null(), "allocated pointer must not be null");
+
+            std::ptr::write_volatile(ptr, 0xCC);
+            assert_eq!(std::ptr::read_volatile(ptr), 0xCC);
+
+            let free_alloc = VirtualFree(ptr as _, 0, MEM_RELEASE);
+            assert_ne!(free_alloc, 0, "failed to free trampoline allocation");
+
+            let free_target = VirtualFree(target, 0, MEM_RELEASE);
+            assert_ne!(free_target, 0, "failed to free target allocation");
+        }
+    }
 }

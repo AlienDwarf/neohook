@@ -86,3 +86,100 @@ pub unsafe fn write_memory_atomic(target: *mut u8, src: *const u8, len: usize) -
         Some(orig)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::ptr;
+
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualQuery
+    };
+
+    use crate::mem::virtual_protect_same_execute;
+
+    #[test]
+    fn changes_protection_and_returns_old_protect() {
+        unsafe {
+            let size = 4096usize;
+
+            // allocate a page with execute-readwrite permissions
+            let ptr = VirtualAlloc(
+                std::ptr::null_mut(),
+                size,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            ) as *mut u8;
+
+            // Ensure the allocation succeeded
+            assert!(!ptr.is_null());
+
+            let mut old_protect = 0u32;
+
+            // Change the protection to readwrite, but since the original page had execute permissions,
+            // we expect it to keep them.
+            let ok = virtual_protect_same_execute(
+                ptr,
+                size,
+                PAGE_READWRITE,
+                &mut old_protect as *mut u32,
+            );
+
+            // Ensure the protection change succeeded and that the old protection is what we set initially.
+            assert_ne!(ok, 0);
+            assert_eq!(old_protect, PAGE_EXECUTE_READWRITE);
+
+            let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let q = VirtualQuery(
+                ptr as _,
+                &mut mbi,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            );
+
+            assert_ne!(q, 0);
+
+            // The new protection should still include execute permissions.
+            assert_eq!(mbi.Protect, PAGE_EXECUTE_READWRITE);
+
+            let freed = VirtualFree(ptr as _, 0, MEM_RELEASE);
+            assert_ne!(freed, 0);
+        }
+    }
+
+    #[test]
+    fn virtual_protect_same_execute_preserves_execute_permission() {
+        unsafe {
+            let page = VirtualAlloc(
+                ptr::null(),
+                4096,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READ,
+            );
+            assert!(!page.is_null(), "setup allocation failed");
+
+            let mut old_protect = 0u32;
+            let ok = crate::mem::virtual_protect_same_execute(
+                page as *mut u8,
+                4096,
+                PAGE_READWRITE,
+                &mut old_protect,
+            );
+            assert_ne!(ok, 0, "virtual_protect_same_execute failed");
+
+            let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let q = VirtualQuery(
+                page,
+                &mut mbi,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            );
+            assert_ne!(q, 0, "VirtualQuery failed");
+
+            let free_ok = VirtualFree(page, 0, MEM_RELEASE);
+            assert_ne!(free_ok, 0, "VirtualFree failed");
+
+            assert_eq!(
+                mbi.Protect, PAGE_EXECUTE_READWRITE,
+                "execute permission should have been preserved"
+            );
+        }
+    }
+}
