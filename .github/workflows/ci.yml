@@ -43,6 +43,19 @@ jobs:
       - name: Test
         run: cargo test --target ${{ matrix.target }} --all-features -- --test-threads=1
 
+      - name: Build, Link and Run C++ FFI Test (G++)
+        shell: bash
+        run: |
+          LIB_PATH="target/${{ matrix.target }}/release/neohook.lib"
+          
+          echo "Compiling and Linking C++ Test..."
+          g++ tests/ffi_full_test.cpp -I include "$LIB_PATH" \
+              -o ffi_test.exe \
+              -luser32 -lkernel32 -ladvapi32 -lws2_32 -lbcrypt -luserenv -lntdll
+          
+          echo "Running FFI Test Execution..."
+          ./ffi_test.exe
+
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }}
 
