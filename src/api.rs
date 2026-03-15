@@ -84,8 +84,6 @@ impl DetourTransaction {
 
     /// Registers an IAT hook to be installed when the transaction is committed.
     ///
-    /// If `orig_out` is non-null, the original imported function pointer is
-    /// written there once the hook has been installed successfully.
     ///
     /// # Errors
     ///
@@ -134,7 +132,9 @@ impl DetourTransaction {
 
     #[cfg(debug_assertions)]
     pub fn dump_state(&self) {
-        self.inner.as_ref().unwrap().dump_state();
+        if let Some(inner) = &self.inner {
+            inner.dump_state();
+        }
     }
 }
 
@@ -192,6 +192,8 @@ pub unsafe extern "C" fn detours_transaction_update_thread(
 /// # Safety
 /// `tx` must be a valid transaction pointer previously returned by
 /// `detours_transaction_begin()`.
+/// `target` and `detour` must be valid pointers to the target function and
+/// detour function, respectively.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn detours_transaction_attach(
     tx: *mut DetourTransaction,
@@ -212,7 +214,7 @@ pub unsafe extern "C" fn detours_transaction_attach(
 /// hooks.
 ///
 /// On success, returns a non-null opaque handle that can be queried with
-/// `detours_handle_len()` and `detours_handle_get_trampoline()`, and must
+/// `detours_handle_len()` and `detours_handle_get_original_ptr()`, and must
 /// eventually be released with `detours_handle_unhook_and_free()`.
 ///
 /// Returns null if the transaction could not be committed.
@@ -278,7 +280,7 @@ pub unsafe extern "C" fn detours_handle_get_original_ptr(
 ///
 /// Dropping the internal hook vector triggers unhooking through RAII.
 ///
-/// Returns `1` on success and `0` if `handle` is null.
+/// Returns 1 if the handle was accepted for destruction, 0 if null.
 ///
 /// # Safety
 /// `handle` must be a valid handle previously returned by
@@ -351,6 +353,10 @@ pub unsafe extern "C" fn detours_transaction_update_all_threads(tx: *mut DetourT
     }
 
     let tx_ref = unsafe { &mut *tx };
+    if tx_ref.inner.is_none() {
+        return 0;
+    }
+
     tx_ref.update_all_threads();
     1
 }
@@ -361,8 +367,9 @@ pub unsafe extern "C" fn detours_transaction_update_all_threads(tx: *mut DetourT
 /// Calling this on an already finished transaction has no effect.
 ///
 /// # Safety
-///
 /// `tx` must be a valid transaction pointer previously returned by
+/// `detours_transaction_begin()`. Ownership of `tx` is consumed by this
+/// function and it must not be used again afterwards.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn detours_transaction_abort(tx: *mut DetourTransaction) -> i32 {
     if tx.is_null() {

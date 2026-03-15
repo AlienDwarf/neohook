@@ -12,7 +12,7 @@ pub(crate) struct RelocationMapping {
 }
 
 /// Provides functionality to disassemble and relocate instructions
-pub struct Disassembler;
+pub(crate) struct Disassembler;
 
 impl Disassembler {
     /// Helper function to determine the bitness of the current architecture (32 or 64)
@@ -36,8 +36,11 @@ impl Disassembler {
     ) -> Result<usize, String> {
         let mut total_bytes = 0;
 
-        // We read a buffer of 32 bytes for analysis (x64 instructions are max 15 bytes)
-        let code_slice = unsafe { std::slice::from_raw_parts(address, 32) };
+        // We need enough bytes to reach `min_size` plus at most one full
+        // additional instruction (x86/x64 max instruction length = 15 bytes).
+        let read_len = min_size.saturating_add(15).max(15);
+
+        let code_slice = unsafe { std::slice::from_raw_parts(address, read_len) };
         let mut decoder = Decoder::with_ip(
             Self::bitness(),
             code_slice,
@@ -59,7 +62,6 @@ impl Disassembler {
 
             total_bytes += instruction.len();
 
-            // We need at least 5 bytes for a JMP rel32, but we can be more flexible and allow any instruction boundary after min_size
             if total_bytes >= min_size {
                 return Ok(total_bytes);
             }
@@ -79,7 +81,7 @@ impl Disassembler {
     ///   will be written.
     /// - `stolen_len`: The number of bytes to relocate from `target`.
     ///
-    /// Returns the total number of bytes written to `trampoline`. This may be
+    /// Returns a mapping with the number of bytes written to `trampoline`. This may be
     /// greater than `stolen_len` because an additional jump back to the original
     /// code may be appended.
     ///
@@ -240,5 +242,26 @@ mod tests {
             assert_eq!(Disassembler::get_instruction_len(ptr, 2).unwrap(), 2);
             assert_eq!(Disassembler::get_instruction_len(ptr, 3).unwrap(), 7);
         }
+    }
+
+    #[test]
+    fn relocate_returns_instruction_offset_mapping() {
+        let code = [0x90u8, 0x90, 0x90, 0x90, 0x90];
+        let mut tramp = [0u8; 64];
+
+        let mapping =
+            unsafe { Disassembler::relocate(code.as_ptr(), tramp.as_mut_ptr(), code.len()) }
+                .expect("relocation should succeed");
+
+        assert_eq!(mapping.old_instruction_offsets, vec![0, 1, 2, 3, 4]);
+        assert_eq!(mapping.new_instruction_offsets, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn get_instruction_len_handles_min_size_larger_than_32() {
+        let code = [0x90u8; 64]; // 64 NOPs
+        let len = unsafe { Disassembler::get_instruction_len(code.as_ptr(), 40) }
+            .expect("expected instruction length");
+        assert_eq!(len, 40);
     }
 }

@@ -56,6 +56,8 @@ int32_t detours_transaction_update_thread(DetourTransaction *tx, uint32_t thread
  * # Safety
  * `tx` must be a valid transaction pointer previously returned by
  * `detours_transaction_begin()`.
+ * `target` and `detour` must be valid pointers to the target function and
+ * detour function, respectively.
  */
 uint8_t *detours_transaction_attach(DetourTransaction *tx, uint8_t *target, const uint8_t *detour);
 
@@ -64,7 +66,7 @@ uint8_t *detours_transaction_attach(DetourTransaction *tx, uint8_t *target, cons
  * hooks.
  *
  * On success, returns a non-null opaque handle that can be queried with
- * `detours_handle_len()` and `detours_handle_get_trampoline()`, and must
+ * `detours_handle_len()` and `detours_handle_get_original_ptr()`, and must
  * eventually be released with `detours_handle_unhook_and_free()`.
  *
  * Returns null if the transaction could not be committed.
@@ -106,7 +108,7 @@ const uint8_t *detours_handle_get_original_ptr(void *handle, uintptr_t idx);
  *
  * Dropping the internal hook vector triggers unhooking through RAII.
  *
- * Returns `1` on success and `0` if `handle` is null.
+ * Returns 1 if the handle was accepted for destruction, 0 if null.
  *
  * # Safety
  * `handle` must be a valid handle previously returned by
@@ -149,8 +151,9 @@ int32_t detours_transaction_update_all_threads(DetourTransaction *tx);
  * Calling this on an already finished transaction has no effect.
  *
  * # Safety
- *
  * `tx` must be a valid transaction pointer previously returned by
+ * `detours_transaction_begin()`. Ownership of `tx` is consumed by this
+ * function and it must not be used again afterwards.
  */
 int32_t detours_transaction_abort(DetourTransaction *tx);
 
