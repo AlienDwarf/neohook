@@ -60,6 +60,7 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 Add the crate to your `Cargo.toml`:
 
 ```toml
+[dependencies]
 neohook = "0.1.0"
 ```
 
@@ -155,10 +156,13 @@ Redirect calls to an imported function across an entire module by rewriting the 
 use neohook::DetourTransaction;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 
-static mut ORIG_SLEEP: Option<unsafe extern "system" fn(u32)> = None;
+type SleepFn = unsafe extern "system" fn(u32);
+static ORIG_SLEEP: OnceLock<SleepFn> = OnceLock::new();
 
 unsafe extern "system" fn hooked_sleep(ms: u32) {
-    // Skip the actual sleep - or log, modify arguments, etc.
+    if let Some(orig) = ORIG_SLEEP.get() {
+        orig(ms / 2);
+    }
 }
 
 fn main() {
@@ -320,8 +324,7 @@ On x86_64, a 5-byte `E9 rel32` jump can only reach ±2 GB. `TrampolineAlloc::all
 
 ### Hook chaining
 
-A managed gateway can itself be used as the target of another inline hook. That is how hook chaining works.
-First hook
+A managed gateway can itself be used as the target of another inline hook. A managed gateway can itself be used as the target of another inline hook. This is how hook chaining works.
 
 Suppose we hook target with detour_A.
 
@@ -368,7 +371,7 @@ neohook/
 │   ├── disasm.rs       - Disassembler: instruction length, relocation via iced-x86
 │   ├── iat.rs          - IatHook: IAT parsing and pointer rewriting
 │   ├── mem.rs          - Memory helpers: VirtualProtect wrapper, atomic write
-│   ├── module.rs      - Module utilities: find_function, get_module_handle
+│   ├── module.rs       - Module utilities: find_function, get_module_handle
 │   └── threads.rs      - ThreadEnumerator: toolhelp32 snapshot, open/suspend threads
 └── include/
     ├── neohook.h    - Auto-generated C header (cbindgen)
