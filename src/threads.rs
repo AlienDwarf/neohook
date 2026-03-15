@@ -5,7 +5,7 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
 use windows_sys::Win32::System::Threading::*;
 
 /// Provides functionality to enumerate threads
-pub struct ThreadEnumerator;
+pub(crate) struct ThreadEnumerator;
 
 impl ThreadEnumerator {
     /// Enumerates all thread IDs of the current process, excluding the calling thread.

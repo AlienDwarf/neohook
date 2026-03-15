@@ -321,7 +321,7 @@ impl TransactionCore {
     /// Suspends and tracks all threads in the current process except the calling
     /// thread.
     ///
-    /// Thread IDs are collected through [`crate::threads::ThreadEnumerator`], then
+    /// Thread IDs are collected, then
     /// each thread is opened and suspended internally. Threads that cannot be
     /// opened or suspended are skipped so that a single inaccessible thread does
     /// not abort the transaction.
