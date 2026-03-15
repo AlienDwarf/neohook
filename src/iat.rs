@@ -152,13 +152,13 @@ impl IatHook {
 
         let mut ignored: u32 = 0;
         if unsafe { VirtualProtect(slot_ptr, slot_size, old_protect, &mut ignored) } == 0 {
+            let protect_err = std::io::Error::last_os_error();
             unsafe {
                 write_thunk_function_slot(slot_ptr, original_fn);
             }
             let _ = unsafe { VirtualProtect(slot_ptr, slot_size, old_protect, &mut ignored) };
-            return Err(map_err(InternalIatHookError::ProtectFailed(
-                std::io::Error::last_os_error(),
-            )));
+
+            return Err(map_err(InternalIatHookError::ProtectFailed(protect_err)));
         }
 
         Ok(original_fn)
