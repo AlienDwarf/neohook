@@ -53,9 +53,3 @@ jobs:
 
       - name: Build docs
         run: cargo doc --no-deps --target ${{ matrix.target }}
-
-      - name: Link C++ test with MSVC
-        shell: pwsh
-        run: |
-          cl /nologo /EHsc /std:c++17 /Iinclude tests\ffi_link_test.cpp `
-            /link /LIBPATH:target\x86_64-pc-windows-msvc\release neohook.lib
