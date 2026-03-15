@@ -43,6 +43,12 @@ jobs:
       - name: Test
         run: cargo test --target ${{ matrix.target }} --all-features -- --test-threads=1
 
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build docs
+        run: cargo doc --no-deps --target ${{ matrix.target }}
+
       - name: Build, Link and Run C++ FFI Test (G++)
         shell: bash
         run: |
@@ -55,9 +61,3 @@ jobs:
           
           echo "Running FFI Test Execution..."
           ./ffi_test.exe
-
-      - name: Build release
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Build docs
-        run: cargo doc --no-deps --target ${{ matrix.target }}
