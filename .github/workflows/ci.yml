@@ -49,15 +49,8 @@ jobs:
       - name: Build docs
         run: cargo doc --no-deps --target ${{ matrix.target }}
 
-      - name: Build, Link and Run C++ FFI Test (G++)
-        shell: bash
+      - name: Link C++ test with MSVC
+        shell: pwsh
         run: |
-          LIB_PATH="target/${{ matrix.target }}/release/neohook.lib"
-          
-          echo "Compiling and Linking C++ Test..."
-          g++ tests/ffi_compile_test.cpp -I include "$LIB_PATH" \
-              -o ffi_test.exe \
-              -luser32 -lkernel32 -ladvapi32 -lws2_32 -lbcrypt -luserenv -lntdll
-          
-          echo "Running FFI Test Execution..."
-          ./ffi_test.exe
+          cl /nologo /EHsc /std:c++17 /Iinclude tests\ffi_link_test.cpp `
+            /link /LIBPATH:target\x86_64-pc-windows-msvc\release neohook.lib
