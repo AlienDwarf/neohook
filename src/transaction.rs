@@ -1156,18 +1156,22 @@ unsafe fn read_managed_gateway_target(src: *const u8) -> Option<*const u8> {
 #[cfg(target_arch = "x86")]
 unsafe fn write_managed_gateway_stub(src: *mut u8, dst: *const u8) {
     let rel = (dst as isize).wrapping_sub(src as isize).wrapping_sub(5);
-    *src.add(0) = 0xE9;
-    std::ptr::copy_nonoverlapping(&(rel as i32).to_le_bytes()[0], src.add(1), 4);
+    unsafe {
+        *src.add(0) = 0xE9;
+        std::ptr::copy_nonoverlapping(&(rel as i32).to_le_bytes()[0], src.add(1), 4);
+    }
 }
 
 #[cfg(target_arch = "x86")]
 unsafe fn read_managed_gateway_target(src: *const u8) -> Option<*const u8> {
-    if *src.add(0) != 0xE9 {
-        return None;
-    }
+    unsafe {
+        if *src.add(0) != 0xE9 {
+            return None;
+        }
 
-    let mut rel = [0u8; 4];
-    std::ptr::copy_nonoverlapping(src.add(1), rel.as_mut_ptr(), 4);
-    let rel = i32::from_le_bytes(rel) as isize;
-    Some(src.offset(5 + rel) as *const u8)
+        let mut rel = [0u8; 4];
+        std::ptr::copy_nonoverlapping(src.add(1), rel.as_mut_ptr(), 4);
+        let rel = i32::from_le_bytes(rel) as isize;
+        Some(src.offset(5 + rel))
+    }
 }

@@ -37,7 +37,7 @@ impl TrampolineAlloc {
                 if addr.is_null() {
                     return None;
                 }
-                return Some(addr as *mut u8);
+                Some(addr as *mut u8)
             }
         }
 
