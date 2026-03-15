@@ -151,9 +151,11 @@ impl IatHook {
         };
 
         let mut ignored: u32 = 0;
-        let restore_success =
-            unsafe { VirtualProtect(slot_ptr, slot_size, old_protect, &mut ignored) };
-        if restore_success == 0 {
+        if unsafe { VirtualProtect(slot_ptr, slot_size, old_protect, &mut ignored) } == 0 {
+            unsafe {
+                write_thunk_function_slot(slot_ptr, original_fn);
+            }
+            let _ = unsafe { VirtualProtect(slot_ptr, slot_size, old_protect, &mut ignored) };
             return Err(map_err(InternalIatHookError::ProtectFailed(
                 std::io::Error::last_os_error(),
             )));
@@ -419,7 +421,7 @@ fn read_c_string_from_rva(image: &ModuleImage, rva: usize) -> Option<String> {
         if byte == 0 {
             let len = cur.checked_sub(start)?;
             let bytes = unsafe { std::slice::from_raw_parts(start as *const u8, len) };
-            return Some(String::from_utf8_lossy(bytes).into_owned());
+            return String::from_utf8(bytes.to_vec()).ok();
         }
         cur = cur.checked_add(1)?;
     }
