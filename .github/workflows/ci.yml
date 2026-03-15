@@ -49,7 +49,7 @@ jobs:
           LIB_PATH="target/${{ matrix.target }}/release/neohook.lib"
           
           echo "Compiling and Linking C++ Test..."
-          g++ tests/ffi_full_test.cpp -I include "$LIB_PATH" \
+          g++ tests/ffi_compile_test.cpp -I include "$LIB_PATH" \
               -o ffi_test.exe \
               -luser32 -lkernel32 -ladvapi32 -lws2_32 -lbcrypt -luserenv -lntdll
           
