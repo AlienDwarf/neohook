@@ -754,12 +754,6 @@ impl TransactionCore {
             let target_start = data.target as usize;
             let target_end = target_start + data.stolen_len;
 
-            #[cfg(debug_assertions)]
-            println!(
-                "[Scan] Thread {} at RIP: 0x{:X} | Target: 0x{:X}-0x{:X}",
-                tid, original_rip, target_start, target_end
-            );
-
             // 1. RIP Redirection
             if original_rip >= target_start && original_rip < target_end {
                 #[cfg(debug_assertions)]
