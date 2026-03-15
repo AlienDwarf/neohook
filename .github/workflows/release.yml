@@ -9,7 +9,7 @@ on:
 jobs:
   publish:
     name: Publish Library
-    runs-on: windows-latest # WICHTIG: Auf Windows geändert!
+    runs-on: windows-latest
     
     steps:
       - name: Checkout Repository
