@@ -1,10 +1,9 @@
 #![cfg(all(windows, target_arch = "x86_64"))]
 
 use neohook::DetourTransaction;
-use neohook::detour_helper;
 use std::arch::naked_asm;
 use std::sync::{
-    Arc, Barrier, OnceLock,
+    Arc, Barrier,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::thread;
@@ -15,7 +14,7 @@ use windows_sys::Win32::System::Memory::{
 
 type HeavyFn = fn(usize) -> usize;
 
-static ORG_HEAVY: OnceLock<HeavyFn> = OnceLock::new();
+static ORG_HEAVY: std::sync::RwLock<Option<HeavyFn>> = std::sync::RwLock::new(None);
 
 const THREAD_COUNT: usize = 50;
 const ITERATIONS: usize = 10;
@@ -34,11 +33,9 @@ fn heavy_computation(val: usize) -> usize {
 }
 
 fn detour_heavy_computation(val: usize) -> usize {
-    if let Some(original) = ORG_HEAVY.get() {
-        original(val) + 1337
-    } else {
-        0
-    }
+    let original = *ORG_HEAVY.read().unwrap();
+    let original = original.expect("original trampoline not set");
+    original(val) + 1337
 }
 
 #[test]
@@ -71,15 +68,24 @@ fn multithreaded_hook_stability() {
     barrier.wait();
 
     for _ in 0..ITERATIONS {
-        let _hooks = detour_helper!(
-            ORG_HEAVY,
-            heavy_computation,
-            detour_heavy_computation,
-            HeavyFn
-        )
-        .expect("failed to install detour via detour_helper");
+        let mut session = DetourTransaction::begin();
+        session.update_all_threads();
+
+        let tramp = session
+            .attach(
+                heavy_computation as *const () as *mut u8,
+                detour_heavy_computation as *const u8,
+            )
+            .expect("failed to attach detour");
+
+        let trampoline_fn: HeavyFn = unsafe { std::mem::transmute(tramp) };
+        *ORG_HEAVY.write().unwrap() = Some(trampoline_fn);
+
+        let hooks = session.commit().expect("failed to commit detour");
 
         thread::sleep(Duration::from_millis(10));
+
+        drop(hooks);
     }
 
     stop_flag.store(true, Ordering::SeqCst);
