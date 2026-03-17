@@ -136,6 +136,22 @@ int32_t detours_transaction_attach_iat(DetourTransaction *tx,
                                        const uint8_t *detour);
 
 /**
+ * Attaches a VTable detour to the given transaction.
+ *
+ * Returns the original function pointer in the selected slot on success,
+ * or null on failure.
+ *
+ * # Safety
+ * `tx` must be a valid transaction pointer previously returned by
+ * `detours_transaction_begin()`. `vtable` must point to a valid VTable and
+ * `index` must refer to an existing slot.
+ */
+uint8_t *detours_transaction_attach_vtable(DetourTransaction *tx,
+                                           uint8_t **vtable,
+                                           uintptr_t index,
+                                           const uint8_t *detour);
+
+/**
  * Suspends all threads in the current process except the calling thread and
  * registers them to be resumed later as part of the transaction.
  *

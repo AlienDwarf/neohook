@@ -45,6 +45,8 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 
 - **IAT Hooking** - Rewrites Import Address Table entries to redirect calls to entire DLL exports without touching function preambles.
 
+- **VTable Hooking** - Rewrites a selected VTable slot to detour virtual calls and restores the original slot on unhook.
+
 - **Hook Chaining** - Detour the trampoline of an already-installed hook to layer multiple interceptors in a defined order.
 
 - **RAII Ownership** - The `Vec<Hook>` returned by `commit()` unhooks and restores original memory automatically when dropped.
@@ -71,10 +73,10 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 | v0.1.0 | ✅ Done | Rollback on failed commit |
 | v0.1.0 | ✅ Done | RAII unhook on drop |
 | v0.1.0 | ✅ Done | C FFI transaction entry points |
-| v0.2.0 | ⬜ Planned | VTable hooking |
+| v0.2.0 | ✅ Done | VTable hooking |
 | v0.2.0 | ⬜ Planned | Per-instance VTable hooks |
 | v0.2.0 | ⬜ Planned | Shared VTable patching |
-| v0.2.0 | ⬜ Planned | VTable hook support in C FFI |
+| v0.2.0 | ✅ Done | VTable hook support in C FFI |
 | v0.2.0 | ⬜ Planned | Additional tests and examples for C++ / COM targets |
 | v0.3.0 | ⬜ Planned | Enable / disable hooks without full unhook |
 | v0.3.0 | ⬜ Planned | Recursion / reentrancy guards |
@@ -224,6 +226,40 @@ fn main() {
 
 ---
 
+### VTable Hooking
+
+Redirect a specific virtual slot by queueing a VTable hook in the same transaction API.
+
+```rust
+use neohook::DetourTransaction;
+
+type SlotFn = extern "system" fn() -> i32;
+
+extern "system" fn original_method() -> i32 { 1 }
+extern "system" fn detour_method() -> i32 { 2 }
+
+fn main() {
+    // Demonstration with a synthetic VTable array.
+    // In real usage, this is usually an object's vtable pointer.
+    let mut vtable = [original_method as *mut u8];
+
+    let mut tx = DetourTransaction::begin();
+    let original_ptr = tx
+        .attach_vtable(vtable.as_mut_ptr(), 0, detour_method as *const u8)
+        .expect("VTable attach failed");
+
+    let _hooks = tx.commit().expect("transaction failed");
+
+    let original: SlotFn = unsafe { std::mem::transmute(original_ptr) };
+    let current: SlotFn = unsafe { std::mem::transmute(vtable[0]) };
+
+    assert_eq!(current(), 2);
+    assert_eq!(original(), 1);
+}
+```
+
+---
+
 ### Keeping hooks alive (DLL injection / DllMain)
 
 In Rust, values are dropped (and hooks uninstalled) when they leave scope. Inside a DLL that is injected into a running process, your initialization thread will eventually finish - taking your hooks with it unless you explicitly extend their lifetime.
@@ -274,6 +310,10 @@ The header is written to `include` directory.
 - `detours_transaction_commit` takes ownership of the transaction pointer and frees it.
 - The returned handle keeps hooks alive until you call `detours_handle_unhook_and_free`.
 - All thread safety guarantees (suspension, RIP redirection, stack scanning) apply equally when called from C/C++.
+
+**VTable FFI API:**
+
+- `detours_transaction_attach_vtable(tx, vtable, index, detour)` returns the previous slot pointer on success.
 
 ---
 

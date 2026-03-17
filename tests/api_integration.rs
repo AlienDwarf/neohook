@@ -17,6 +17,16 @@ pub fn detour_func(a: i32) -> i32 {
     black_box(a) + 100
 }
 
+#[inline(never)]
+extern "system" fn vtable_target() -> i32 {
+    1
+}
+
+#[inline(never)]
+extern "system" fn vtable_detour() -> i32 {
+    2
+}
+
 #[test]
 fn ffi_transaction_happy_path_and_null_guards() {
     unsafe {
@@ -103,4 +113,27 @@ fn transaction_attach_fails_after_abort() {
 
     let result = tx.attach(target_func as *mut u8, detour_func as *const u8);
     assert!(matches!(result, Err(DetourError::NotStarted)));
+}
+
+#[test]
+fn transaction_vtable_hook_happy_path_and_restore() {
+    let mut vtable = [vtable_target as *mut u8];
+
+    let mut tx = DetourTransaction::begin();
+    let original = tx
+        .attach_vtable(vtable.as_mut_ptr(), 0, vtable_detour as *const u8)
+        .expect("attach_vtable should succeed");
+
+    assert_eq!(original, vtable_target as *mut u8);
+
+    let hooks = tx.commit().expect("commit should succeed");
+    assert_eq!(hooks.len(), 1);
+
+    let hooked: extern "system" fn() -> i32 = unsafe { std::mem::transmute(vtable[0]) };
+    assert_eq!(hooked(), 2);
+
+    drop(hooks);
+
+    let restored: extern "system" fn() -> i32 = unsafe { std::mem::transmute(vtable[0]) };
+    assert_eq!(restored(), 1);
 }

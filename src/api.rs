@@ -104,6 +104,29 @@ impl DetourTransaction {
             .attach_iat(h_module, target_dll, target_func, detour)
     }
 
+    /// Registers a VTable hook to be installed when the transaction is committed.
+    ///
+    /// On success, returns the original function pointer currently stored in the
+    /// selected VTable slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(DetourError::NotStarted)` if the transaction has already
+    /// been committed or aborted.
+    ///
+    /// Propagates VTable validation/protection errors from the transaction core.
+    pub fn attach_vtable(
+        &mut self,
+        vtable: *mut *mut u8,
+        index: usize,
+        detour: *const u8,
+    ) -> Result<*mut u8, DetourError> {
+        self.inner
+            .as_mut()
+            .ok_or(DetourError::NotStarted)?
+            .attach_vtable(vtable, index, detour)
+    }
+
     /// Commits the transaction and returns the installed hooks.
     ///
     /// All pending hooks are applied. On success, ownership of the installed
@@ -335,6 +358,34 @@ pub unsafe extern "C" fn detours_transaction_attach_iat(
         )
         .map(|_| 1)
         .unwrap_or(0)
+}
+
+/// Attaches a VTable detour to the given transaction.
+///
+/// Returns the original function pointer in the selected slot on success,
+/// or null on failure.
+///
+/// # Safety
+/// `tx` must be a valid transaction pointer previously returned by
+/// `detours_transaction_begin()`. `vtable` must point to a valid VTable and
+/// `index` must refer to an existing slot. `detour` must have a compatible
+/// ABI/signature for the selected virtual method.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_transaction_attach_vtable(
+    tx: *mut DetourTransaction,
+    vtable: *mut *mut u8,
+    index: usize,
+    detour: *const u8,
+) -> *mut u8 {
+    if tx.is_null() || vtable.is_null() || detour.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let tx_ref = unsafe { &mut *tx };
+
+    tx_ref
+        .attach_vtable(vtable, index, detour)
+        .unwrap_or(std::ptr::null_mut())
 }
 
 /// Suspends all threads in the current process except the calling thread and
