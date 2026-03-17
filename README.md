@@ -55,6 +55,35 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 
 ---
 
+
+---
+
+## Roadmap
+| Version | Status | Features |
+|---|---:|---|
+| v0.1.0 | ✅ Done | Initial release |
+| v0.1.0 | ✅ Done | Inline hooking |
+| v0.1.0 | ✅ Done | IAT hooking |
+| v0.1.0 | ✅ Done | Transaction API (`begin`, `attach`, `commit`, `abort`) |
+| v0.1.0 | ✅ Done | Thread updates (`update_thread`, `update_all_threads`) |
+| v0.1.0 | ✅ Done | Trampoline allocation + relocation |
+| v0.1.0 | ✅ Done | Managed gateways / hook chaining |
+| v0.1.0 | ✅ Done | Rollback on failed commit |
+| v0.1.0 | ✅ Done | RAII unhook on drop |
+| v0.1.0 | ✅ Done | C FFI transaction entry points |
+| v0.2.0 | ⬜ Planned | VTable hooking |
+| v0.2.0 | ⬜ Planned | Per-instance VTable hooks |
+| v0.2.0 | ⬜ Planned | Shared VTable patching |
+| v0.2.0 | ⬜ Planned | VTable hook support in C FFI |
+| v0.2.0 | ⬜ Planned | Additional tests and examples for C++ / COM targets |
+| v0.3.0 | ⬜ Planned | Enable / disable hooks without full unhook |
+| v0.3.0 | ⬜ Planned | Recursion / reentrancy guards |
+| v0.3.0 | ⬜ Planned | Improved diagnostics / debug output |
+| v0.4.0 | ⬜ Planned | Export / EAT hooking |
+| v0.5.0 | ⬜ Planned | VEH hooking |
+
+--
+
 ## Installation
 
 Add the crate to your `Cargo.toml`:
