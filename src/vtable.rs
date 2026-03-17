@@ -80,14 +80,8 @@ impl VTableHook {
         let original_ptr = unsafe { *slot };
 
         let mut old_protect = 0u32;
-        let success = unsafe {
-            VirtualProtect(
-                slot.cast(),
-                slot_size,
-                PAGE_READWRITE,
-                &mut old_protect,
-            )
-        };
+        let success =
+            unsafe { VirtualProtect(slot.cast(), slot_size, PAGE_READWRITE, &mut old_protect) };
 
         if success == 0 {
             return Err(map_err(InternalVTableHookError::ProtectFailed(
