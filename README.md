@@ -47,6 +47,8 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 
 - **VTable Hooking** - Rewrites a selected VTable slot to detour virtual calls and restores the original slot on unhook.
 
+- **Per-Instance VTable Hooking** - Clones an object's VTable, patches the clone, and redirects only that instance.
+
 - **Hook Chaining** - Detour the trampoline of an already-installed hook to layer multiple interceptors in a defined order.
 
 - **RAII Ownership** - The `Vec<Hook>` returned by `commit()` unhooks and restores original memory automatically when dropped.
@@ -74,8 +76,8 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 | v0.1.0  |    ✅ Done | RAII unhook on drop                                    |
 | v0.1.0  |    ✅ Done | C FFI transaction entry points                         |
 | v0.2.0  |    ✅ Done | VTable hooking                                         |
-| v0.2.0  | ⬜ Planned | Per-instance VTable hooks                              |
-| v0.2.0  | ⬜ Planned | Shared VTable patching                                 |
+| v0.2.0  |    ✅ Done | Per-instance VTable hooks                              |
+| v0.2.0  |    ✅ Done | Shared VTable patching                                 |
 | v0.2.0  |    ✅ Done | VTable hook support in C FFI                           |
 | v0.2.0  | ⬜ Planned | Additional tests and examples for C++ / COM targets    |
 | v0.3.0  | ⬜ Planned | Enable / disable hooks without full unhook             |
@@ -257,6 +259,8 @@ fn main() {
     assert_eq!(original(), 1);
 }
 ```
+
+For an object-scoped variant, see [`examples/vtable_instance_hook.rs`](examples/vtable_instance_hook.rs).
 
 ---
 
