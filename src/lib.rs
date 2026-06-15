@@ -17,6 +17,7 @@ mod disasm;
 mod iat;
 mod mem;
 mod module;
+mod reentrancy;
 mod threads;
 pub(crate) mod transaction;
 mod vtable;
@@ -25,6 +26,7 @@ mod vtable;
 pub use crate::api::DetourTransaction;
 pub use crate::iat::IatHookError;
 pub use crate::module::{find_function, get_module_handle, get_module_size};
+pub use crate::reentrancy::ReentrancyGuard;
 pub use crate::transaction::{
     Hook, IatHook, InlineHook, JumpType, TransactionCore, VtableHook, VtableInstanceHook,
 };
