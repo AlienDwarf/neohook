@@ -127,6 +127,31 @@ impl DetourTransaction {
             .attach_vtable(vtable, index, detour)
     }
 
+    /// Registers a per-instance VTable hook to be installed when the
+    /// transaction is committed.
+    ///
+    /// The object's VTable is cloned so only that instance is affected.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(DetourError::NotStarted)` if the transaction has already
+    /// been committed or aborted.
+    ///
+    /// Propagates validation, protection, and allocation errors from the
+    /// transaction core.
+    pub fn attach_vtable_instance(
+        &mut self,
+        object_vptr: *mut *mut u8,
+        index: usize,
+        vtable_len: usize,
+        detour: *const u8,
+    ) -> Result<*mut u8, DetourError> {
+        self.inner
+            .as_mut()
+            .ok_or(DetourError::NotStarted)?
+            .attach_vtable_instance(object_vptr, index, vtable_len, detour)
+    }
+
     /// Commits the transaction and returns the installed hooks.
     ///
     /// All pending hooks are applied. On success, ownership of the installed
@@ -385,6 +410,34 @@ pub unsafe extern "C" fn detours_transaction_attach_vtable(
 
     tx_ref
         .attach_vtable(vtable, index, detour)
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// Attaches a per-instance VTable detour to the given transaction.
+///
+/// Returns the original function pointer stored in the selected slot on
+/// success, or null on failure.
+///
+/// # Safety
+/// `tx` must be a valid transaction pointer previously returned by
+/// `detours_transaction_begin()`. `object_vptr` must point to the object's
+/// vptr field, and `vtable_len` must cover the entire VTable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_transaction_attach_vtable_instance(
+    tx: *mut DetourTransaction,
+    object_vptr: *mut *mut u8,
+    index: usize,
+    vtable_len: usize,
+    detour: *const u8,
+) -> *mut u8 {
+    if tx.is_null() || object_vptr.is_null() || detour.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let tx_ref = unsafe { &mut *tx };
+
+    tx_ref
+        .attach_vtable_instance(object_vptr, index, vtable_len, detour)
         .unwrap_or(std::ptr::null_mut())
 }
 

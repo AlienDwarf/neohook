@@ -93,6 +93,12 @@ pub enum PendingHook {
         index: usize,
         detour: *const u8,
     },
+    VtableInstance {
+        object_vptr: *mut *mut u8,
+        vtable_len: usize,
+        index: usize,
+        detour: *const u8,
+    },
 }
 
 /// Represents an installed detour managed by NeoHook.
@@ -104,6 +110,7 @@ pub enum Hook {
     Inline(InlineHook),
     Iat(IatHook),
     Vtable(VtableHook),
+    VtableInstance(VtableInstanceHook),
 }
 
 impl Hook {
@@ -116,7 +123,8 @@ impl Hook {
         match self {
             Hook::Inline(h) => h.original_ptr(),
             Hook::Iat(h) => h.original_ptr,
-            Hook::Vtable(h) => h.original_ptr,
+            Hook::Vtable(h) => h.original_ptr(),
+            Hook::VtableInstance(h) => h.original_ptr(),
         }
     }
 
@@ -126,6 +134,7 @@ impl Hook {
             Hook::Inline(h) => h.unhook(),
             Hook::Iat(h) => h.unhook(),
             Hook::Vtable(h) => h.unhook(),
+            Hook::VtableInstance(h) => h.unhook(),
         }
     }
 }
@@ -259,46 +268,10 @@ impl Drop for IatHook {
     }
 }
 
-#[derive(Debug)]
-pub struct VtableHook {
-    /// Base pointer to the patched VTable.
-    pub vtable: *mut *mut u8,
-    /// Slot index that was patched.
-    pub index: usize,
-    /// Function pointer that was stored in the slot before patching.
-    pub original_ptr: *mut u8,
-    active: bool,
-}
-
-impl VtableHook {
-    /// Unhooks this VTable hook by restoring the original slot pointer.
-    pub fn unhook(mut self) -> Result<(), DetourError> {
-        self.perform_unhook()?;
-        self.active = false;
-
-        Ok(())
-    }
-
-    /// Restores the VTable entry without consuming the hook value.
-    ///
-    /// This is used by both [`Self::unhook`] and [`Drop`] for best-effort
-    /// cleanup.
-    fn perform_unhook(&self) -> Result<(), DetourError> {
-        unsafe {
-            crate::vtable::VTableHook::hook_entry(self.vtable, self.index, self.original_ptr)?;
-            Ok(())
-        }
-    }
-}
-
-impl Drop for VtableHook {
-    fn drop(&mut self) {
-        if self.active {
-            // RAII fallback: restore the slot if the guard is dropped while active.
-            let _ = self.perform_unhook();
-        }
-    }
-}
+/// Installed VTable hook type used by transaction commits.
+pub type VtableHook = crate::vtable::VTableHook;
+/// Installed per-instance VTable hook type used by transaction commits.
+pub type VtableInstanceHook = crate::vtable::VTableInstanceHook;
 
 pub struct TransactionCore {
     threads: Vec<HANDLE>,
@@ -669,8 +642,7 @@ impl TransactionCore {
             let res = windows_sys::Win32::System::Memory::VirtualQuery(
                 slot as *const _,
                 &mut mbi,
-                std::mem::size_of::<windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION>(
-                ),
+                std::mem::size_of::<windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION>(),
             );
 
             if res == 0
@@ -689,6 +661,55 @@ impl TransactionCore {
 
         self.pending_hooks.push(PendingHook::Vtable {
             vtable,
+            index,
+            detour,
+        });
+
+        Ok(original_ptr)
+    }
+
+    /// Queues a per-instance VTable hook.
+    ///
+    /// The object's VTable is cloned and the clone is patched so only this
+    /// instance observes the detour.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(DetourError::NotStarted)` if the transaction is no longer
+    /// pending.
+    ///
+    /// Returns an error if the object pointer, slot index, VTable length, or
+    /// detour pointer is invalid, or if allocating the cloned VTable fails.
+    ///
+    /// # Safety
+    /// The caller must ensure `object_vptr` points to the object's vptr field
+    /// and that `vtable_len` covers the complete VTable.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn attach_vtable_instance(
+        &mut self,
+        object_vptr: *mut *mut u8,
+        index: usize,
+        vtable_len: usize,
+        detour: *const u8,
+    ) -> Result<*mut u8, DetourError> {
+        if !self.is_pending {
+            return Err(DetourError::NotStarted);
+        }
+
+        if object_vptr.is_null() || detour.is_null() || vtable_len == 0 || index >= vtable_len {
+            return Err(DetourError::InvalidParameter);
+        }
+
+        let original_vtable = unsafe { *object_vptr };
+        if original_vtable.is_null() {
+            return Err(DetourError::InvalidParameter);
+        }
+
+        let original_ptr = unsafe { *(original_vtable as *mut *mut u8).add(index) };
+
+        self.pending_hooks.push(PendingHook::VtableInstance {
+            object_vptr,
+            vtable_len,
             index,
             detour,
         });
@@ -784,16 +805,32 @@ impl TransactionCore {
                     index,
                     detour,
                 } => unsafe {
-                    // Patch the selected slot and retain the previous value for
-                    // rollback/unhook semantics.
-                    match crate::vtable::VTableHook::hook_entry(vtable, index, detour) {
-                        Ok(original) => {
-                            installed.push(Hook::Vtable(VtableHook {
-                                vtable,
-                                index,
-                                original_ptr: original,
-                                active: true,
-                            }));
+                    // Install as RAII hook object so rollback/drop can restore.
+                    match crate::vtable::VTableHook::install(vtable, index, detour) {
+                        Ok(inst) => {
+                            installed.push(Hook::Vtable(inst));
+                        }
+                        Err(err) => {
+                            self.rollback(&mut installed);
+                            self.cleanup_threads();
+                            return Err(err.into());
+                        }
+                    }
+                },
+                PendingHook::VtableInstance {
+                    object_vptr,
+                    vtable_len,
+                    index,
+                    detour,
+                } => unsafe {
+                    match crate::vtable::VTableInstanceHook::install(
+                        object_vptr,
+                        vtable_len,
+                        index,
+                        detour,
+                    ) {
+                        Ok(inst) => {
+                            installed.push(Hook::VtableInstance(inst));
                         }
                         Err(err) => {
                             self.rollback(&mut installed);
@@ -1053,6 +1090,9 @@ impl TransactionCore {
                 Hook::Vtable(hook) => {
                     let _ = hook.unhook();
                 }
+                Hook::VtableInstance(hook) => {
+                    let _ = hook.unhook();
+                }
             }
         }
     }
@@ -1176,6 +1216,17 @@ impl TransactionCore {
                 }
                 PendingHook::Vtable { vtable, index, .. } => {
                     println!("  [{}] VTABLE: {:p}[{}]", i, vtable, index);
+                }
+                PendingHook::VtableInstance {
+                    object_vptr,
+                    vtable_len,
+                    index,
+                    ..
+                } => {
+                    println!(
+                        "  [{}] VTABLE-INSTANCE: {:p} len={} slot={}",
+                        i, object_vptr, vtable_len, index
+                    );
                 }
             }
         }

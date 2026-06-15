@@ -153,6 +153,23 @@ extern "C"
                                                const uint8_t *detour);
 
     /**
+     * Attaches a per-instance VTable detour to the given transaction.
+     *
+     * Returns the original function pointer in the selected slot on success,
+     * or null on failure.
+     *
+     * # Safety
+     * `tx` must be a valid transaction pointer previously returned by
+     * `detours_transaction_begin()`. `object_vptr` must point to the object's
+     * vptr field and `vtable_len` must cover the entire VTable.
+     */
+    uint8_t *detours_transaction_attach_vtable_instance(DetourTransaction *tx,
+                                                        uint8_t **object_vptr,
+                                                        uintptr_t index,
+                                                        uintptr_t vtable_len,
+                                                        const uint8_t *detour);
+
+    /**
      * Suspends all threads in the current process except the calling thread and
      * registers them to be resumed later as part of the transaction.
      *
