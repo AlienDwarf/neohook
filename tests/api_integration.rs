@@ -27,6 +27,21 @@ extern "system" fn vtable_detour() -> i32 {
     2
 }
 
+#[repr(C)]
+struct InstanceDemoObject {
+    vptr: *mut u8,
+}
+
+#[inline(never)]
+extern "system" fn instance_target() -> i32 {
+    1
+}
+
+#[inline(never)]
+extern "system" fn instance_detour() -> i32 {
+    2
+}
+
 #[test]
 fn ffi_transaction_happy_path_and_null_guards() {
     unsafe {
@@ -136,4 +151,51 @@ fn transaction_vtable_hook_happy_path_and_restore() {
 
     let restored: extern "system" fn() -> i32 = unsafe { std::mem::transmute(vtable[0]) };
     assert_eq!(restored(), 1);
+}
+
+#[test]
+fn transaction_vtable_instance_hook_only_affects_one_object() {
+    let mut vtable = [instance_target as *mut u8];
+
+    let mut first = InstanceDemoObject {
+        vptr: vtable.as_mut_ptr() as *mut u8,
+    };
+    let second = InstanceDemoObject {
+        vptr: vtable.as_mut_ptr() as *mut u8,
+    };
+
+    let mut tx = DetourTransaction::begin();
+    let original = tx
+        .attach_vtable_instance(
+            &mut first.vptr as *mut *mut u8,
+            0,
+            1,
+            instance_detour as *const u8,
+        )
+        .expect("attach_vtable_instance should succeed");
+
+    assert_eq!(original, instance_target as *mut u8);
+    assert_eq!(second.vptr, vtable.as_mut_ptr() as *mut u8);
+
+    let hooks = tx.commit().expect("commit should succeed");
+    assert_eq!(hooks.len(), 1);
+
+    let first_table = first.vptr as *mut *mut u8;
+    let second_table = second.vptr as *mut *mut u8;
+    let first_fn: extern "system" fn() -> i32 = unsafe { std::mem::transmute(*first_table) };
+    let second_fn: extern "system" fn() -> i32 = unsafe { std::mem::transmute(*second_table) };
+
+    println!("before first call");
+    assert_eq!(first_fn(), 2);
+    println!("before second call");
+    assert_eq!(second_fn(), 1);
+
+    println!("before drop hooks");
+    drop(hooks);
+
+    println!("before restore call");
+    let restored_first: extern "system" fn() -> i32 = unsafe {
+        std::mem::transmute(*(first.vptr as *mut *mut u8))
+    };
+    assert_eq!(restored_first(), 1);
 }
