@@ -32,6 +32,27 @@ pub use crate::transaction::{
 };
 pub use crate::vtable::VTableHookError;
 
+/// Identifies which kind of hook a [`DetourError::CommitFailed`] refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookKind {
+    Inline,
+    Iat,
+    Vtable,
+    VtableInstance,
+}
+
+impl fmt::Display for HookKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Inline => "inline",
+            Self::Iat => "IAT",
+            Self::Vtable => "VTable",
+            Self::VtableInstance => "per-instance VTable",
+        };
+        f.write_str(name)
+    }
+}
+
 /// Errors that can occur while installing or managing detours.
 #[derive(Debug)]
 pub enum DetourError {
@@ -47,6 +68,19 @@ pub enum DetourError {
     Iat(crate::iat::IatHookError),
     /// An error occurred while installing a VTable hook.
     Vtable(crate::vtable::VTableHookError),
+    /// A pending hook failed to install during [`DetourTransaction::commit`].
+    ///
+    /// Reports the position of the failing hook in the order it was queued and
+    /// its kind, along with the underlying error. All hooks installed earlier in
+    /// the same commit have already been rolled back.
+    CommitFailed {
+        /// Index of the failing hook among the queued hooks (0-based).
+        index: usize,
+        /// Which kind of hook failed.
+        kind: HookKind,
+        /// The underlying error that caused the failure.
+        source: Box<DetourError>,
+    },
 }
 
 impl fmt::Display for DetourError {
@@ -58,6 +92,14 @@ impl fmt::Display for DetourError {
             Self::InvalidParameter => write!(f, "One or more parameters were invalid"),
             Self::Iat(err) => write!(f, "IAT hook error: {err}"),
             Self::Vtable(err) => write!(f, "VTable hook error: {err}"),
+            Self::CommitFailed {
+                index,
+                kind,
+                source,
+            } => write!(
+                f,
+                "commit failed at {kind} hook #{index} (rolled back): {source}"
+            ),
         }
     }
 }
@@ -75,7 +117,14 @@ impl From<crate::vtable::VTableHookError> for DetourError {
 }
 
 // Implement the standard Error trait for DetourError to allow it to be used with the `?` operator
-impl std::error::Error for DetourError {}
+impl std::error::Error for DetourError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::CommitFailed { source, .. } => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 /// Convenience macro for installing a single inline hook.
 ///
@@ -138,4 +187,43 @@ macro_rules! detour_helper {
             Err(e) => Err(e),
         }
     }};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commit_failed_reports_index_kind_and_source() {
+        let err = DetourError::CommitFailed {
+            index: 2,
+            kind: HookKind::Vtable,
+            source: Box::new(DetourError::InvalidParameter),
+        };
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("VTable"),
+            "message should name the hook kind: {msg}"
+        );
+        assert!(
+            msg.contains("#2"),
+            "message should include the hook index: {msg}"
+        );
+
+        // The underlying cause is reachable via Error::source.
+        let source = std::error::Error::source(&err).expect("CommitFailed should expose a source");
+        assert_eq!(
+            source.to_string(),
+            DetourError::InvalidParameter.to_string()
+        );
+    }
+
+    #[test]
+    fn hook_kind_display_names() {
+        assert_eq!(HookKind::Inline.to_string(), "inline");
+        assert_eq!(HookKind::Iat.to_string(), "IAT");
+        assert_eq!(HookKind::Vtable.to_string(), "VTable");
+        assert_eq!(HookKind::VtableInstance.to_string(), "per-instance VTable");
+    }
 }

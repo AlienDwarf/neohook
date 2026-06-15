@@ -1,6 +1,7 @@
 // Copyright (c) 2026 NeoHook Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use crate::DetourError;
+use crate::HookKind;
 use crate::alloc::{Trampoline, TrampolineAlloc};
 use crate::disasm;
 use std::collections::HashSet;
@@ -903,7 +904,7 @@ impl TransactionCore {
         let mut installed: Vec<Hook> = Vec::new();
 
         // Apply hooks
-        for hook in pending {
+        for (hook_index, hook) in pending.into_iter().enumerate() {
             match hook {
                 PendingHook::Inline(data) => {
                     // Borrow
@@ -913,7 +914,11 @@ impl TransactionCore {
                         if let Err(e) = self.redirect_rip_relative_threads(h_thread, &data) {
                             self.rollback(&mut installed);
                             self.cleanup_threads();
-                            return Err(e);
+                            return Err(DetourError::CommitFailed {
+                                index: hook_index,
+                                kind: HookKind::Inline,
+                                source: Box::new(e),
+                            });
                         }
                     }
 
@@ -922,7 +927,11 @@ impl TransactionCore {
                         Err(e) => {
                             self.rollback(&mut installed);
                             self.cleanup_threads();
-                            return Err(e);
+                            return Err(DetourError::CommitFailed {
+                                index: hook_index,
+                                kind: HookKind::Inline,
+                                source: Box::new(e),
+                            });
                         }
                     }
                 }
@@ -952,7 +961,11 @@ impl TransactionCore {
                         Err(err) => {
                             self.rollback(&mut installed);
                             self.cleanup_threads();
-                            return Err(err.into());
+                            return Err(DetourError::CommitFailed {
+                                index: hook_index,
+                                kind: HookKind::Iat,
+                                source: Box::new(err.into()),
+                            });
                         }
                     }
                 },
@@ -969,7 +982,11 @@ impl TransactionCore {
                         Err(err) => {
                             self.rollback(&mut installed);
                             self.cleanup_threads();
-                            return Err(err.into());
+                            return Err(DetourError::CommitFailed {
+                                index: hook_index,
+                                kind: HookKind::Vtable,
+                                source: Box::new(err.into()),
+                            });
                         }
                     }
                 },
@@ -991,7 +1008,11 @@ impl TransactionCore {
                         Err(err) => {
                             self.rollback(&mut installed);
                             self.cleanup_threads();
-                            return Err(err.into());
+                            return Err(DetourError::CommitFailed {
+                                index: hook_index,
+                                kind: HookKind::VtableInstance,
+                                source: Box::new(err.into()),
+                            });
                         }
                     }
                 },
