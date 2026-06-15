@@ -11,6 +11,47 @@ pub(crate) struct RelocationMapping {
     pub new_instruction_offsets: Vec<u32>,
 }
 
+/// Returns how many bytes are readable starting at `address`, bounded by the
+/// committed memory region that contains it.
+///
+/// Returns 0 if the region cannot be queried or is not readable, so callers can
+/// avoid dereferencing unmapped memory.
+///
+/// # Safety
+/// `address` only needs to be a value to query; it is never dereferenced here.
+unsafe fn readable_bytes_from(address: *const u8) -> usize {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+        PAGE_EXECUTE_WRITECOPY, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+    };
+
+    const READABLE: u32 = PAGE_READONLY
+        | PAGE_READWRITE
+        | PAGE_WRITECOPY
+        | PAGE_EXECUTE_READ
+        | PAGE_EXECUTE_READWRITE
+        | PAGE_EXECUTE_WRITECOPY;
+
+    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let written = unsafe {
+        VirtualQuery(
+            address as *const _,
+            &mut mbi,
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if written == 0 {
+        return 0;
+    }
+
+    if mbi.State != MEM_COMMIT || (mbi.Protect & READABLE) == 0 {
+        return 0;
+    }
+
+    let region_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+    region_end.saturating_sub(address as usize)
+}
+
 /// Provides functionality to disassemble and relocate instructions
 pub(crate) struct Disassembler;
 
@@ -38,7 +79,22 @@ impl Disassembler {
 
         // We need enough bytes to reach `min_size` plus at most one full
         // additional instruction (x86/x64 max instruction length = 15 bytes).
-        let read_len = min_size.saturating_add(15).max(15);
+        let mut read_len = min_size.saturating_add(15).max(15);
+
+        // Never read past the end of the committed memory region that contains
+        // `address`. Without this, a function that sits at the very end of a
+        // mapped page makes `from_raw_parts` span into unmapped memory, and
+        // decoding it triggers an access violation.
+        let readable = unsafe { readable_bytes_from(address) };
+        if readable == 0 {
+            return Err("Target address is not in readable committed memory".to_string());
+        }
+        if readable < min_size {
+            return Err(
+                "Not enough readable bytes at target to cover the required patch size".to_string(),
+            );
+        }
+        read_len = read_len.min(readable);
 
         let code_slice = unsafe { std::slice::from_raw_parts(address, read_len) };
         let mut decoder = Decoder::with_ip(
@@ -255,6 +311,37 @@ mod tests {
 
         assert_eq!(mapping.old_instruction_offsets, vec![0, 1, 2, 3, 4]);
         assert_eq!(mapping.new_instruction_offsets, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn relocate_preserves_rip_relative_memory_operand() {
+        use iced_x86::{Decoder, DecoderOptions};
+
+        // mov rax, [rip+0]  =>  48 8B 05 00 00 00 00
+        // The effective address is (end of this instruction) + disp32.
+        let code = [0x48u8, 0x8B, 0x05, 0x00, 0x00, 0x00, 0x00];
+        let mut tramp = [0u8; 64];
+
+        let original_target = code.as_ptr() as u64 + code.len() as u64;
+
+        unsafe {
+            Disassembler::relocate(code.as_ptr(), tramp.as_mut_ptr(), code.len())
+                .expect("relocation should succeed");
+        }
+
+        let mut decoder = Decoder::with_ip(64, &tramp, tramp.as_ptr() as u64, DecoderOptions::NONE);
+        let instr = decoder.decode();
+
+        assert!(
+            instr.is_ip_rel_memory_operand(),
+            "relocated instruction should still be RIP-relative"
+        );
+        assert_eq!(
+            instr.memory_displacement64(),
+            original_target,
+            "RIP-relative operand must still resolve to the same absolute address after relocation"
+        );
     }
 
     #[test]
