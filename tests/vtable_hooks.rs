@@ -288,11 +288,17 @@ fn multiple_vtable_hooks_in_one_transaction() {
     let hooks = tx.commit().expect("commit should succeed");
     assert_eq!(hooks.len(), 2);
 
-    assert_eq!(unsafe { call_slot(shared_table.as_mut_ptr() as *mut u8, 0) }, 99);
+    assert_eq!(
+        unsafe { call_slot(shared_table.as_mut_ptr() as *mut u8, 0) },
+        99
+    );
     assert_eq!(unsafe { call_slot(obj.vptr, 0) }, 99);
 
     drop(hooks);
 
-    assert_eq!(unsafe { call_slot(shared_table.as_mut_ptr() as *mut u8, 0) }, 10);
+    assert_eq!(
+        unsafe { call_slot(shared_table.as_mut_ptr() as *mut u8, 0) },
+        10
+    );
     assert_eq!(unsafe { call_slot(obj.vptr, 0) }, 20);
 }

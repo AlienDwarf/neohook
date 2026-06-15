@@ -279,15 +279,18 @@ fn ffi_vtable_instance_attach_happy_path_and_restore() {
         let handle = detours_transaction_commit(tx);
         assert!(!handle.is_null());
 
-        let first_fn: extern "system" fn() -> i32 = std::mem::transmute(*(first.vptr as *mut *mut u8));
-        let second_fn: extern "system" fn() -> i32 = std::mem::transmute(*(second.vptr as *mut *mut u8));
+        let first_fn: extern "system" fn() -> i32 =
+            std::mem::transmute(*(first.vptr as *mut *mut u8));
+        let second_fn: extern "system" fn() -> i32 =
+            std::mem::transmute(*(second.vptr as *mut *mut u8));
 
         assert_eq!(first_fn(), 2);
         assert_eq!(second_fn(), 1);
 
         assert_eq!(detours_handle_unhook_and_free(handle), 1);
 
-        let restored: extern "system" fn() -> i32 = std::mem::transmute(*(first.vptr as *mut *mut u8));
+        let restored: extern "system" fn() -> i32 =
+            std::mem::transmute(*(first.vptr as *mut *mut u8));
         assert_eq!(restored(), 1);
     }
 }

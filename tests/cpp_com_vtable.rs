@@ -48,7 +48,9 @@ static SHARED_ORIGINAL: OnceLock<extern "system" fn(*mut CppObject) -> i32> = On
 
 extern "system" fn shared_detour(this: *mut CppObject) -> i32 {
     // Forward to the real method (using the right `this`) and adjust the result.
-    let original = SHARED_ORIGINAL.get().expect("original must be set before dispatch");
+    let original = SHARED_ORIGINAL
+        .get()
+        .expect("original must be set before dispatch");
     original(this) + 1000
 }
 
@@ -69,7 +71,9 @@ fn cpp_shared_vtable_hook_receives_this_and_chains_to_original() {
         .attach_vtable(vtable.as_mut_ptr(), 0, shared_detour as *const u8)
         .expect("attach_vtable should succeed");
     SHARED_ORIGINAL
-        .set(unsafe { std::mem::transmute::<*mut u8, extern "system" fn(*mut CppObject) -> i32>(original) })
+        .set(unsafe {
+            std::mem::transmute::<*mut u8, extern "system" fn(*mut CppObject) -> i32>(original)
+        })
         .ok();
 
     let hooks = tx.commit().expect("commit should succeed");
@@ -116,7 +120,9 @@ fn cpp_per_instance_hook_isolates_single_object() {
         )
         .expect("attach_vtable_instance should succeed");
     INSTANCE_ORIGINAL
-        .set(unsafe { std::mem::transmute::<*mut u8, extern "system" fn(*mut CppObject) -> i32>(original) })
+        .set(unsafe {
+            std::mem::transmute::<*mut u8, extern "system" fn(*mut CppObject) -> i32>(original)
+        })
         .ok();
 
     let mut hooks = tx.commit().expect("commit should succeed");
@@ -206,7 +212,9 @@ fn com_iunknown_addref_hook_intercepts_and_forwards() {
         .attach_vtable(vtable.as_mut_ptr(), 1, add_ref_detour as *const u8)
         .expect("attach_vtable should succeed");
     COM_ADDREF_ORIGINAL
-        .set(unsafe { std::mem::transmute::<*mut u8, extern "system" fn(*mut ComObject) -> u32>(original) })
+        .set(unsafe {
+            std::mem::transmute::<*mut u8, extern "system" fn(*mut ComObject) -> u32>(original)
+        })
         .ok();
 
     let hooks = tx.commit().expect("commit should succeed");

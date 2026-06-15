@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::DetourError;
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{Layout, alloc, dealloc};
 use std::fmt;
 use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
 
@@ -302,7 +302,15 @@ impl VTableInstanceHook {
         }
 
         let mut ignored = 0u32;
-        if unsafe { VirtualProtect(object_vptr.cast(), std::mem::size_of::<*mut u8>(), old_protect, &mut ignored) } == 0 {
+        if unsafe {
+            VirtualProtect(
+                object_vptr.cast(),
+                std::mem::size_of::<*mut u8>(),
+                old_protect,
+                &mut ignored,
+            )
+        } == 0
+        {
             let restore_err = std::io::Error::last_os_error();
             unsafe {
                 *object_vptr = original_vtable;
@@ -335,7 +343,11 @@ impl VTableInstanceHook {
     }
 
     fn perform_unhook(&mut self) -> Result<(), DetourError> {
-        if self.object_vptr.is_null() || self.original_vtable.is_null() || self.cloned_vtable.is_null() || self.vtable_len == 0 {
+        if self.object_vptr.is_null()
+            || self.original_vtable.is_null()
+            || self.cloned_vtable.is_null()
+            || self.vtable_len == 0
+        {
             return Err(map_err(InternalVTableHookError::NullObject).into());
         }
 
@@ -359,8 +371,8 @@ impl VTableInstanceHook {
             *self.object_vptr = self.original_vtable;
         }
 
-        let layout = Layout::array::<*mut u8>(self.vtable_len)
-            .map_err(|_| DetourError::InvalidParameter)?;
+        let layout =
+            Layout::array::<*mut u8>(self.vtable_len).map_err(|_| DetourError::InvalidParameter)?;
         unsafe {
             dealloc(self.cloned_vtable.cast(), layout);
         }
@@ -370,7 +382,15 @@ impl VTableInstanceHook {
         self.cloned_vtable = std::ptr::null_mut();
 
         let mut ignored = 0u32;
-        if unsafe { VirtualProtect(self.object_vptr.cast(), std::mem::size_of::<*mut u8>(), old_protect, &mut ignored) } == 0 {
+        if unsafe {
+            VirtualProtect(
+                self.object_vptr.cast(),
+                std::mem::size_of::<*mut u8>(),
+                old_protect,
+                &mut ignored,
+            )
+        } == 0
+        {
             return Err(map_err(InternalVTableHookError::ProtectFailed(
                 std::io::Error::last_os_error(),
             ))

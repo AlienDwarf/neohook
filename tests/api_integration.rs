@@ -194,8 +194,7 @@ fn transaction_vtable_instance_hook_only_affects_one_object() {
     drop(hooks);
 
     println!("before restore call");
-    let restored_first: extern "system" fn() -> i32 = unsafe {
-        std::mem::transmute(*(first.vptr as *mut *mut u8))
-    };
+    let restored_first: extern "system" fn() -> i32 =
+        unsafe { std::mem::transmute(*(first.vptr as *mut *mut u8)) };
     assert_eq!(restored_first(), 1);
 }

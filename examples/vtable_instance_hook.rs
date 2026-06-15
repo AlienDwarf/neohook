@@ -39,8 +39,10 @@ fn main() {
 
     let hooks = tx.commit().expect("commit failed");
 
-    let first_fn: extern "system" fn() -> i32 = unsafe { std::mem::transmute(*(first.vptr as *mut *mut u8)) };
-    let second_fn: extern "system" fn() -> i32 = unsafe { std::mem::transmute(*(second.vptr as *mut *mut u8)) };
+    let first_fn: extern "system" fn() -> i32 =
+        unsafe { std::mem::transmute(*(first.vptr as *mut *mut u8)) };
+    let second_fn: extern "system" fn() -> i32 =
+        unsafe { std::mem::transmute(*(second.vptr as *mut *mut u8)) };
     let original_fn: extern "system" fn() -> i32 = unsafe { std::mem::transmute(original) };
 
     println!("first object hooked result: {}", first_fn());
@@ -49,6 +51,7 @@ fn main() {
 
     drop(hooks);
 
-    let restored_fn: extern "system" fn() -> i32 = unsafe { std::mem::transmute(*(first.vptr as *mut *mut u8)) };
+    let restored_fn: extern "system" fn() -> i32 =
+        unsafe { std::mem::transmute(*(first.vptr as *mut *mut u8)) };
     println!("restored first object result: {}", restored_fn());
 }

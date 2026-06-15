@@ -21,7 +21,9 @@ extern "system" fn dummy_detour() -> u32 {
 static SERIAL: Mutex<()> = Mutex::new(());
 
 fn serial() -> MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[test]

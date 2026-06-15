@@ -93,7 +93,9 @@ fn main() {
         )
         .expect("attach_vtable_instance failed");
     ORIGINAL_ADDREF
-        .set(unsafe { std::mem::transmute::<*mut u8, extern "system" fn(*mut ComObject) -> u32>(original) })
+        .set(unsafe {
+            std::mem::transmute::<*mut u8, extern "system" fn(*mut ComObject) -> u32>(original)
+        })
         .ok();
 
     let hooks = tx.commit().expect("commit failed");
@@ -104,7 +106,10 @@ fn main() {
 
     println!("hooked AddRef -> refcount {r1}, then {r2}");
     println!("other  AddRef -> refcount {other_ref} (not hooked)");
-    println!("intercepted AddRef calls: {}", ADDREF_CALLS.load(Ordering::SeqCst));
+    println!(
+        "intercepted AddRef calls: {}",
+        ADDREF_CALLS.load(Ordering::SeqCst)
+    );
 
     drop(hooks);
 
