@@ -279,6 +279,11 @@ pub struct TransactionCore {
     is_pending: bool,
     redirected_threads: Vec<(HANDLE, u64)>, // for safety, we store the original RIP of redirected threads so we can restore it if needed
     redirected_stacks: Vec<(HANDLE, usize, usize)>, // for safety, we store the original stack pointer and size of redirected threads so we can restore it if needed
+    // Process-wide transaction lock guard. Held from the first thread
+    // suspension (or the start of commit) until threads are resumed, so two
+    // transactions on different threads cannot suspend each other or patch
+    // code concurrently. `None` while the transaction holds no lock.
+    global_lock: Option<std::sync::MutexGuard<'static, ()>>,
 }
 
 impl TransactionCore {
@@ -296,6 +301,20 @@ impl TransactionCore {
             is_pending: true,
             redirected_threads: Vec::new(),
             redirected_stacks: Vec::new(),
+            global_lock: None,
+        }
+    }
+
+    /// Acquires the process-wide transaction lock if this transaction does not
+    /// already hold it.
+    ///
+    /// This is idempotent: calling it multiple times during a transaction keeps
+    /// the single guard that was acquired first. The lock must be taken *before*
+    /// any thread is suspended, otherwise two transactions could suspend each
+    /// other and deadlock.
+    fn acquire_global_lock(&mut self) {
+        if self.global_lock.is_none() {
+            self.global_lock = Some(lock_transaction());
         }
     }
 
@@ -332,6 +351,11 @@ impl TransactionCore {
                 // Ignore invalid thread IDs or inaccessible threads
                 return Ok(());
             }
+
+            // Take the process-wide lock before suspending any thread, so a
+            // concurrent transaction can never freeze the thread that holds the
+            // lock (which would deadlock).
+            self.acquire_global_lock();
 
             if SuspendThread(h_thread) == u32::MAX {
                 CloseHandle(h_thread);
@@ -738,6 +762,10 @@ impl TransactionCore {
             return Err(DetourError::NotStarted);
         }
 
+        // Serialize the patch phase against other transactions. If threads were
+        // suspended earlier this is a no-op, since the lock is already held.
+        self.acquire_global_lock();
+
         #[cfg(debug_assertions)]
         println!(
             "[Commit] Starting transaction with {} Hooks and {} threads...",
@@ -1105,6 +1133,9 @@ impl TransactionCore {
             }
         }
         self.threads.clear();
+        // All threads have been resumed; release the process-wide transaction
+        // lock (if this transaction holds it) so another transaction can run.
+        self.global_lock = None;
     }
 
     // Apply an inline hook, returning an InstalledHook on success.
@@ -1293,6 +1324,29 @@ impl Drop for TransactionCore {
             self.abort();
         }
     }
+}
+
+/// Process-wide transaction lock.
+///
+/// NeoHook serializes the critical section of a transaction (thread suspension
+/// and code patching) so concurrent transactions on different threads cannot
+/// suspend each other or patch overlapping code at the same time. This mirrors
+/// the "one transaction at a time" model used by Microsoft Detours.
+///
+/// A transaction must not be nested on the same thread (i.e. suspend threads or
+/// commit a second transaction while a first one on that thread still holds the
+/// lock), as the lock is not reentrant and that would deadlock.
+static TRANSACTION_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquires the process-wide transaction lock, recovering from poisoning.
+///
+/// If another transaction panicked while holding the lock, the underlying data
+/// is `()` and carries no invariant, so recovering the guard keeps NeoHook
+/// usable instead of permanently wedging every future transaction.
+fn lock_transaction() -> std::sync::MutexGuard<'static, ()> {
+    TRANSACTION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn managed_gateways() -> &'static Mutex<HashSet<usize>> {
