@@ -324,6 +324,58 @@ pub unsafe extern "C" fn detours_handle_get_original_ptr(
         .unwrap_or(std::ptr::null())
 }
 
+/// Enables (`enabled != 0`) or disables (`enabled == 0`) the hook at `idx`
+/// without unhooking it.
+///
+/// Disabling restores the original code/pointer while keeping the hook
+/// installed; enabling re-applies the detour. This is cheaper than a full
+/// unhook/rehook cycle.
+///
+/// Returns `1` on success, `0` if `handle` is null, `idx` is out of bounds, or
+/// the toggle failed.
+///
+/// # Safety
+/// `handle` must be a valid handle previously returned by
+/// `detours_transaction_commit()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_handle_set_enabled(
+    handle: *mut c_void,
+    idx: usize,
+    enabled: i32,
+) -> i32 {
+    if handle.is_null() {
+        return 0;
+    }
+    let vec = unsafe { &mut *(handle as *mut Vec<Hook>) };
+
+    match vec.get_mut(idx) {
+        Some(hook) => {
+            let result = if enabled != 0 {
+                hook.enable()
+            } else {
+                hook.disable()
+            };
+            result.map(|_| 1).unwrap_or(0)
+        }
+        None => 0,
+    }
+}
+
+/// Returns `1` if the hook at `idx` is currently enabled, `0` otherwise (also
+/// `0` if `handle` is null or `idx` is out of bounds).
+///
+/// # Safety
+/// `handle` must be a valid handle previously returned by
+/// `detours_transaction_commit()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_handle_is_enabled(handle: *mut c_void, idx: usize) -> i32 {
+    if handle.is_null() {
+        return 0;
+    }
+    let vec = unsafe { &*(handle as *mut Vec<Hook>) };
+    vec.get(idx).map(|h| h.is_enabled() as i32).unwrap_or(0)
+}
+
 /// Unhooks all installed hooks referenced by `handle` and frees the handle.
 ///
 /// Dropping the internal hook vector triggers unhooking through RAII.

@@ -137,6 +137,38 @@ impl Hook {
             Hook::VtableInstance(h) => h.unhook(),
         }
     }
+
+    /// Returns whether the detour is currently active for this hook.
+    pub fn is_enabled(&self) -> bool {
+        match self {
+            Hook::Inline(h) => h.is_enabled(),
+            Hook::Iat(h) => h.is_enabled(),
+            Hook::Vtable(h) => h.is_enabled(),
+            Hook::VtableInstance(h) => h.is_enabled(),
+        }
+    }
+
+    /// Re-installs the detour after a [`Self::disable`], without rebuilding the
+    /// hook. Cheaper than a full unhook/rehook cycle.
+    pub fn enable(&mut self) -> Result<(), DetourError> {
+        match self {
+            Hook::Inline(h) => h.enable(),
+            Hook::Iat(h) => h.enable(),
+            Hook::Vtable(h) => h.enable(),
+            Hook::VtableInstance(h) => h.enable(),
+        }
+    }
+
+    /// Temporarily restores the original code/pointer while keeping the hook
+    /// installed, so it can be re-enabled later with [`Self::enable`].
+    pub fn disable(&mut self) -> Result<(), DetourError> {
+        match self {
+            Hook::Inline(h) => h.disable(),
+            Hook::Iat(h) => h.disable(),
+            Hook::Vtable(h) => h.disable(),
+            Hook::VtableInstance(h) => h.disable(),
+        }
+    }
 }
 
 /// Helper struct to manage the allocation of trampolines, which are used for inline hooks.
@@ -149,6 +181,11 @@ pub struct InlineHook {
     pub jump_type: JumpType,
     active: bool,
     target_kind: TargetKind,
+    /// The exact bytes written into the target to install the jump to the
+    /// detour. Kept so the hook can be re-enabled after [`Self::disable`].
+    patch_bytes: Vec<u8>,
+    /// Whether the detour jump is currently installed at the target.
+    enabled: bool,
 }
 
 impl InlineHook {
@@ -156,6 +193,51 @@ impl InlineHook {
     pub fn original_ptr(&self) -> *const u8 {
         // .ptr is  *mut u8, we cast to *const u8
         self.trampoline.ptr as *const u8
+    }
+
+    /// Returns whether the detour is currently installed at the target.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Temporarily restores the original bytes at the target without releasing
+    /// the trampoline, so the hook can later be re-enabled with [`Self::enable`].
+    ///
+    /// This rewrites the target in place and does **not** suspend or redirect
+    /// other threads, so it should be toggled at a point where the target is not
+    /// concurrently executing its first instructions.
+    pub fn disable(&mut self) -> Result<(), DetourError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        Self::patch_target(self.target, &self.orig_bytes)?;
+        self.enabled = false;
+        Ok(())
+    }
+
+    /// Re-installs the detour jump at the target after a [`Self::disable`].
+    ///
+    /// Like [`Self::disable`], this rewrites the target in place without thread
+    /// redirection.
+    pub fn enable(&mut self) -> Result<(), DetourError> {
+        if self.enabled {
+            return Ok(());
+        }
+        Self::patch_target(self.target, &self.patch_bytes)?;
+        self.enabled = true;
+        Ok(())
+    }
+
+    fn patch_target(target: *mut u8, bytes: &[u8]) -> Result<(), DetourError> {
+        if target.is_null() || bytes.is_empty() {
+            return Err(DetourError::InvalidParameter);
+        }
+        if unsafe { crate::mem::write_memory_atomic(target, bytes.as_ptr(), bytes.len()) }.is_some()
+        {
+            Ok(())
+        } else {
+            Err(DetourError::RelocationFailed)
+        }
     }
 
     /// Unhooks this inline hook by restoring the original bytes at the target address.
@@ -236,6 +318,10 @@ pub struct IatHook {
     pub func_name: String,
     pub original_ptr: *mut u8,
     active: bool,
+    /// Detour pointer currently written into the import slot when enabled.
+    detour: *mut u8,
+    /// Whether the import slot currently points at the detour.
+    enabled: bool,
 }
 
 impl IatHook {
@@ -243,6 +329,46 @@ impl IatHook {
         self.perform_unhook()?;
         self.active = false;
 
+        Ok(())
+    }
+
+    /// Returns whether the import slot currently points at the detour.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Restores the original import pointer without forgetting the detour, so
+    /// the hook can be re-enabled later.
+    pub fn disable(&mut self) -> Result<(), DetourError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        unsafe {
+            crate::iat::IatHook::hook_import(
+                self.module,
+                &self.dll_name,
+                &self.func_name,
+                self.original_ptr,
+            )?;
+        }
+        self.enabled = false;
+        Ok(())
+    }
+
+    /// Re-points the import slot at the detour after a [`Self::disable`].
+    pub fn enable(&mut self) -> Result<(), DetourError> {
+        if self.enabled {
+            return Ok(());
+        }
+        unsafe {
+            crate::iat::IatHook::hook_import(
+                self.module,
+                &self.dll_name,
+                &self.func_name,
+                self.detour,
+            )?;
+        }
+        self.enabled = true;
         Ok(())
     }
 
@@ -819,6 +945,8 @@ impl TransactionCore {
                                 func_name: target_func,
                                 original_ptr: original,
                                 active: true,
+                                detour: detour as *mut u8,
+                                enabled: true,
                             }));
                         }
                         Err(err) => {
@@ -1203,6 +1331,8 @@ impl TransactionCore {
                     jump_type: data.jump_type,
                     active: true,
                     target_kind: data.target_kind,
+                    patch_bytes: full_patch,
+                    enabled: true,
                 })
             } else {
                 // If the write fails, we return an error. The commit() function will catch this and call rollback() to undo any hooks that were already installed.

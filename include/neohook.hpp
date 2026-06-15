@@ -69,6 +69,35 @@ namespace neohook
             return reinterpret_cast<T>(const_cast<uint8_t *>(detours_handle_get_original_ptr(handle_, index)));
         }
 
+        /**
+         * @brief Disables the hook at @p index without unhooking it.
+         *
+         * Restores the original code/pointer while keeping the hook installed so
+         * it can be re-enabled later. Returns true on success.
+         */
+        bool disable(size_t index)
+        {
+            return handle_ && detours_handle_set_enabled(handle_, index, 0) != 0;
+        }
+
+        /**
+         * @brief Re-enables a previously disabled hook at @p index.
+         *
+         * Returns true on success.
+         */
+        bool enable(size_t index)
+        {
+            return handle_ && detours_handle_set_enabled(handle_, index, 1) != 0;
+        }
+
+        /**
+         * @brief Returns whether the hook at @p index is currently enabled.
+         */
+        bool is_enabled(size_t index) const
+        {
+            return handle_ && detours_handle_is_enabled(handle_, index) != 0;
+        }
+
     private:
         void *handle_ = nullptr;
     };

@@ -109,6 +109,32 @@ extern "C"
     const uint8_t *detours_handle_get_original_ptr(void *handle, uintptr_t idx);
 
     /**
+     * Enables (`enabled != 0`) or disables (`enabled == 0`) the hook at `idx`
+     * without unhooking it.
+     *
+     * Disabling restores the original code/pointer while keeping the hook
+     * installed; enabling re-applies the detour.
+     *
+     * Returns 1 on success, 0 if `handle` is null, `idx` is out of bounds, or
+     * the toggle failed.
+     *
+     * # Safety
+     * `handle` must be a valid handle previously returned by
+     * `detours_transaction_commit()`.
+     */
+    int32_t detours_handle_set_enabled(void *handle, uintptr_t idx, int32_t enabled);
+
+    /**
+     * Returns 1 if the hook at `idx` is currently enabled, 0 otherwise (also 0
+     * if `handle` is null or `idx` is out of bounds).
+     *
+     * # Safety
+     * `handle` must be a valid handle previously returned by
+     * `detours_transaction_commit()`.
+     */
+    int32_t detours_handle_is_enabled(void *handle, uintptr_t idx);
+
+    /**
      * Unhooks all installed hooks referenced by `handle` and frees the handle.
      *
      * Dropping the internal hook vector triggers unhooking through RAII.

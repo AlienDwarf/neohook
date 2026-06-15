@@ -66,7 +66,9 @@ fn map_err(err: InternalVTableHookError) -> VTableHookError {
 pub struct VTableHook {
     slot: *mut *mut u8,
     original_ptr: *mut u8,
+    detour: *mut u8,
     active: bool,
+    enabled: bool,
 }
 
 impl VTableHook {
@@ -134,13 +136,41 @@ impl VTableHook {
         Ok(Self {
             slot,
             original_ptr,
+            detour: detour as *mut u8,
             active: true,
+            enabled: true,
         })
     }
 
     /// Returns the original function pointer that was stored in the patched slot.
     pub fn original_ptr(&self) -> *const u8 {
         self.original_ptr
+    }
+
+    /// Returns whether the slot currently points at the detour.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Restores the original slot pointer while keeping the hook so it can be
+    /// re-enabled later.
+    pub fn disable(&mut self) -> Result<(), DetourError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        Self::write_slot(self.slot, self.original_ptr)?;
+        self.enabled = false;
+        Ok(())
+    }
+
+    /// Re-points the slot at the detour after a [`Self::disable`].
+    pub fn enable(&mut self) -> Result<(), DetourError> {
+        if self.enabled {
+            return Ok(());
+        }
+        Self::write_slot(self.slot, self.detour)?;
+        self.enabled = true;
+        Ok(())
     }
 
     /// Unhooks this VTable hook by restoring the original slot pointer.
@@ -151,7 +181,12 @@ impl VTableHook {
     }
 
     fn perform_unhook(&self) -> Result<(), DetourError> {
-        if self.slot.is_null() {
+        Self::write_slot(self.slot, self.original_ptr)
+    }
+
+    /// Writes `value` into `slot`, flipping page protection around the write.
+    fn write_slot(slot: *mut *mut u8, value: *mut u8) -> Result<(), DetourError> {
+        if slot.is_null() {
             return Err(map_err(InternalVTableHookError::NullVTable).into());
         }
 
@@ -159,7 +194,7 @@ impl VTableHook {
         let mut old_protect = 0u32;
         if unsafe {
             crate::mem::virtual_protect_same_execute(
-                self.slot.cast(),
+                slot.cast(),
                 slot_size,
                 PAGE_READWRITE,
                 &mut old_protect,
@@ -173,11 +208,11 @@ impl VTableHook {
         }
 
         unsafe {
-            *self.slot = self.original_ptr;
+            *slot = value;
         }
 
         let mut ignored = 0u32;
-        if unsafe { VirtualProtect(self.slot.cast(), slot_size, old_protect, &mut ignored) } == 0 {
+        if unsafe { VirtualProtect(slot.cast(), slot_size, old_protect, &mut ignored) } == 0 {
             return Err(map_err(InternalVTableHookError::ProtectFailed(
                 std::io::Error::last_os_error(),
             ))
@@ -209,6 +244,7 @@ pub struct VTableInstanceHook {
     vtable_len: usize,
     original_ptr: *mut u8,
     active: bool,
+    enabled: bool,
 }
 
 impl VTableInstanceHook {
@@ -326,12 +362,88 @@ impl VTableInstanceHook {
             vtable_len,
             original_ptr,
             active: true,
+            enabled: true,
         })
     }
 
     /// Returns the original function pointer that was stored in the patched slot.
     pub fn original_ptr(&self) -> *const u8 {
         self.original_ptr
+    }
+
+    /// Returns whether the object currently dispatches through the cloned
+    /// (hooked) VTable.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Points the object back at its original VTable while keeping the cloned
+    /// table allocated, so the hook can be re-enabled later.
+    pub fn disable(&mut self) -> Result<(), DetourError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.object_vptr.is_null() || self.original_vtable.is_null() {
+            return Err(map_err(InternalVTableHookError::NullObject).into());
+        }
+        Self::write_vptr(self.object_vptr, self.original_vtable)?;
+        self.enabled = false;
+        Ok(())
+    }
+
+    /// Re-points the object at the cloned VTable after a [`Self::disable`].
+    pub fn enable(&mut self) -> Result<(), DetourError> {
+        if self.enabled {
+            return Ok(());
+        }
+        if self.object_vptr.is_null() || self.cloned_vtable.is_null() {
+            return Err(map_err(InternalVTableHookError::NullObject).into());
+        }
+        Self::write_vptr(self.object_vptr, self.cloned_vtable)?;
+        self.enabled = true;
+        Ok(())
+    }
+
+    /// Writes `value` into the object's vptr field, flipping page protection
+    /// around the write.
+    fn write_vptr(object_vptr: *mut *mut u8, value: *mut u8) -> Result<(), DetourError> {
+        let mut old_protect = 0u32;
+        if unsafe {
+            crate::mem::virtual_protect_same_execute(
+                object_vptr.cast(),
+                std::mem::size_of::<*mut u8>(),
+                PAGE_READWRITE,
+                &mut old_protect,
+            )
+        } == 0
+        {
+            return Err(map_err(InternalVTableHookError::ProtectFailed(
+                std::io::Error::last_os_error(),
+            ))
+            .into());
+        }
+
+        unsafe {
+            *object_vptr = value;
+        }
+
+        let mut ignored = 0u32;
+        if unsafe {
+            VirtualProtect(
+                object_vptr.cast(),
+                std::mem::size_of::<*mut u8>(),
+                old_protect,
+                &mut ignored,
+            )
+        } == 0
+        {
+            return Err(map_err(InternalVTableHookError::ProtectFailed(
+                std::io::Error::last_os_error(),
+            ))
+            .into());
+        }
+
+        Ok(())
     }
 
     /// Unhooks the instance hook by restoring the original VTable pointer and
@@ -351,51 +463,18 @@ impl VTableInstanceHook {
             return Err(map_err(InternalVTableHookError::NullObject).into());
         }
 
-        let mut old_protect = 0u32;
-        if unsafe {
-            crate::mem::virtual_protect_same_execute(
-                self.object_vptr.cast(),
-                std::mem::size_of::<*mut u8>(),
-                PAGE_READWRITE,
-                &mut old_protect,
-            )
-        } == 0
-        {
-            return Err(map_err(InternalVTableHookError::ProtectFailed(
-                std::io::Error::last_os_error(),
-            ))
-            .into());
-        }
-
-        unsafe {
-            *self.object_vptr = self.original_vtable;
-        }
+        // Restore the object's original VTable pointer (idempotent if the hook
+        // was already disabled).
+        Self::write_vptr(self.object_vptr, self.original_vtable)?;
 
         let layout =
             Layout::array::<*mut u8>(self.vtable_len).map_err(|_| DetourError::InvalidParameter)?;
         unsafe {
             dealloc(self.cloned_vtable.cast(), layout);
         }
-        // Clear the pointer immediately so that if the protection restore below
-        // fails (leaving `active == true`) a subsequent `Drop` does not free the
-        // same allocation a second time (double free).
+        // Clear the pointer immediately so a subsequent `Drop` (e.g. if the
+        // guard is still active) cannot free the same allocation twice.
         self.cloned_vtable = std::ptr::null_mut();
-
-        let mut ignored = 0u32;
-        if unsafe {
-            VirtualProtect(
-                self.object_vptr.cast(),
-                std::mem::size_of::<*mut u8>(),
-                old_protect,
-                &mut ignored,
-            )
-        } == 0
-        {
-            return Err(map_err(InternalVTableHookError::ProtectFailed(
-                std::io::Error::last_os_error(),
-            ))
-            .into());
-        }
 
         Ok(())
     }
