@@ -19,12 +19,16 @@ mod mem;
 mod module;
 mod threads;
 pub(crate) mod transaction;
+mod vtable;
 
 // Re-exports for public API
 pub use crate::api::DetourTransaction;
 pub use crate::iat::IatHookError;
 pub use crate::module::{find_function, get_module_handle, get_module_size};
-pub use crate::transaction::{Hook, IatHook, InlineHook, JumpType, TransactionCore};
+pub use crate::transaction::{
+    Hook, IatHook, InlineHook, JumpType, TransactionCore, VtableHook, VtableInstanceHook,
+};
+pub use crate::vtable::VTableHookError;
 
 /// Errors that can occur while installing or managing detours.
 #[derive(Debug)]
@@ -39,6 +43,8 @@ pub enum DetourError {
     InvalidParameter,
     /// An error occurred while installing an IAT hook.
     Iat(crate::iat::IatHookError),
+    /// An error occurred while installing a VTable hook.
+    Vtable(crate::vtable::VTableHookError),
 }
 
 impl fmt::Display for DetourError {
@@ -49,6 +55,7 @@ impl fmt::Display for DetourError {
             Self::RelocationFailed => write!(f, "Failed to relocate instructions to trampoline"),
             Self::InvalidParameter => write!(f, "One or more parameters were invalid"),
             Self::Iat(err) => write!(f, "IAT hook error: {err}"),
+            Self::Vtable(err) => write!(f, "VTable hook error: {err}"),
         }
     }
 }
@@ -56,6 +63,12 @@ impl fmt::Display for DetourError {
 impl From<crate::iat::IatHookError> for DetourError {
     fn from(err: crate::iat::IatHookError) -> Self {
         Self::Iat(err)
+    }
+}
+
+impl From<crate::vtable::VTableHookError> for DetourError {
+    fn from(err: crate::vtable::VTableHookError) -> Self {
+        Self::Vtable(err)
     }
 }
 

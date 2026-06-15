@@ -23,6 +23,31 @@ extern "system" fn dummy_iat_detour() -> u32 {
     0
 }
 
+#[inline(never)]
+extern "system" fn vtable_target() -> i32 {
+    1
+}
+
+#[inline(never)]
+extern "system" fn vtable_detour() -> i32 {
+    2
+}
+
+#[repr(C)]
+struct InstanceDemoObject {
+    vptr: *mut u8,
+}
+
+#[inline(never)]
+extern "system" fn instance_target() -> i32 {
+    1
+}
+
+#[inline(never)]
+extern "system" fn instance_detour() -> i32 {
+    2
+}
+
 #[test]
 fn ffi_inline_transaction_happy_path_and_null_guards() {
     unsafe {
@@ -195,5 +220,77 @@ fn ffi_iat_attach_can_prepare_known_import_if_present() {
         assert!(!detours_handle_get_original_ptr(handle, 0).is_null());
 
         assert_eq!(detours_handle_unhook_and_free(handle), 1);
+    }
+}
+
+#[test]
+fn ffi_vtable_attach_happy_path_and_restore() {
+    let mut vtable = [vtable_target as *mut u8];
+
+    unsafe {
+        let tx = detours_transaction_begin();
+        assert!(!tx.is_null());
+
+        let original = detours_transaction_attach_vtable(
+            tx,
+            vtable.as_mut_ptr(),
+            0,
+            vtable_detour as *const u8,
+        );
+        assert_eq!(original, vtable_target as *mut u8);
+
+        let handle = detours_transaction_commit(tx);
+        assert!(!handle.is_null());
+
+        let hooked: extern "system" fn() -> i32 = std::mem::transmute(vtable[0]);
+        assert_eq!(hooked(), 2);
+
+        assert_eq!(detours_handle_unhook_and_free(handle), 1);
+
+        let restored: extern "system" fn() -> i32 = std::mem::transmute(vtable[0]);
+        assert_eq!(restored(), 1);
+    }
+}
+
+#[test]
+fn ffi_vtable_instance_attach_happy_path_and_restore() {
+    let mut vtable = [instance_target as *mut u8];
+
+    let mut first = InstanceDemoObject {
+        vptr: vtable.as_mut_ptr() as *mut u8,
+    };
+    let second = InstanceDemoObject {
+        vptr: vtable.as_mut_ptr() as *mut u8,
+    };
+
+    unsafe {
+        let tx = detours_transaction_begin();
+        assert!(!tx.is_null());
+
+        let original = detours_transaction_attach_vtable_instance(
+            tx,
+            &mut first.vptr as *mut *mut u8,
+            0,
+            1,
+            instance_detour as *const u8,
+        );
+        assert_eq!(original, instance_target as *mut u8);
+
+        let handle = detours_transaction_commit(tx);
+        assert!(!handle.is_null());
+
+        let first_fn: extern "system" fn() -> i32 =
+            std::mem::transmute(*(first.vptr as *mut *mut u8));
+        let second_fn: extern "system" fn() -> i32 =
+            std::mem::transmute(*(second.vptr as *mut *mut u8));
+
+        assert_eq!(first_fn(), 2);
+        assert_eq!(second_fn(), 1);
+
+        assert_eq!(detours_handle_unhook_and_free(handle), 1);
+
+        let restored: extern "system" fn() -> i32 =
+            std::mem::transmute(*(first.vptr as *mut *mut u8));
+        assert_eq!(restored(), 1);
     }
 }

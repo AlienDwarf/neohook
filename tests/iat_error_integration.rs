@@ -2,6 +2,7 @@
 
 use neohook::DetourTransaction;
 use std::ptr;
+use std::sync::{Mutex, MutexGuard};
 use windows_sys::Win32::Foundation::HMODULE;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 
@@ -13,8 +14,21 @@ extern "system" fn dummy_detour() -> u32 {
     0
 }
 
+/// One of these tests hooks a process-wide import (e.g. `GetModuleHandleW`) and
+/// briefly redirects it to `dummy_detour`. Another test calls that same function
+/// directly. Running them in parallel lets one observe the other's active hook,
+/// so the tests in this file must run serially.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[test]
 fn iat_attach_rejects_invalid_module_handles() {
+    let _guard = serial();
     let mut tx = DetourTransaction::begin();
 
     // Stack memory is not a valid PE module base.
@@ -40,6 +54,7 @@ fn iat_attach_rejects_invalid_module_handles() {
 
 #[test]
 fn iat_attach_rejects_nonexistent_import_name() {
+    let _guard = serial();
     let mut tx = DetourTransaction::begin();
 
     let kernel32_w = wide_null("kernel32.dll");
@@ -58,6 +73,7 @@ fn iat_attach_rejects_nonexistent_import_name() {
 
 #[test]
 fn iat_attach_can_hook_known_import_if_present() {
+    let _guard = serial();
     let mut tx = DetourTransaction::begin();
 
     let h_exe: HMODULE = unsafe { GetModuleHandleW(ptr::null()) };

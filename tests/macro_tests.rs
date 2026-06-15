@@ -6,6 +6,17 @@ use std::sync::OnceLock;
 
 static ORIGINAL_ADD: OnceLock<extern "C" fn(i32, i32) -> i32> = OnceLock::new();
 
+// Each test hooks its OWN target function. A hooked function is global mutable
+// state, so two tests sharing one target cannot run in parallel while each
+// asserts exclusive behavior. Distinct targets keep the tests isolated and
+// parallel-safe.
+
+#[inline(never)]
+fn add_values_inline(a: i32, b: i32) -> i32 {
+    let result = black_box(a) + black_box(b);
+    black_box(result)
+}
+
 #[inline(never)]
 fn add_values(a: i32, b: i32) -> i32 {
     let result = black_box(a) + black_box(b);
@@ -25,18 +36,18 @@ fn detour_add(a: i32, b: i32) -> i32 {
 
 #[test]
 fn test_macro_inline_simple() {
-    let original_result = add_values(2, 2);
+    let original_result = add_values_inline(2, 2);
     assert_eq!(original_result, 4);
 
     {
-        let _hooks =
-            detour_inline!(add_values, simple_detour_add).expect("inline macro hooking failed");
+        let _hooks = detour_inline!(add_values_inline, simple_detour_add)
+            .expect("inline macro hooking failed");
 
-        let hooked_result = add_values(2, 2);
+        let hooked_result = add_values_inline(2, 2);
         assert_eq!(hooked_result, 40);
     }
 
-    assert_eq!(add_values(2, 2), 4);
+    assert_eq!(add_values_inline(2, 2), 4);
 }
 
 #[test]

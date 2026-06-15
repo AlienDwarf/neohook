@@ -78,8 +78,8 @@ pub struct InlineData {
     redirect_map: Option<RedirectMap>,
 }
 
-/// Enum, used internally in DetourTransaction, to represent either
-/// an inline hook or an IAT hook that is pending to be committed.
+/// Enum used internally by [`TransactionCore`] to represent hooks that are
+/// queued but not yet installed.
 pub enum PendingHook {
     Inline(InlineData),
     Iat {
@@ -88,13 +88,29 @@ pub enum PendingHook {
         target_func: String,
         detour: *const u8,
     },
+    Vtable {
+        vtable: *mut *mut u8,
+        index: usize,
+        detour: *const u8,
+    },
+    VtableInstance {
+        object_vptr: *mut *mut u8,
+        vtable_len: usize,
+        index: usize,
+        detour: *const u8,
+    },
 }
 
-/// Enum to represent an installed detour, which can be either an inline hook or an IAT hook.
+/// Represents an installed detour managed by NeoHook.
+///
+/// A hook is returned from [`TransactionCore::commit`] and stays active until
+/// it is explicitly unhooked or dropped.
 #[derive(Debug)]
 pub enum Hook {
     Inline(InlineHook),
     Iat(IatHook),
+    Vtable(VtableHook),
+    VtableInstance(VtableInstanceHook),
 }
 
 impl Hook {
@@ -107,6 +123,8 @@ impl Hook {
         match self {
             Hook::Inline(h) => h.original_ptr(),
             Hook::Iat(h) => h.original_ptr,
+            Hook::Vtable(h) => h.original_ptr(),
+            Hook::VtableInstance(h) => h.original_ptr(),
         }
     }
 
@@ -115,6 +133,8 @@ impl Hook {
         match self {
             Hook::Inline(h) => h.unhook(),
             Hook::Iat(h) => h.unhook(),
+            Hook::Vtable(h) => h.unhook(),
+            Hook::VtableInstance(h) => h.unhook(),
         }
     }
 }
@@ -248,12 +268,22 @@ impl Drop for IatHook {
     }
 }
 
+/// Installed VTable hook type used by transaction commits.
+pub type VtableHook = crate::vtable::VTableHook;
+/// Installed per-instance VTable hook type used by transaction commits.
+pub type VtableInstanceHook = crate::vtable::VTableInstanceHook;
+
 pub struct TransactionCore {
     threads: Vec<HANDLE>,
     pending_hooks: Vec<PendingHook>,
     is_pending: bool,
     redirected_threads: Vec<(HANDLE, u64)>, // for safety, we store the original RIP of redirected threads so we can restore it if needed
     redirected_stacks: Vec<(HANDLE, usize, usize)>, // for safety, we store the original stack pointer and size of redirected threads so we can restore it if needed
+    // Process-wide transaction lock guard. Held from the first thread
+    // suspension (or the start of commit) until threads are resumed, so two
+    // transactions on different threads cannot suspend each other or patch
+    // code concurrently. `None` while the transaction holds no lock.
+    global_lock: Option<std::sync::MutexGuard<'static, ()>>,
 }
 
 impl TransactionCore {
@@ -271,6 +301,20 @@ impl TransactionCore {
             is_pending: true,
             redirected_threads: Vec::new(),
             redirected_stacks: Vec::new(),
+            global_lock: None,
+        }
+    }
+
+    /// Acquires the process-wide transaction lock if this transaction does not
+    /// already hold it.
+    ///
+    /// This is idempotent: calling it multiple times during a transaction keeps
+    /// the single guard that was acquired first. The lock must be taken *before*
+    /// any thread is suspended, otherwise two transactions could suspend each
+    /// other and deadlock.
+    fn acquire_global_lock(&mut self) {
+        if self.global_lock.is_none() {
+            self.global_lock = Some(lock_transaction());
         }
     }
 
@@ -307,6 +351,11 @@ impl TransactionCore {
                 // Ignore invalid thread IDs or inaccessible threads
                 return Ok(());
             }
+
+            // Take the process-wide lock before suspending any thread, so a
+            // concurrent transaction can never freeze the thread that holds the
+            // lock (which would deadlock).
+            self.acquire_global_lock();
 
             if SuspendThread(h_thread) == u32::MAX {
                 CloseHandle(h_thread);
@@ -577,6 +626,121 @@ impl TransactionCore {
         Ok(())
     }
 
+    /// Queues a VTable hook for a specific slot.
+    ///
+    /// The slot is validated and patched during commit. The previous slot value
+    /// is returned through the installed [`Hook`] and can be used to restore
+    /// the original method.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(DetourError::NotStarted)` if the transaction is not pending.
+    ///
+    /// Returns `Err(DetourError::InvalidParameter)` if `vtable`/`detour` is
+    /// null or if the slot address cannot be queried as readable memory.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `vtable.add(index)` points to a valid slot
+    /// and that `detour` has a compatible ABI/signature for that virtual method.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn attach_vtable(
+        &mut self,
+        vtable: *mut *mut u8,
+        index: usize,
+        detour: *const u8,
+    ) -> Result<*mut u8, DetourError> {
+        if !self.is_pending {
+            return Err(DetourError::NotStarted);
+        }
+
+        if vtable.is_null() || detour.is_null() {
+            return Err(DetourError::InvalidParameter);
+        }
+
+        let slot = unsafe { vtable.add(index) };
+
+        unsafe {
+            let mut mbi: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION =
+                std::mem::zeroed();
+            let res = windows_sys::Win32::System::Memory::VirtualQuery(
+                slot as *const _,
+                &mut mbi,
+                std::mem::size_of::<windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION>(),
+            );
+
+            if res == 0
+                || (mbi.Protect
+                    & (windows_sys::Win32::System::Memory::PAGE_READONLY
+                        | windows_sys::Win32::System::Memory::PAGE_READWRITE
+                        | windows_sys::Win32::System::Memory::PAGE_EXECUTE_READ
+                        | windows_sys::Win32::System::Memory::PAGE_EXECUTE_READWRITE))
+                    == 0
+            {
+                return Err(DetourError::InvalidParameter);
+            }
+        }
+
+        let original_ptr = unsafe { *slot };
+
+        self.pending_hooks.push(PendingHook::Vtable {
+            vtable,
+            index,
+            detour,
+        });
+
+        Ok(original_ptr)
+    }
+
+    /// Queues a per-instance VTable hook.
+    ///
+    /// The object's VTable is cloned and the clone is patched so only this
+    /// instance observes the detour.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(DetourError::NotStarted)` if the transaction is no longer
+    /// pending.
+    ///
+    /// Returns an error if the object pointer, slot index, VTable length, or
+    /// detour pointer is invalid, or if allocating the cloned VTable fails.
+    ///
+    /// # Safety
+    /// The caller must ensure `object_vptr` points to the object's vptr field
+    /// and that `vtable_len` covers the complete VTable.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn attach_vtable_instance(
+        &mut self,
+        object_vptr: *mut *mut u8,
+        index: usize,
+        vtable_len: usize,
+        detour: *const u8,
+    ) -> Result<*mut u8, DetourError> {
+        if !self.is_pending {
+            return Err(DetourError::NotStarted);
+        }
+
+        if object_vptr.is_null() || detour.is_null() || vtable_len == 0 || index >= vtable_len {
+            return Err(DetourError::InvalidParameter);
+        }
+
+        let original_vtable = unsafe { *object_vptr };
+        if original_vtable.is_null() {
+            return Err(DetourError::InvalidParameter);
+        }
+
+        let original_ptr = unsafe { *(original_vtable as *mut *mut u8).add(index) };
+
+        self.pending_hooks.push(PendingHook::VtableInstance {
+            object_vptr,
+            vtable_len,
+            index,
+            detour,
+        });
+
+        Ok(original_ptr)
+    }
+
     // Commits the current detour transaction and returns the installed hooks.
     ///
     /// Pending inline hooks are installed after tracked threads have been checked
@@ -597,6 +761,10 @@ impl TransactionCore {
         if !self.is_pending {
             return Err(DetourError::NotStarted);
         }
+
+        // Serialize the patch phase against other transactions. If threads were
+        // suspended earlier this is a no-op, since the lock is already held.
+        self.acquire_global_lock();
 
         #[cfg(debug_assertions)]
         println!(
@@ -652,6 +820,45 @@ impl TransactionCore {
                                 original_ptr: original,
                                 active: true,
                             }));
+                        }
+                        Err(err) => {
+                            self.rollback(&mut installed);
+                            self.cleanup_threads();
+                            return Err(err.into());
+                        }
+                    }
+                },
+                PendingHook::Vtable {
+                    vtable,
+                    index,
+                    detour,
+                } => unsafe {
+                    // Install as RAII hook object so rollback/drop can restore.
+                    match crate::vtable::VTableHook::install(vtable, index, detour) {
+                        Ok(inst) => {
+                            installed.push(Hook::Vtable(inst));
+                        }
+                        Err(err) => {
+                            self.rollback(&mut installed);
+                            self.cleanup_threads();
+                            return Err(err.into());
+                        }
+                    }
+                },
+                PendingHook::VtableInstance {
+                    object_vptr,
+                    vtable_len,
+                    index,
+                    detour,
+                } => unsafe {
+                    match crate::vtable::VTableInstanceHook::install(
+                        object_vptr,
+                        vtable_len,
+                        index,
+                        detour,
+                    ) {
+                        Ok(inst) => {
+                            installed.push(Hook::VtableInstance(inst));
                         }
                         Err(err) => {
                             self.rollback(&mut installed);
@@ -908,6 +1115,12 @@ impl TransactionCore {
                 Hook::Iat(hook) => {
                     let _ = hook.unhook();
                 }
+                Hook::Vtable(hook) => {
+                    let _ = hook.unhook();
+                }
+                Hook::VtableInstance(hook) => {
+                    let _ = hook.unhook();
+                }
             }
         }
     }
@@ -920,6 +1133,9 @@ impl TransactionCore {
             }
         }
         self.threads.clear();
+        // All threads have been resumed; release the process-wide transaction
+        // lock (if this transaction holds it) so another transaction can run.
+        self.global_lock = None;
     }
 
     // Apply an inline hook, returning an InstalledHook on success.
@@ -1029,6 +1245,20 @@ impl TransactionCore {
                 } => {
                     println!("  [{}] IAT: {}!{}", i, target_dll, target_func);
                 }
+                PendingHook::Vtable { vtable, index, .. } => {
+                    println!("  [{}] VTABLE: {:p}[{}]", i, vtable, index);
+                }
+                PendingHook::VtableInstance {
+                    object_vptr,
+                    vtable_len,
+                    index,
+                    ..
+                } => {
+                    println!(
+                        "  [{}] VTABLE-INSTANCE: {:p} len={} slot={}",
+                        i, object_vptr, vtable_len, index
+                    );
+                }
             }
         }
 
@@ -1094,6 +1324,29 @@ impl Drop for TransactionCore {
             self.abort();
         }
     }
+}
+
+/// Process-wide transaction lock.
+///
+/// NeoHook serializes the critical section of a transaction (thread suspension
+/// and code patching) so concurrent transactions on different threads cannot
+/// suspend each other or patch overlapping code at the same time. This mirrors
+/// the "one transaction at a time" model used by Microsoft Detours.
+///
+/// A transaction must not be nested on the same thread (i.e. suspend threads or
+/// commit a second transaction while a first one on that thread still holds the
+/// lock), as the lock is not reentrant and that would deadlock.
+static TRANSACTION_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquires the process-wide transaction lock, recovering from poisoning.
+///
+/// If another transaction panicked while holding the lock, the underlying data
+/// is `()` and carries no invariant, so recovering the guard keeps NeoHook
+/// usable instead of permanently wedging every future transaction.
+fn lock_transaction() -> std::sync::MutexGuard<'static, ()> {
+    TRANSACTION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn managed_gateways() -> &'static Mutex<HashSet<usize>> {
