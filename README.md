@@ -79,7 +79,7 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 | v0.2.0  |    ✅ Done | Per-instance VTable hooks                              |
 | v0.2.0  |    ✅ Done | Shared VTable patching                                 |
 | v0.2.0  |    ✅ Done | VTable hook support in C FFI                           |
-| v0.2.0  | ⬜ Planned | Additional tests and examples for C++ / COM targets    |
+| v0.2.0  |    ✅ Done | Additional tests and examples for C++ / COM targets    |
 | v0.3.0  | ⬜ Planned | Enable / disable hooks without full unhook             |
 | v0.3.0  | ⬜ Planned | Recursion / reentrancy guards                          |
 | v0.3.0  | ⬜ Planned | Improved diagnostics / debug output                    |
@@ -261,6 +261,8 @@ fn main() {
 ```
 
 For an object-scoped variant, see [`examples/vtable_instance_hook.rs`](examples/vtable_instance_hook.rs).
+For hooking a COM-style interface (the `IUnknown` `QueryInterface`/`AddRef`/`Release` layout),
+see [`examples/com_vtable_hook.rs`](examples/com_vtable_hook.rs).
 
 ---
 
