@@ -51,6 +51,14 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 
 - **Hook Chaining** - Detour the trampoline of an already-installed hook to layer multiple interceptors in a defined order.
 
+- **Enable / Disable** - Toggle an installed hook on or off (`Hook::enable` / `Hook::disable`) without unhooking, keeping the trampoline and cloned tables in place.
+
+- **Reentrancy Guard** - The `reentrancy_guard!` macro lets a detour detect that it is already running on the current thread and forward to the original instead of recursing.
+
+- **Serialized Transactions** - A process-wide lock applies one transaction at a time, so concurrent installs on different threads cannot suspend each other or patch overlapping code.
+
+- **Failure Diagnostics** - A failed `commit()` reports which queued hook failed (`DetourError::CommitFailed { index, kind, source }`) after rolling back.
+
 - **RAII Ownership** - The `Vec<Hook>` returned by `commit()` unhooks and restores original memory automatically when dropped.
 
 - **Zero-Boilerplate Macros** - `detour_inline!` and `detour_helper!` install a complete hook with a single expression.
@@ -80,9 +88,9 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 | v0.2.0  |    ✅ Done | Shared VTable patching                                 |
 | v0.2.0  |    ✅ Done | VTable hook support in C FFI                           |
 | v0.2.0  |    ✅ Done | Additional tests and examples for C++ / COM targets    |
-| v0.3.0  | ⬜ Planned | Enable / disable hooks without full unhook             |
-| v0.3.0  | ⬜ Planned | Recursion / reentrancy guards                          |
-| v0.3.0  | ⬜ Planned | Improved diagnostics / debug output                    |
+| v0.3.0  |    ✅ Done | Enable / disable hooks without full unhook             |
+| v0.3.0  |    ✅ Done | Recursion / reentrancy guards                          |
+| v0.3.0  |    ✅ Done | Improved diagnostics / debug output                    |
 | v0.4.0  | ⬜ Planned | Export / EAT hooking                                   |
 | v0.5.0  | ⬜ Planned | VEH hooking                                            |
 
@@ -263,6 +271,8 @@ fn main() {
 For an object-scoped variant, see [`examples/vtable_instance_hook.rs`](examples/vtable_instance_hook.rs).
 For hooking a COM-style interface (the `IUnknown` `QueryInterface`/`AddRef`/`Release` layout),
 see [`examples/com_vtable_hook.rs`](examples/com_vtable_hook.rs).
+For an end-to-end input hook (intercepting `user32!GetMessageW` so every keystroke
+in a window becomes `'a'`), see [`examples/force_keystroke_to_a.rs`](examples/force_keystroke_to_a.rs).
 
 ---
 
