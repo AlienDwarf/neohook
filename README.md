@@ -8,7 +8,7 @@
 
 <img align="right" width="320px" height="320px" src="logo.png">
 
-Hook any function in one line — transactional, and thread-safe. Leave pointer-to-pointer chaos behind.
+Hook any function in one line - transactional, and thread-safe. Leave pointer-to-pointer chaos behind.
 
 NeoHook makes runtime function hooking simple and reliable: Win32 APIs, game engine functions, third-party DLL exports, anything with a code pointer. It brings the precision of low-level binary patching together with Rust's memory safety, type system, and RAII ownership model.
 
