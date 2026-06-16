@@ -5,9 +5,152 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace neohook
 {
+    /**
+     * @brief Resolves leading jump stubs/import thunks to the real code address.
+     */
+    inline void *code_from_pointer(const void *pointer)
+    {
+        return static_cast<void *>(detours_code_from_pointer(static_cast<const uint8_t *>(pointer)));
+    }
+
+    // ----------------- Module / PE introspection -----------------
+
+    /** @brief A module loaded in the current process. */
+    struct ModuleInfo
+    {
+        void *base = nullptr;
+        uint32_t size = 0;
+        std::string name;
+    };
+
+    /** @brief A single entry in a module's Export Address Table. */
+    struct ExportInfo
+    {
+        uint32_t ordinal = 0;
+        std::string name;      // empty for ordinal-only exports
+        void *address = nullptr;
+        std::string forwarder; // non-empty only for forwarded exports
+    };
+
+    /** @brief A single imported function in a module's import table. */
+    struct ImportInfo
+    {
+        std::string dll;
+        std::string name;                  // empty when imported by ordinal
+        uint32_t ordinal = 0xFFFFFFFFu;    // 0xFFFFFFFF when imported by name
+        void *address = nullptr;
+    };
+
+    namespace detail
+    {
+        inline std::string from_c(const char *s)
+        {
+            return s ? std::string(s) : std::string();
+        }
+    }
+
+    /**
+     * @brief Enumerates every module loaded in the calling process.
+     */
+    inline std::vector<ModuleInfo> enumerate_modules()
+    {
+        std::vector<ModuleInfo> out;
+        void *h = detours_enumerate_modules();
+        if (!h)
+            return out;
+
+        size_t n = detours_modules_len(h);
+        out.reserve(n);
+        for (size_t i = 0; i < n; ++i)
+        {
+            ModuleInfo m;
+            m.base = detours_modules_base(h, i);
+            m.size = detours_modules_size(h, i);
+            m.name = detail::from_c(detours_modules_name(h, i));
+            out.push_back(std::move(m));
+        }
+        detours_modules_free(h);
+        return out;
+    }
+
+    /**
+     * @brief Returns a module's entry point (the main executable's if @p h_module is null).
+     */
+    inline void *get_entry_point(void *h_module)
+    {
+        return static_cast<void *>(detours_get_entry_point(h_module));
+    }
+
+    /**
+     * @brief Enumerates the exports (EAT) of a loaded module.
+     */
+    inline std::vector<ExportInfo> enumerate_exports(void *h_module)
+    {
+        std::vector<ExportInfo> out;
+        void *h = detours_enumerate_exports(h_module);
+        if (!h)
+            return out;
+
+        size_t n = detours_exports_len(h);
+        out.reserve(n);
+        for (size_t i = 0; i < n; ++i)
+        {
+            ExportInfo e;
+            e.ordinal = detours_exports_ordinal(h, i);
+            e.name = detail::from_c(detours_exports_name(h, i));
+            e.address = const_cast<uint8_t *>(detours_exports_address(h, i));
+            e.forwarder = detail::from_c(detours_exports_forwarder(h, i));
+            out.push_back(std::move(e));
+        }
+        detours_exports_free(h);
+        return out;
+    }
+
+    /**
+     * @brief Enumerates the imports of a loaded module across all imported DLLs.
+     */
+    inline std::vector<ImportInfo> enumerate_imports(void *h_module)
+    {
+        std::vector<ImportInfo> out;
+        void *h = detours_enumerate_imports(h_module);
+        if (!h)
+            return out;
+
+        size_t n = detours_imports_len(h);
+        out.reserve(n);
+        for (size_t i = 0; i < n; ++i)
+        {
+            ImportInfo im;
+            im.dll = detail::from_c(detours_imports_dll(h, i));
+            im.name = detail::from_c(detours_imports_name(h, i));
+            im.ordinal = detours_imports_ordinal(h, i);
+            im.address = const_cast<uint8_t *>(detours_imports_address(h, i));
+            out.push_back(std::move(im));
+        }
+        detours_imports_free(h);
+        return out;
+    }
+
+    /**
+     * @brief Resolves an exported function by name, loading the module if needed.
+     */
+    inline void *find_function(const std::string &module, const std::string &func)
+    {
+        return const_cast<uint8_t *>(detours_find_function(module.c_str(), func.c_str()));
+    }
+
+    /**
+     * @brief Resolves an exported function by ordinal, loading the module if needed.
+     */
+    inline void *find_function(const std::string &module, uint16_t ordinal)
+    {
+        return const_cast<uint8_t *>(detours_find_function_by_ordinal(module.c_str(), ordinal));
+    }
+
     /**
      * @brief Manages the lifetime of installed hooks.
      *
@@ -16,6 +159,8 @@ namespace neohook
      */
     class HookGuard
     {
+        friend class Transaction;
+
     public:
         explicit HookGuard(void *handle) : handle_(handle) {}
 
@@ -172,6 +317,18 @@ namespace neohook
                 throw std::runtime_error("NeoHook: Failed to attach hook");
 
             return reinterpret_cast<T>(tramp);
+        }
+
+        /**
+         * @brief Queues one hook from an existing HookGuard to be removed on commit.
+         */
+        void detach(HookGuard &guard, size_t index)
+        {
+            if (!tx_)
+                throw std::runtime_error("NeoHook: Transaction is no longer valid");
+
+            if (!guard.handle_ || !detours_transaction_detach(tx_, guard.handle_, static_cast<uintptr_t>(index)))
+                throw std::runtime_error("NeoHook: Failed to detach hook");
         }
 
         /**

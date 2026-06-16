@@ -100,6 +100,22 @@ pub enum PendingHook {
         index: usize,
         detour: *const u8,
     },
+    Detach(DetachTarget),
+}
+
+#[derive(Clone, Copy)]
+pub enum DetachTarget {
+    HookPtr(*mut Hook),
+    HandleIndex {
+        handle: *mut core::ffi::c_void,
+        index: usize,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct AppliedDetach {
+    target: DetachTarget,
+    was_enabled: bool,
 }
 
 /// Represents an installed detour managed by NeoHook.
@@ -168,6 +184,30 @@ impl Hook {
             Hook::Iat(h) => h.disable(),
             Hook::Vtable(h) => h.disable(),
             Hook::VtableInstance(h) => h.disable(),
+        }
+    }
+
+    pub(crate) fn detach_prepare(&mut self) -> Result<bool, DetourError> {
+        let was_enabled = self.is_enabled();
+        if was_enabled {
+            self.disable()?;
+        }
+        Ok(was_enabled)
+    }
+
+    pub(crate) fn detach_rollback(&mut self, was_enabled: bool) -> Result<(), DetourError> {
+        if was_enabled {
+            self.enable()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn detach_finalize(&mut self) {
+        match self {
+            Hook::Inline(h) => h.detach_finalize(),
+            Hook::Iat(h) => h.detach_finalize(),
+            Hook::Vtable(h) => h.detach_finalize(),
+            Hook::VtableInstance(h) => h.detach_finalize(),
         }
     }
 }
@@ -300,6 +340,15 @@ impl InlineHook {
         }
         Ok(())
     }
+
+    fn detach_finalize(&mut self) {
+        if self.enabled {
+            let _ = self.disable();
+        }
+        unregister_managed_gateway(self.trampoline.ptr);
+        self.active = false;
+        self.enabled = false;
+    }
 }
 
 impl Drop for InlineHook {
@@ -383,6 +432,14 @@ impl IatHook {
             )?;
             Ok(())
         }
+    }
+
+    fn detach_finalize(&mut self) {
+        if self.enabled {
+            let _ = self.disable();
+        }
+        self.active = false;
+        self.enabled = false;
     }
 }
 
@@ -536,7 +593,11 @@ impl TransactionCore {
     /// # Safety
     /// The caller must ensure that `target` and `detour` are valid pointers. NeoHook performs basic validation but does not guarantee that the pointers are valid or that the memory they point to is properly aligned or accessible. Invalid pointers may cause undefined behavior, including crashes.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
-    pub fn attach(&mut self, target: *mut u8, detour: *const u8) -> Result<*mut u8, DetourError> {
+    pub fn attach(
+        &mut self,
+        mut target: *mut u8,
+        detour: *const u8,
+    ) -> Result<*mut u8, DetourError> {
         if !self.is_pending {
             return Err(DetourError::NotStarted);
         }
@@ -598,6 +659,11 @@ impl TransactionCore {
 
             self.pending_hooks.push(PendingHook::Inline(data));
             return Ok(gateway);
+        }
+
+        target = unsafe { crate::detour_code_from_pointer(target.cast_const()) };
+        if target.is_null() {
+            return Err(DetourError::InvalidParameter);
         }
 
         // --- architecture ---
@@ -868,6 +934,63 @@ impl TransactionCore {
         Ok(original_ptr)
     }
 
+    /// Queues an installed hook to be detached when the transaction commits.
+    ///
+    /// The hook is only disabled during the commit phase. If a later operation
+    /// in the same transaction fails, the hook is re-enabled before the error is
+    /// returned. On successful commit the hook guard is made inert, so dropping
+    /// it afterwards is a no-op.
+    pub fn detach(&mut self, hook: &mut Hook) -> Result<(), DetourError> {
+        if !self.is_pending {
+            return Err(DetourError::NotStarted);
+        }
+
+        let hook_ptr = hook as *mut Hook;
+        if hook_ptr.is_null() || self.pending_detach_exists(DetachTarget::HookPtr(hook_ptr)) {
+            return Err(DetourError::InvalidParameter);
+        }
+
+        self.pending_hooks
+            .push(PendingHook::Detach(DetachTarget::HookPtr(hook_ptr)));
+        Ok(())
+    }
+
+    /// Queues a hook stored inside an FFI handle to be detached on commit.
+    ///
+    /// The handle remains valid. On success, the selected hook is removed from
+    /// the handle's hook list and all remaining hooks keep their relative order.
+    ///
+    /// # Safety
+    ///
+    /// `handle` must be a valid handle previously returned by
+    /// `detours_transaction_commit()`.
+    pub unsafe fn detach_handle_index(
+        &mut self,
+        handle: *mut core::ffi::c_void,
+        index: usize,
+    ) -> Result<(), DetourError> {
+        if !self.is_pending {
+            return Err(DetourError::NotStarted);
+        }
+        if handle.is_null()
+            || self.pending_detach_exists(DetachTarget::HandleIndex { handle, index })
+        {
+            return Err(DetourError::InvalidParameter);
+        }
+
+        let hooks = unsafe { &*(handle as *mut Vec<Hook>) };
+        if index >= hooks.len() {
+            return Err(DetourError::InvalidParameter);
+        }
+
+        self.pending_hooks
+            .push(PendingHook::Detach(DetachTarget::HandleIndex {
+                handle,
+                index,
+            }));
+        Ok(())
+    }
+
     // Commits the current detour transaction and returns the installed hooks.
     ///
     /// Pending inline hooks are installed after tracked threads have been checked
@@ -902,6 +1025,7 @@ impl TransactionCore {
 
         let pending = std::mem::take(&mut self.pending_hooks);
         let mut installed: Vec<Hook> = Vec::new();
+        let mut detached: Vec<AppliedDetach> = Vec::new();
 
         // Apply hooks
         for (hook_index, hook) in pending.into_iter().enumerate() {
@@ -912,6 +1036,7 @@ impl TransactionCore {
                     // check if any thread is executing in the range of the original bytes, and if so, redirect them to the trampoline before we overwrite the code
                     for h_thread in thread_handles {
                         if let Err(e) = self.redirect_rip_relative_threads(h_thread, &data) {
+                            rollback_detaches(&mut detached);
                             self.rollback(&mut installed);
                             self.cleanup_threads();
                             return Err(DetourError::CommitFailed {
@@ -925,6 +1050,7 @@ impl TransactionCore {
                     match self.apply_inline_hook(data) {
                         Ok(inst) => installed.push(Hook::Inline(inst)),
                         Err(e) => {
+                            rollback_detaches(&mut detached);
                             self.rollback(&mut installed);
                             self.cleanup_threads();
                             return Err(DetourError::CommitFailed {
@@ -959,6 +1085,7 @@ impl TransactionCore {
                             }));
                         }
                         Err(err) => {
+                            rollback_detaches(&mut detached);
                             self.rollback(&mut installed);
                             self.cleanup_threads();
                             return Err(DetourError::CommitFailed {
@@ -980,6 +1107,7 @@ impl TransactionCore {
                             installed.push(Hook::Vtable(inst));
                         }
                         Err(err) => {
+                            rollback_detaches(&mut detached);
                             self.rollback(&mut installed);
                             self.cleanup_threads();
                             return Err(DetourError::CommitFailed {
@@ -1006,6 +1134,7 @@ impl TransactionCore {
                             installed.push(Hook::VtableInstance(inst));
                         }
                         Err(err) => {
+                            rollback_detaches(&mut detached);
                             self.rollback(&mut installed);
                             self.cleanup_threads();
                             return Err(DetourError::CommitFailed {
@@ -1014,6 +1143,23 @@ impl TransactionCore {
                                 source: Box::new(err.into()),
                             });
                         }
+                    }
+                },
+                PendingHook::Detach(target) => match unsafe { prepare_detach(target) } {
+                    Ok(was_enabled) => detached.push(AppliedDetach {
+                        target,
+                        was_enabled,
+                    }),
+                    Err(e) => {
+                        rollback_detaches(&mut detached);
+                        rollback_detaches(&mut detached);
+                        self.rollback(&mut installed);
+                        self.cleanup_threads();
+                        return Err(DetourError::CommitFailed {
+                            index: hook_index,
+                            kind: HookKind::Detach,
+                            source: Box::new(e),
+                        });
                     }
                 },
             }
@@ -1036,6 +1182,7 @@ impl TransactionCore {
 
         // resume threads
         self.cleanup_threads();
+        finalize_detaches(&mut detached);
         self.is_pending = false;
         Ok(installed)
     }
@@ -1410,6 +1557,9 @@ impl TransactionCore {
                         i, object_vptr, vtable_len, index
                     );
                 }
+                PendingHook::Detach(_) => {
+                    println!("  [{}] DETACH", i);
+                }
             }
         }
 
@@ -1466,6 +1616,16 @@ impl TransactionCore {
             }
         }
     }
+
+    fn pending_detach_exists(&self, needle: DetachTarget) -> bool {
+        self.pending_hooks.iter().any(|hook| {
+            let PendingHook::Detach(existing) = hook else {
+                return false;
+            };
+
+            detach_targets_equal(*existing, needle)
+        })
+    }
 }
 
 impl Drop for TransactionCore {
@@ -1498,6 +1658,101 @@ fn lock_transaction() -> std::sync::MutexGuard<'static, ()> {
     TRANSACTION_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn detach_targets_equal(left: DetachTarget, right: DetachTarget) -> bool {
+    match (left, right) {
+        (DetachTarget::HookPtr(a), DetachTarget::HookPtr(b)) => a == b,
+        (
+            DetachTarget::HandleIndex {
+                handle: a_handle,
+                index: a_index,
+            },
+            DetachTarget::HandleIndex {
+                handle: b_handle,
+                index: b_index,
+            },
+        ) => a_handle == b_handle && a_index == b_index,
+        _ => false,
+    }
+}
+
+unsafe fn prepare_detach(target: DetachTarget) -> Result<bool, DetourError> {
+    let hook = unsafe { hook_from_detach_target_mut(target)? };
+    hook.detach_prepare()
+}
+
+unsafe fn hook_from_detach_target_mut<'a>(
+    target: DetachTarget,
+) -> Result<&'a mut Hook, DetourError> {
+    match target {
+        DetachTarget::HookPtr(hook) => {
+            if hook.is_null() {
+                Err(DetourError::InvalidParameter)
+            } else {
+                Ok(unsafe { &mut *hook })
+            }
+        }
+        DetachTarget::HandleIndex { handle, index } => {
+            if handle.is_null() {
+                return Err(DetourError::InvalidParameter);
+            }
+
+            let hooks = unsafe { &mut *(handle as *mut Vec<Hook>) };
+            hooks.get_mut(index).ok_or(DetourError::InvalidParameter)
+        }
+    }
+}
+
+fn rollback_detaches(detached: &mut Vec<AppliedDetach>) {
+    for detach in detached.iter().rev() {
+        let Ok(hook) = (unsafe { hook_from_detach_target_mut(detach.target) }) else {
+            continue;
+        };
+        let _ = hook.detach_rollback(detach.was_enabled);
+    }
+    detached.clear();
+}
+
+fn finalize_detaches(detached: &mut Vec<AppliedDetach>) {
+    let mut handle_detaches = Vec::new();
+
+    for detach in detached.iter() {
+        match detach.target {
+            DetachTarget::HookPtr(hook) => {
+                if !hook.is_null() {
+                    unsafe {
+                        (*hook).detach_finalize();
+                    }
+                }
+            }
+            DetachTarget::HandleIndex { handle, index } => {
+                handle_detaches.push((handle, index));
+            }
+        }
+    }
+
+    handle_detaches.sort_by(|(left_handle, left_index), (right_handle, right_index)| {
+        left_handle
+            .cmp(right_handle)
+            .then_with(|| right_index.cmp(left_index))
+    });
+
+    for (handle, index) in handle_detaches {
+        if handle.is_null() {
+            continue;
+        }
+
+        let hooks = unsafe { &mut *(handle as *mut Vec<Hook>) };
+        if index >= hooks.len() {
+            continue;
+        }
+
+        let mut hook = hooks.remove(index);
+        hook.detach_finalize();
+    }
+
+    detached.clear();
 }
 
 fn managed_gateways() -> &'static Mutex<HashSet<usize>> {

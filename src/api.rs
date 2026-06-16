@@ -1,8 +1,10 @@
 // Copyright (c) 2026 NeoHook Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use crate::DetourError;
+use crate::introspect;
 use crate::transaction::{Hook, TransactionCore};
-use std::ffi::c_void;
+use std::ffi::{CStr, CString, c_char, c_void};
+use windows_sys::Win32::Foundation::HMODULE;
 
 /// High-level wrapper around [`TransactionCore`].
 ///
@@ -152,6 +154,18 @@ impl DetourTransaction {
             .attach_vtable_instance(object_vptr, index, vtable_len, detour)
     }
 
+    /// Queues an installed hook to be detached when the transaction commits.
+    ///
+    /// If a later operation in the same transaction fails, the hook is
+    /// re-enabled before the commit error is returned. On success, `hook` is
+    /// made inert and dropping it afterwards is a no-op.
+    pub fn detach(&mut self, hook: &mut Hook) -> Result<(), DetourError> {
+        self.inner
+            .as_mut()
+            .ok_or(DetourError::NotStarted)?
+            .detach(hook)
+    }
+
     /// Commits the transaction and returns the installed hooks.
     ///
     /// All pending hooks are applied. On success, ownership of the installed
@@ -193,6 +207,20 @@ impl Drop for DetourTransaction {
 }
 
 // ----------------- FFI Entry Points (C-Interfaces) -----------------
+
+/// Resolves a function pointer to the first real code address by following
+/// common leading jump stubs and import thunks.
+///
+/// Returns null if `pointer` is null. If the pointer does not reference a
+/// recognized jump stub, the original pointer is returned.
+///
+/// # Safety
+/// `pointer` and any thunk slots it references must point to readable process
+/// memory.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_code_from_pointer(pointer: *const u8) -> *mut u8 {
+    unsafe { crate::detour_code_from_pointer(pointer) }
+}
 
 /// Begins a new detour transaction and returns an opaque transaction pointer.
 ///
@@ -256,6 +284,39 @@ pub unsafe extern "C" fn detours_transaction_attach(
     tx_ref
         .attach(target, detour)
         .unwrap_or(std::ptr::null_mut())
+}
+
+/// Queues a single hook from an opaque hook handle to be detached when the
+/// transaction commits.
+///
+/// On success, the selected hook is removed from `handle` during commit. The
+/// handle remains valid and any other hooks stored in it remain active.
+///
+/// Returns `1` if the detach was queued, or `0` if `tx`/`handle` is null, the
+/// transaction is no longer pending, or `idx` is out of bounds.
+///
+/// # Safety
+/// `tx` must be a valid transaction pointer returned by
+/// `detours_transaction_begin()`. `handle` must be a valid handle returned by
+/// `detours_transaction_commit()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_transaction_detach(
+    tx: *mut DetourTransaction,
+    handle: *mut c_void,
+    idx: usize,
+) -> i32 {
+    if tx.is_null() || handle.is_null() {
+        return 0;
+    }
+
+    let tx_ref = unsafe { &mut *tx };
+    tx_ref
+        .inner
+        .as_mut()
+        .ok_or(DetourError::NotStarted)
+        .and_then(|inner| unsafe { inner.detach_handle_index(handle, idx) })
+        .map(|_| 1)
+        .unwrap_or(0)
 }
 
 /// Commits a detour transaction and returns an opaque handle to the installed
@@ -535,4 +596,432 @@ pub unsafe extern "C" fn detours_transaction_abort(tx: *mut DetourTransaction) -
     let mut tx_box = unsafe { Box::from_raw(tx) };
     tx_box.abort();
     1
+}
+
+// ----------------- FFI Entry Points: Module / PE Introspection -----------------
+//
+// Variable-length results (modules / exports / imports) follow NeoHook's opaque
+// handle pattern: an enumerate call returns a boxed handle, the caller queries
+// the length and indexes individual fields, then releases the handle with the
+// matching `*_free` function. String fields are returned as `const char*`
+// pointers that stay valid until the handle is freed.
+
+/// Sentinel returned by `detours_imports_ordinal` for a by-name import.
+const IMPORT_BY_NAME: u32 = u32::MAX;
+
+struct ModuleEntryC {
+    base: *mut c_void,
+    size: u32,
+    name: CString,
+}
+
+struct ExportEntryC {
+    ordinal: u32,
+    name: Option<CString>,
+    address: *const u8,
+    forwarder: Option<CString>,
+}
+
+struct ImportEntryC {
+    dll: CString,
+    name: Option<CString>,
+    ordinal: Option<u16>,
+    address: *const u8,
+}
+
+fn to_cstring(s: String) -> CString {
+    CString::new(s).unwrap_or_default()
+}
+
+/// Enumerates the modules loaded in the calling process.
+///
+/// Returns an opaque handle to be queried with `detours_modules_len()` /
+/// `detours_modules_*()` and released with `detours_modules_free()`. The handle
+/// is non-null even when no modules are reported.
+#[unsafe(no_mangle)]
+pub extern "C" fn detours_enumerate_modules() -> *mut c_void {
+    let entries: Vec<ModuleEntryC> = introspect::enumerate_modules()
+        .into_iter()
+        .map(|m| ModuleEntryC {
+            base: m.base,
+            size: m.size,
+            name: to_cstring(m.name),
+        })
+        .collect();
+    Box::into_raw(Box::new(entries)) as *mut c_void
+}
+
+/// Returns the number of modules in a handle from `detours_enumerate_modules()`.
+///
+/// Returns `0` if `handle` is null.
+///
+/// # Safety
+/// `handle` must be a valid handle returned by `detours_enumerate_modules()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_modules_len(handle: *mut c_void) -> usize {
+    if handle.is_null() {
+        return 0;
+    }
+    unsafe { &*(handle as *mut Vec<ModuleEntryC>) }.len()
+}
+
+/// Returns the base address (`HMODULE`) of the module at `idx`, or null if
+/// `handle` is null or `idx` is out of bounds.
+///
+/// # Safety
+/// `handle` must be a valid handle returned by `detours_enumerate_modules()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_modules_base(handle: *mut c_void, idx: usize) -> *mut c_void {
+    if handle.is_null() {
+        return std::ptr::null_mut();
+    }
+    let vec = unsafe { &*(handle as *mut Vec<ModuleEntryC>) };
+    vec.get(idx).map(|m| m.base).unwrap_or(std::ptr::null_mut())
+}
+
+/// Returns the image size of the module at `idx`, or `0` if `handle` is null or
+/// `idx` is out of bounds.
+///
+/// # Safety
+/// `handle` must be a valid handle returned by `detours_enumerate_modules()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_modules_size(handle: *mut c_void, idx: usize) -> u32 {
+    if handle.is_null() {
+        return 0;
+    }
+    let vec = unsafe { &*(handle as *mut Vec<ModuleEntryC>) };
+    vec.get(idx).map(|m| m.size).unwrap_or(0)
+}
+
+/// Returns the file name of the module at `idx` as a NUL-terminated string, or
+/// null if `handle` is null or `idx` is out of bounds. The pointer is valid
+/// until the handle is freed.
+///
+/// # Safety
+/// `handle` must be a valid handle returned by `detours_enumerate_modules()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_modules_name(handle: *mut c_void, idx: usize) -> *const c_char {
+    if handle.is_null() {
+        return std::ptr::null();
+    }
+    let vec = unsafe { &*(handle as *mut Vec<ModuleEntryC>) };
+    vec.get(idx)
+        .map(|m| m.name.as_ptr())
+        .unwrap_or(std::ptr::null())
+}
+
+/// Frees a module handle returned by `detours_enumerate_modules()`.
+///
+/// # Safety
+/// `handle` must be a valid handle returned by `detours_enumerate_modules()`
+/// and must not be used afterwards.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_modules_free(handle: *mut c_void) {
+    if !handle.is_null() {
+        drop(unsafe { Box::from_raw(handle as *mut Vec<ModuleEntryC>) });
+    }
+}
+
+/// Returns the entry point of the module identified by `h_module`.
+///
+/// When `h_module` is null, the entry point of the main executable is returned.
+/// Returns null if the module headers are invalid or it has no entry point.
+///
+/// # Safety
+/// `h_module`, when non-null, must be the base address of a valid PE module
+/// loaded in the current process.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_get_entry_point(h_module: *mut c_void) -> *mut u8 {
+    introspect::get_entry_point(h_module as HMODULE)
+        .map(|p| p as *mut u8)
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// Enumerates the exports (EAT) of the module identified by `h_module`.
+///
+/// Returns an opaque handle to be queried with `detours_exports_len()` /
+/// `detours_exports_*()` and released with `detours_exports_free()`. Returns
+/// null if the module's PE headers are invalid.
+///
+/// # Safety
+/// `h_module` must be the base address of a valid PE module loaded in the
+/// current process.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_enumerate_exports(h_module: *mut c_void) -> *mut c_void {
+    let exports = match unsafe { introspect::enumerate_exports(h_module as HMODULE) } {
+        Ok(v) => v,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    let entries: Vec<ExportEntryC> = exports
+        .into_iter()
+        .map(|e| ExportEntryC {
+            ordinal: e.ordinal,
+            name: e.name.map(to_cstring),
+            address: e.address,
+            forwarder: e.forwarder.map(to_cstring),
+        })
+        .collect();
+    Box::into_raw(Box::new(entries)) as *mut c_void
+}
+
+/// Returns the number of exports in a handle from `detours_enumerate_exports()`.
+///
+/// Returns `0` if `handle` is null.
+///
+/// # Safety
+/// `handle` must be a valid handle returned by `detours_enumerate_exports()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_exports_len(handle: *mut c_void) -> usize {
+    if handle.is_null() {
+        return 0;
+    }
+    unsafe { &*(handle as *mut Vec<ExportEntryC>) }.len()
+}
+
+/// Returns the ordinal of the export at `idx`, or `0` if `handle` is null or
+/// `idx` is out of bounds.
+///
+/// # Safety
+/// `handle` must be a valid handle returned by `detours_enumerate_exports()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_exports_ordinal(handle: *mut c_void, idx: usize) -> u32 {
+    if handle.is_null() {
+        return 0;
+    }
+    let vec = unsafe { &*(handle as *mut Vec<ExportEntryC>) };
+    vec.get(idx).map(|e| e.ordinal).unwrap_or(0)
+}
+
+/// Returns the name of the export at `idx`, or null if it is exported by ordinal
+/// only (or `handle` is null / `idx` is out of bounds). Valid until free.
+///
+/// # Safety
+/// `handle` must be a valid handle returned by `detours_enumerate_exports()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_exports_name(handle: *mut c_void, idx: usize) -> *const c_char {
+    if handle.is_null() {
+        return std::ptr::null();
+    }
+    let vec = unsafe { &*(handle as *mut Vec<ExportEntryC>) };
+    vec.get(idx)
+        .and_then(|e| e.name.as_ref())
+        .map(|n| n.as_ptr())
+        .unwrap_or(std::ptr::null())
+}
+
+/// Returns the resolved code address of the export at `idx`, or null if
+/// `handle` is null or `idx` is out of bounds.
+///
+/// # Safety
+/// `handle` must be a valid handle returned by `detours_enumerate_exports()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_exports_address(handle: *mut c_void, idx: usize) -> *const u8 {
+    if handle.is_null() {
+        return std::ptr::null();
+    }
+    let vec = unsafe { &*(handle as *mut Vec<ExportEntryC>) };
+    vec.get(idx).map(|e| e.address).unwrap_or(std::ptr::null())
+}
+
+/// Returns the forwarder target (`"OTHERDLL.Function"`) of the export at `idx`,
+/// or null if it is not a forwarder (or `handle` is null / `idx` is out of
+/// bounds). Valid until free.
+///
+/// # Safety
+/// `handle` must be a valid handle returned by `detours_enumerate_exports()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_exports_forwarder(
+    handle: *mut c_void,
+    idx: usize,
+) -> *const c_char {
+    if handle.is_null() {
+        return std::ptr::null();
+    }
+    let vec = unsafe { &*(handle as *mut Vec<ExportEntryC>) };
+    vec.get(idx)
+        .and_then(|e| e.forwarder.as_ref())
+        .map(|f| f.as_ptr())
+        .unwrap_or(std::ptr::null())
+}
+
+/// Frees an export handle returned by `detours_enumerate_exports()`.
+///
+/// # Safety
+/// `handle` must be a valid handle returned by `detours_enumerate_exports()`
+/// and must not be used afterwards.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_exports_free(handle: *mut c_void) {
+    if !handle.is_null() {
+        drop(unsafe { Box::from_raw(handle as *mut Vec<ExportEntryC>) });
+    }
+}
+
+/// Enumerates the imports of the module identified by `h_module` across all of
+/// its imported DLLs.
+///
+/// Returns an opaque handle to be queried with `detours_imports_len()` /
+/// `detours_imports_*()` and released with `detours_imports_free()`. Returns
+/// null if the module's PE headers are invalid.
+///
+/// # Safety
+/// `h_module` must be the base address of a valid PE module loaded in the
+/// current process.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_enumerate_imports(h_module: *mut c_void) -> *mut c_void {
+    let imports = match unsafe { introspect::enumerate_imports(h_module as HMODULE) } {
+        Ok(v) => v,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    let entries: Vec<ImportEntryC> = imports
+        .into_iter()
+        .map(|i| ImportEntryC {
+            dll: to_cstring(i.dll),
+            name: i.name.map(to_cstring),
+            ordinal: i.ordinal,
+            address: i.address,
+        })
+        .collect();
+    Box::into_raw(Box::new(entries)) as *mut c_void
+}
+
+/// Returns the number of imports in a handle from `detours_enumerate_imports()`.
+///
+/// Returns `0` if `handle` is null.
+///
+/// # Safety
+/// `handle` must be a valid handle returned by `detours_enumerate_imports()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_imports_len(handle: *mut c_void) -> usize {
+    if handle.is_null() {
+        return 0;
+    }
+    unsafe { &*(handle as *mut Vec<ImportEntryC>) }.len()
+}
+
+/// Returns the source DLL name of the import at `idx`, or null if `handle` is
+/// null or `idx` is out of bounds. Valid until free.
+///
+/// # Safety
+/// `handle` must be a valid handle returned by `detours_enumerate_imports()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_imports_dll(handle: *mut c_void, idx: usize) -> *const c_char {
+    if handle.is_null() {
+        return std::ptr::null();
+    }
+    let vec = unsafe { &*(handle as *mut Vec<ImportEntryC>) };
+    vec.get(idx)
+        .map(|i| i.dll.as_ptr())
+        .unwrap_or(std::ptr::null())
+}
+
+/// Returns the name of the import at `idx`, or null if it is imported by ordinal
+/// (or `handle` is null / `idx` is out of bounds). Valid until free.
+///
+/// # Safety
+/// `handle` must be a valid handle returned by `detours_enumerate_imports()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_imports_name(handle: *mut c_void, idx: usize) -> *const c_char {
+    if handle.is_null() {
+        return std::ptr::null();
+    }
+    let vec = unsafe { &*(handle as *mut Vec<ImportEntryC>) };
+    vec.get(idx)
+        .and_then(|i| i.name.as_ref())
+        .map(|n| n.as_ptr())
+        .unwrap_or(std::ptr::null())
+}
+
+/// Returns the ordinal of the import at `idx`, or `0xFFFFFFFF` if it is imported
+/// by name (or `handle` is null / `idx` is out of bounds).
+///
+/// # Safety
+/// `handle` must be a valid handle returned by `detours_enumerate_imports()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_imports_ordinal(handle: *mut c_void, idx: usize) -> u32 {
+    if handle.is_null() {
+        return IMPORT_BY_NAME;
+    }
+    let vec = unsafe { &*(handle as *mut Vec<ImportEntryC>) };
+    vec.get(idx)
+        .and_then(|i| i.ordinal)
+        .map(|o| o as u32)
+        .unwrap_or(IMPORT_BY_NAME)
+}
+
+/// Returns the bound IAT address of the import at `idx`, or null if `handle` is
+/// null or `idx` is out of bounds.
+///
+/// # Safety
+/// `handle` must be a valid handle returned by `detours_enumerate_imports()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_imports_address(handle: *mut c_void, idx: usize) -> *const u8 {
+    if handle.is_null() {
+        return std::ptr::null();
+    }
+    let vec = unsafe { &*(handle as *mut Vec<ImportEntryC>) };
+    vec.get(idx).map(|i| i.address).unwrap_or(std::ptr::null())
+}
+
+/// Frees an import handle returned by `detours_enumerate_imports()`.
+///
+/// # Safety
+/// `handle` must be a valid handle returned by `detours_enumerate_imports()`
+/// and must not be used afterwards.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_imports_free(handle: *mut c_void) {
+    if !handle.is_null() {
+        drop(unsafe { Box::from_raw(handle as *mut Vec<ImportEntryC>) });
+    }
+}
+
+/// Resolves an exported function by name within a module, loading the module if
+/// it is not already present.
+///
+/// Returns null if `module`/`func` are null or not valid UTF-8, or if the
+/// function cannot be resolved.
+///
+/// # Safety
+/// `module` and `func` must be valid NUL-terminated C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_find_function(
+    module: *const c_char,
+    func: *const c_char,
+) -> *const u8 {
+    if module.is_null() || func.is_null() {
+        return std::ptr::null();
+    }
+    let module = match unsafe { CStr::from_ptr(module) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null(),
+    };
+    let func = match unsafe { CStr::from_ptr(func) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null(),
+    };
+    crate::find_function(module, func).unwrap_or(std::ptr::null())
+}
+
+/// Resolves an exported function by ordinal within a module, loading the module
+/// if it is not already present.
+///
+/// Returns null if `module` is null or not valid UTF-8, or if the ordinal
+/// cannot be resolved.
+///
+/// # Safety
+/// `module` must be a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_find_function_by_ordinal(
+    module: *const c_char,
+    ordinal: u16,
+) -> *const u8 {
+    if module.is_null() {
+        return std::ptr::null();
+    }
+    let module = match unsafe { CStr::from_ptr(module) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null(),
+    };
+    crate::find_function_by_ordinal(module, ordinal).unwrap_or(std::ptr::null())
 }

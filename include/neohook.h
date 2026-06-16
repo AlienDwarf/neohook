@@ -24,6 +24,19 @@ extern "C" {
 #endif // __cplusplus
 
 /**
+ * Resolves a function pointer to the first real code address by following
+ * common leading jump stubs and import thunks.
+ *
+ * Returns null if `pointer` is null. If the pointer does not reference a
+ * recognized jump stub, the original pointer is returned.
+ *
+ * # Safety
+ * `pointer` and any thunk slots it references must point to readable process
+ * memory.
+ */
+uint8_t *detours_code_from_pointer(const uint8_t *pointer);
+
+/**
  * Begins a new detour transaction and returns an opaque transaction pointer.
  *
  * The returned pointer is owned by the caller and must later be passed to
@@ -64,6 +77,23 @@ int32_t detours_transaction_update_thread(DetourTransaction *tx, uint32_t thread
  * detour function, respectively.
  */
 uint8_t *detours_transaction_attach(DetourTransaction *tx, uint8_t *target, const uint8_t *detour);
+
+/**
+ * Queues a single hook from an opaque hook handle to be detached when the
+ * transaction commits.
+ *
+ * On success, the selected hook is removed from `handle` during commit. The
+ * handle remains valid and any other hooks stored in it remain active.
+ *
+ * Returns `1` if the detach was queued, or `0` if `tx`/`handle` is null, the
+ * transaction is no longer pending, or `idx` is out of bounds.
+ *
+ * # Safety
+ * `tx` must be a valid transaction pointer returned by
+ * `detours_transaction_begin()`. `handle` must be a valid handle returned by
+ * `detours_transaction_commit()`.
+ */
+int32_t detours_transaction_detach(DetourTransaction *tx, void *handle, uintptr_t idx);
 
 /**
  * Commits a detour transaction and returns an opaque handle to the installed
@@ -221,6 +251,236 @@ int32_t detours_transaction_update_all_threads(DetourTransaction *tx);
  * function and it must not be used again afterwards.
  */
 int32_t detours_transaction_abort(DetourTransaction *tx);
+
+/**
+ * Enumerates the modules loaded in the calling process.
+ *
+ * Returns an opaque handle to be queried with `detours_modules_len()` /
+ * `detours_modules_*()` and released with `detours_modules_free()`. The handle
+ * is non-null even when no modules are reported.
+ */
+void *detours_enumerate_modules(void);
+
+/**
+ * Returns the number of modules in a handle from `detours_enumerate_modules()`.
+ *
+ * Returns `0` if `handle` is null.
+ *
+ * # Safety
+ * `handle` must be a valid handle returned by `detours_enumerate_modules()`.
+ */
+uintptr_t detours_modules_len(void *handle);
+
+/**
+ * Returns the base address (`HMODULE`) of the module at `idx`, or null if
+ * `handle` is null or `idx` is out of bounds.
+ *
+ * # Safety
+ * `handle` must be a valid handle returned by `detours_enumerate_modules()`.
+ */
+void *detours_modules_base(void *handle, uintptr_t idx);
+
+/**
+ * Returns the image size of the module at `idx`, or `0` if `handle` is null or
+ * `idx` is out of bounds.
+ *
+ * # Safety
+ * `handle` must be a valid handle returned by `detours_enumerate_modules()`.
+ */
+uint32_t detours_modules_size(void *handle, uintptr_t idx);
+
+/**
+ * Returns the file name of the module at `idx` as a NUL-terminated string, or
+ * null if `handle` is null or `idx` is out of bounds. The pointer is valid
+ * until the handle is freed.
+ *
+ * # Safety
+ * `handle` must be a valid handle returned by `detours_enumerate_modules()`.
+ */
+const char *detours_modules_name(void *handle, uintptr_t idx);
+
+/**
+ * Frees a module handle returned by `detours_enumerate_modules()`.
+ *
+ * # Safety
+ * `handle` must be a valid handle returned by `detours_enumerate_modules()`
+ * and must not be used afterwards.
+ */
+void detours_modules_free(void *handle);
+
+/**
+ * Returns the entry point of the module identified by `h_module`.
+ *
+ * When `h_module` is null, the entry point of the main executable is returned.
+ * Returns null if the module headers are invalid or it has no entry point.
+ *
+ * # Safety
+ * `h_module`, when non-null, must be the base address of a valid PE module
+ * loaded in the current process.
+ */
+uint8_t *detours_get_entry_point(void *h_module);
+
+/**
+ * Enumerates the exports (EAT) of the module identified by `h_module`.
+ *
+ * Returns an opaque handle to be queried with `detours_exports_len()` /
+ * `detours_exports_*()` and released with `detours_exports_free()`. Returns
+ * null if the module's PE headers are invalid.
+ *
+ * # Safety
+ * `h_module` must be the base address of a valid PE module loaded in the
+ * current process.
+ */
+void *detours_enumerate_exports(void *h_module);
+
+/**
+ * Returns the number of exports in a handle from `detours_enumerate_exports()`.
+ *
+ * Returns `0` if `handle` is null.
+ *
+ * # Safety
+ * `handle` must be a valid handle returned by `detours_enumerate_exports()`.
+ */
+uintptr_t detours_exports_len(void *handle);
+
+/**
+ * Returns the ordinal of the export at `idx`, or `0` if `handle` is null or
+ * `idx` is out of bounds.
+ *
+ * # Safety
+ * `handle` must be a valid handle returned by `detours_enumerate_exports()`.
+ */
+uint32_t detours_exports_ordinal(void *handle, uintptr_t idx);
+
+/**
+ * Returns the name of the export at `idx`, or null if it is exported by ordinal
+ * only (or `handle` is null / `idx` is out of bounds). Valid until free.
+ *
+ * # Safety
+ * `handle` must be a valid handle returned by `detours_enumerate_exports()`.
+ */
+const char *detours_exports_name(void *handle, uintptr_t idx);
+
+/**
+ * Returns the resolved code address of the export at `idx`, or null if
+ * `handle` is null or `idx` is out of bounds.
+ *
+ * # Safety
+ * `handle` must be a valid handle returned by `detours_enumerate_exports()`.
+ */
+const uint8_t *detours_exports_address(void *handle, uintptr_t idx);
+
+/**
+ * Returns the forwarder target (`"OTHERDLL.Function"`) of the export at `idx`,
+ * or null if it is not a forwarder (or `handle` is null / `idx` is out of
+ * bounds). Valid until free.
+ *
+ * # Safety
+ * `handle` must be a valid handle returned by `detours_enumerate_exports()`.
+ */
+const char *detours_exports_forwarder(void *handle, uintptr_t idx);
+
+/**
+ * Frees an export handle returned by `detours_enumerate_exports()`.
+ *
+ * # Safety
+ * `handle` must be a valid handle returned by `detours_enumerate_exports()`
+ * and must not be used afterwards.
+ */
+void detours_exports_free(void *handle);
+
+/**
+ * Enumerates the imports of the module identified by `h_module` across all of
+ * its imported DLLs.
+ *
+ * Returns an opaque handle to be queried with `detours_imports_len()` /
+ * `detours_imports_*()` and released with `detours_imports_free()`. Returns
+ * null if the module's PE headers are invalid.
+ *
+ * # Safety
+ * `h_module` must be the base address of a valid PE module loaded in the
+ * current process.
+ */
+void *detours_enumerate_imports(void *h_module);
+
+/**
+ * Returns the number of imports in a handle from `detours_enumerate_imports()`.
+ *
+ * Returns `0` if `handle` is null.
+ *
+ * # Safety
+ * `handle` must be a valid handle returned by `detours_enumerate_imports()`.
+ */
+uintptr_t detours_imports_len(void *handle);
+
+/**
+ * Returns the source DLL name of the import at `idx`, or null if `handle` is
+ * null or `idx` is out of bounds. Valid until free.
+ *
+ * # Safety
+ * `handle` must be a valid handle returned by `detours_enumerate_imports()`.
+ */
+const char *detours_imports_dll(void *handle, uintptr_t idx);
+
+/**
+ * Returns the name of the import at `idx`, or null if it is imported by ordinal
+ * (or `handle` is null / `idx` is out of bounds). Valid until free.
+ *
+ * # Safety
+ * `handle` must be a valid handle returned by `detours_enumerate_imports()`.
+ */
+const char *detours_imports_name(void *handle, uintptr_t idx);
+
+/**
+ * Returns the ordinal of the import at `idx`, or `0xFFFFFFFF` if it is imported
+ * by name (or `handle` is null / `idx` is out of bounds).
+ *
+ * # Safety
+ * `handle` must be a valid handle returned by `detours_enumerate_imports()`.
+ */
+uint32_t detours_imports_ordinal(void *handle, uintptr_t idx);
+
+/**
+ * Returns the bound IAT address of the import at `idx`, or null if `handle` is
+ * null or `idx` is out of bounds.
+ *
+ * # Safety
+ * `handle` must be a valid handle returned by `detours_enumerate_imports()`.
+ */
+const uint8_t *detours_imports_address(void *handle, uintptr_t idx);
+
+/**
+ * Frees an import handle returned by `detours_enumerate_imports()`.
+ *
+ * # Safety
+ * `handle` must be a valid handle returned by `detours_enumerate_imports()`
+ * and must not be used afterwards.
+ */
+void detours_imports_free(void *handle);
+
+/**
+ * Resolves an exported function by name within a module, loading the module if
+ * it is not already present.
+ *
+ * Returns null if `module`/`func` are null or not valid UTF-8, or if the
+ * function cannot be resolved.
+ *
+ * # Safety
+ * `module` and `func` must be valid NUL-terminated C strings.
+ */
+const uint8_t *detours_find_function(const char *module, const char *func);
+
+/**
+ * Resolves an exported function by ordinal within a module, loading the module
+ * if it is not already present.
+ *
+ * Returns null if `module` is null or not valid UTF-8, or if the ordinal
+ * cannot be resolved.
+ *
+ * # Safety
+ * `module` must be a valid NUL-terminated C string.
+ */
+const uint8_t *detours_find_function_by_ordinal(const char *module, uint16_t ordinal);
 
 #ifdef __cplusplus
 }  // extern "C"

@@ -13,10 +13,13 @@ use std::fmt;
 
 mod alloc;
 pub mod api;
+mod code;
 mod disasm;
 mod iat;
+mod introspect;
 mod mem;
 mod module;
+mod pe;
 mod reentrancy;
 mod threads;
 pub(crate) mod transaction;
@@ -24,8 +27,16 @@ mod vtable;
 
 // Re-exports for public API
 pub use crate::api::DetourTransaction;
+pub use crate::code::detour_code_from_pointer;
 pub use crate::iat::IatHookError;
-pub use crate::module::{find_function, get_module_handle, get_module_size};
+pub use crate::introspect::{
+    ExportInfo, ImportInfo, ModuleInfo, enumerate_exports, enumerate_imports, enumerate_modules,
+    get_entry_point,
+};
+pub use crate::module::{
+    find_function, find_function_by_ordinal, get_module_handle, get_module_size,
+};
+pub use crate::pe::PeError;
 pub use crate::reentrancy::ReentrancyGuard;
 pub use crate::transaction::{
     Hook, IatHook, InlineHook, JumpType, TransactionCore, VtableHook, VtableInstanceHook,
@@ -39,6 +50,7 @@ pub enum HookKind {
     Iat,
     Vtable,
     VtableInstance,
+    Detach,
 }
 
 impl fmt::Display for HookKind {
@@ -48,6 +60,7 @@ impl fmt::Display for HookKind {
             Self::Iat => "IAT",
             Self::Vtable => "VTable",
             Self::VtableInstance => "per-instance VTable",
+            Self::Detach => "detach",
         };
         f.write_str(name)
     }

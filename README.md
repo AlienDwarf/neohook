@@ -91,6 +91,7 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 | v0.3.0  |    ✅ Done | Enable / disable hooks without full unhook             |
 | v0.3.0  |    ✅ Done | Recursion / reentrancy guards                          |
 | v0.3.0  |    ✅ Done | Improved diagnostics / debug output                    |
+| v0.3.0  |    ✅ Done | Module / PE introspection (modules, exports, imports)  |
 | v0.4.0  | ⬜ Planned | Export / EAT hooking                                   |
 | v0.5.0  | ⬜ Planned | VEH hooking                                            |
 
@@ -330,6 +331,40 @@ The header is written to `include` directory.
 **VTable FFI API:**
 
 - `detours_transaction_attach_vtable(tx, vtable, index, detour)` returns the previous slot pointer on success.
+
+---
+
+### Module / PE Introspection
+
+Discover hook targets at runtime: enumerate loaded modules, a module's entry point,
+its exports (EAT) and imports, and resolve exports by name or ordinal.
+
+```rust
+use neohook::{enumerate_modules, enumerate_exports, get_module_handle, find_function_by_ordinal};
+
+// List loaded modules.
+for m in enumerate_modules() {
+    println!("{} @ {:p} ({} bytes)", m.name, m.base, m.size);
+}
+
+// Walk a module's exports.
+let h = get_module_handle("kernel32.dll").unwrap();
+for e in unsafe { enumerate_exports(h) }.unwrap() {
+    if let Some(name) = &e.name {
+        println!("#{} {} -> {:p}", e.ordinal, name, e.address);
+    }
+}
+
+// Resolve an export the linker only exposes by ordinal.
+let func = find_function_by_ordinal("ws2_32.dll", 1);
+```
+
+The C ABI mirrors this with the opaque-handle pattern
+(`detours_enumerate_modules` / `detours_enumerate_exports` / `detours_enumerate_imports`,
+each paired with `_len` / per-field getters / `_free`), plus `detours_get_entry_point`
+and `detours_find_function` / `detours_find_function_by_ordinal`. The C++ wrapper
+(`neohook::enumerate_modules()`, etc.) returns owning `std::vector`s. See
+[`examples/introspect.rs`](examples/introspect.rs).
 
 ---
 

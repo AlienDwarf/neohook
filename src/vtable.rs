@@ -184,6 +184,14 @@ impl VTableHook {
         Self::write_slot(self.slot, self.original_ptr)
     }
 
+    pub(crate) fn detach_finalize(&mut self) {
+        if self.enabled {
+            let _ = self.disable();
+        }
+        self.active = false;
+        self.enabled = false;
+    }
+
     /// Writes `value` into `slot`, flipping page protection around the write.
     fn write_slot(slot: *mut *mut u8, value: *mut u8) -> Result<(), DetourError> {
         if slot.is_null() {
@@ -477,6 +485,14 @@ impl VTableInstanceHook {
         self.cloned_vtable = std::ptr::null_mut();
 
         Ok(())
+    }
+
+    pub(crate) fn detach_finalize(&mut self) {
+        if self.active {
+            let _ = self.perform_unhook();
+        }
+        self.active = false;
+        self.enabled = false;
     }
 }
 
