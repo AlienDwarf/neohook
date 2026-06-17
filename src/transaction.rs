@@ -698,8 +698,34 @@ impl TransactionCore {
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn attach(
         &mut self,
+        target: *mut u8,
+        detour: *const u8,
+    ) -> Result<*mut u8, DetourError> {
+        self.attach_inner(target, detour, true)
+    }
+
+    /// Queues an inline hook at the **exact** `target` address, without first
+    /// resolving leading jump stubs / import thunks.
+    ///
+    /// Entry-point hooking ([`Self::attach`]) follows thunks so a stub address
+    /// resolves to the real function body. Mid-function / arbitrary-address
+    /// detours must instead patch precisely where the caller asked, even if the
+    /// bytes there happen to look like a jump. Used by [`crate::midhook`].
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub(crate) fn attach_exact(
+        &mut self,
+        target: *mut u8,
+        detour: *const u8,
+    ) -> Result<*mut u8, DetourError> {
+        self.attach_inner(target, detour, false)
+    }
+
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    fn attach_inner(
+        &mut self,
         mut target: *mut u8,
         detour: *const u8,
+        follow_thunks: bool,
     ) -> Result<*mut u8, DetourError> {
         if !self.is_pending {
             return Err(DetourError::NotStarted);
@@ -711,7 +737,7 @@ impl TransactionCore {
 
         // If the target function is a managed gateway, we use a special hooking method that does not require disassembly or stolen bytes, as the gateway is designed to be overwritten with a jump to the trampoline. This allows us to hook methods that would otherwise be difficult or impossible to hook.
         // The trampoline will contain a stub that jumps to the original target after executing the detour, allowing for proper chaining of hooks
-        if is_managed_gateway(target) {
+        if follow_thunks && is_managed_gateway(target) {
             let previous_target = unsafe {
                 read_managed_gateway_target(target as *const u8)
                     .ok_or(DetourError::InvalidParameter)?
@@ -764,9 +790,13 @@ impl TransactionCore {
             return Ok(gateway);
         }
 
-        target = unsafe { crate::detour_code_from_pointer(target.cast_const()) };
-        if target.is_null() {
-            return Err(DetourError::InvalidParameter);
+        // Entry-point hooks resolve leading jump stubs to the real function;
+        // exact (mid-function) hooks must patch precisely where requested.
+        if follow_thunks {
+            target = unsafe { crate::detour_code_from_pointer(target.cast_const()) };
+            if target.is_null() {
+                return Err(DetourError::InvalidParameter);
+            }
         }
 
         // --- architecture ---
