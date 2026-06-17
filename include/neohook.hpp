@@ -151,6 +151,40 @@ namespace neohook
         return const_cast<uint8_t *>(detours_find_function_by_ordinal(module.c_str(), ordinal));
     }
 
+    // ----------------- Pattern / signature scanning -----------------
+
+    /**
+     * @brief Resolves an IDA / x64dbg-style byte signature inside a module.
+     *
+     * @param h_module Base address (HMODULE) of the module to scan.
+     * @param pattern  Signature string, e.g. "48 8B 05 ?? ?? ?? ?? E8".
+     * @return The address of the first match in the module's executable
+     *         regions, or nullptr if it does not match.
+     */
+    inline void *scan_module(void *h_module, const std::string &pattern)
+    {
+        return const_cast<uint8_t *>(detours_scan_module(h_module, pattern.c_str()));
+    }
+
+    /**
+     * @brief Resolves a signature inside a module identified by name, loading it
+     *        if necessary.
+     */
+    inline void *scan_module(const std::string &module, const std::string &pattern)
+    {
+        return const_cast<uint8_t *>(detours_scan_module_by_name(module.c_str(), pattern.c_str()));
+    }
+
+    /**
+     * @brief Resolves a signature within @p len bytes starting at @p start,
+     *        limited to committed, readable regions.
+     */
+    inline void *scan_range(const void *start, size_t len, const std::string &pattern)
+    {
+        return const_cast<uint8_t *>(detours_scan_range(
+            static_cast<const uint8_t *>(start), static_cast<uintptr_t>(len), pattern.c_str()));
+    }
+
     /**
      * @brief Manages the lifetime of installed hooks.
      *
@@ -365,6 +399,35 @@ namespace neohook
         }
 
         /**
+         * @brief Resolves a byte signature inside a module and queues an inline
+         *        hook on the matched address.
+         *
+         * The signature-based counterpart to attach(): the target is located by
+         * scanning @p module's executable regions for @p pattern (IDA / x64dbg
+         * syntax, e.g. "48 8B 05 ?? ?? ?? ?? E8"). The module is loaded if it is
+         * not already present.
+         *
+         * @return The original function pointer (trampoline) cast to type T.
+         */
+        template <typename T>
+        T attach_pattern(const std::string &module, const std::string &pattern, T detour)
+        {
+            if (!tx_)
+                throw std::runtime_error("NeoHook: Transaction is no longer valid");
+
+            auto *tramp = detours_transaction_attach_pattern(
+                tx_,
+                module.c_str(),
+                pattern.c_str(),
+                reinterpret_cast<const uint8_t *>(detour));
+
+            if (!tramp)
+                throw std::runtime_error("NeoHook: Failed to attach pattern hook");
+
+            return reinterpret_cast<T>(tramp);
+        }
+
+        /**
          * @brief Queues a VTable hook for the given slot index.
          *
          * @return The original function pointer cast to type T.
@@ -503,5 +566,66 @@ namespace neohook
 
     private:
         ::VehHook *hook_ = nullptr;
+    };
+
+    /**
+     * @brief RAII guard for a mid-function / arbitrary-address detour.
+     *
+     * Redirects @p target - which may be any instruction boundary, not just a
+     * function entry - to a context @p handler. The handler receives a pointer
+     * to a ::HookContext snapshot of the general-purpose registers and flags,
+     * which it may read or modify before the original instructions resume.
+     *
+     * The original bytes are restored when the guard is destroyed.
+     */
+    class MidHook
+    {
+    public:
+        MidHook(const void *target, MidHookHandler handler)
+        {
+            hook_ = detours_midhook_install(
+                static_cast<const uint8_t *>(target), handler);
+            if (!hook_)
+                throw std::runtime_error("NeoHook: Failed to install mid-function hook");
+        }
+
+        ~MidHook()
+        {
+            if (hook_)
+                detours_midhook_unhook(hook_);
+        }
+
+        MidHook(const MidHook &) = delete;
+        MidHook &operator=(const MidHook &) = delete;
+
+        MidHook(MidHook &&other) noexcept : hook_(other.hook_)
+        {
+            other.hook_ = nullptr;
+        }
+
+        MidHook &operator=(MidHook &&other) noexcept
+        {
+            if (this != &other)
+            {
+                if (hook_)
+                    detours_midhook_unhook(hook_);
+                hook_ = other.hook_;
+                other.hook_ = nullptr;
+            }
+            return *this;
+        }
+
+        /// Removes the hook early, restoring the original bytes. Idempotent.
+        void unhook()
+        {
+            if (hook_)
+            {
+                detours_midhook_unhook(hook_);
+                hook_ = nullptr;
+            }
+        }
+
+    private:
+        ::MidHook *hook_ = nullptr;
     };
 }

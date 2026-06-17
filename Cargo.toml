@@ -1,6 +1,6 @@
 [package]
 name = "neohook"
-version = "0.5.0"
+version = "0.7.0"
 edition = "2024"
 description = "A powerful, transactional, thread-safe function hooking library for Windows (x86/x64), written in Rust."
 license = "MIT OR Apache-2.0"
