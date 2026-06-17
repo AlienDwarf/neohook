@@ -47,7 +47,7 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 
 - **EAT Hooking** - Rewrites a module's Export Address Table so every consumer that resolves the export afterwards (e.g. via `GetProcAddress`) is redirected, without patching the function body. On x64 an out-of-range detour is reached through an automatically managed jump stub.
 
-- **VEH Hooking** - Redirects a function using a CPU hardware breakpoint and a vectored exception handler, **without modifying a single byte** of the target. Ideal for read-only or shared code that must not be patched. Up to four targets at a time (this is a hardware limitation not caused yb NeoHook).
+- **VEH Hooking** - Redirects a function using a CPU hardware breakpoint and a vectored exception handler, **without modifying a single byte** of the target. Ideal for read-only or shared code that must not be patched. Up to four targets at a time (this is a hardware limitation not caused by NeoHook).
 
 - **Pattern / Signature Scanning** - Resolve unexported, statically-linked, or stripped functions by a byte signature (IDA / x64dbg `48 8B ?? E8` syntax, or code+mask). Scans only committed, executable regions of a module - safely skipping guard pages and holes - and feeds the match straight into a hook via `attach_pattern`.
 
@@ -642,7 +642,7 @@ On x86_64, a 5-byte `E9 rel32` jump can only reach ±2 GB. `TrampolineAlloc::all
 
 ### Hook chaining
 
-A managed gateway can itself be used as the target of another inline hook. A managed gateway can itself be used as the target of another inline hook. This is how hook chaining works.
+A managed gateway can itself be used as the target of another inline hook. This is how hook chaining works.
 
 Suppose we hook target with detour_A.
 
