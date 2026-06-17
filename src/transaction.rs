@@ -89,6 +89,11 @@ pub enum PendingHook {
         target_func: String,
         detour: *const u8,
     },
+    Eat {
+        module: HMODULE,
+        target_func: String,
+        detour: *const u8,
+    },
     Vtable {
         vtable: *mut *mut u8,
         index: usize,
@@ -126,6 +131,7 @@ struct AppliedDetach {
 pub enum Hook {
     Inline(InlineHook),
     Iat(IatHook),
+    Eat(EatHook),
     Vtable(VtableHook),
     VtableInstance(VtableInstanceHook),
 }
@@ -140,6 +146,7 @@ impl Hook {
         match self {
             Hook::Inline(h) => h.original_ptr(),
             Hook::Iat(h) => h.original_ptr,
+            Hook::Eat(h) => h.original_ptr(),
             Hook::Vtable(h) => h.original_ptr(),
             Hook::VtableInstance(h) => h.original_ptr(),
         }
@@ -150,6 +157,7 @@ impl Hook {
         match self {
             Hook::Inline(h) => h.unhook(),
             Hook::Iat(h) => h.unhook(),
+            Hook::Eat(h) => h.unhook(),
             Hook::Vtable(h) => h.unhook(),
             Hook::VtableInstance(h) => h.unhook(),
         }
@@ -160,6 +168,7 @@ impl Hook {
         match self {
             Hook::Inline(h) => h.is_enabled(),
             Hook::Iat(h) => h.is_enabled(),
+            Hook::Eat(h) => h.is_enabled(),
             Hook::Vtable(h) => h.is_enabled(),
             Hook::VtableInstance(h) => h.is_enabled(),
         }
@@ -171,6 +180,7 @@ impl Hook {
         match self {
             Hook::Inline(h) => h.enable(),
             Hook::Iat(h) => h.enable(),
+            Hook::Eat(h) => h.enable(),
             Hook::Vtable(h) => h.enable(),
             Hook::VtableInstance(h) => h.enable(),
         }
@@ -182,6 +192,7 @@ impl Hook {
         match self {
             Hook::Inline(h) => h.disable(),
             Hook::Iat(h) => h.disable(),
+            Hook::Eat(h) => h.disable(),
             Hook::Vtable(h) => h.disable(),
             Hook::VtableInstance(h) => h.disable(),
         }
@@ -206,6 +217,7 @@ impl Hook {
         match self {
             Hook::Inline(h) => h.detach_finalize(),
             Hook::Iat(h) => h.detach_finalize(),
+            Hook::Eat(h) => h.detach_finalize(),
             Hook::Vtable(h) => h.detach_finalize(),
             Hook::VtableInstance(h) => h.detach_finalize(),
         }
@@ -449,6 +461,97 @@ impl Drop for IatHook {
             // auto unhook when dropped, best effort, ignore errors
             let _ = self.perform_unhook();
         }
+    }
+}
+
+/// Installed Export Address Table (EAT) hook.
+///
+/// Patches a single export slot in a module's EAT so consumers that resolve the
+/// export *after* installation (e.g. via `GetProcAddress`) are redirected to the
+/// detour. Like [`IatHook`], it changes a lookup table rather than the function
+/// body, so code that already cached the resolved address is unaffected.
+///
+/// On x86_64 an out-of-range detour is reached through a small owned jump stub,
+/// which is released when the hook is dropped or unhooked.
+#[derive(Debug)]
+pub struct EatHook {
+    pub module: HMODULE,
+    pub func_name: String,
+    slot_ptr: *mut u32,
+    original_rva: u32,
+    detour_rva: u32,
+    original_ptr: *mut u8,
+    /// Jump stub keeping an out-of-range detour reachable. Only held so its
+    /// `Drop` releases the allocation when the hook goes away.
+    #[allow(dead_code)]
+    stub: Option<crate::alloc::Trampoline>,
+    active: bool,
+    /// Whether the export slot currently points at the detour.
+    enabled: bool,
+}
+
+impl EatHook {
+    /// Returns the resolved address of the original export.
+    pub fn original_ptr(&self) -> *const u8 {
+        self.original_ptr
+    }
+
+    /// Returns whether the export slot currently points at the detour.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Restores the original export RVA without releasing the stub, so the hook
+    /// can be re-enabled later.
+    pub fn disable(&mut self) -> Result<(), DetourError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        unsafe { crate::eat::EatHook::write_export_rva(self.slot_ptr, self.original_rva)? };
+        self.enabled = false;
+        Ok(())
+    }
+
+    /// Re-points the export slot at the detour after a [`Self::disable`].
+    pub fn enable(&mut self) -> Result<(), DetourError> {
+        if self.enabled {
+            return Ok(());
+        }
+        unsafe { crate::eat::EatHook::write_export_rva(self.slot_ptr, self.detour_rva)? };
+        self.enabled = true;
+        Ok(())
+    }
+
+    /// Unhooks this EAT hook by restoring the original export RVA. The jump stub
+    /// (if any) is released when the guard is dropped.
+    pub fn unhook(mut self) -> Result<(), DetourError> {
+        self.perform_unhook()?;
+        self.active = false;
+        Ok(())
+    }
+
+    fn perform_unhook(&self) -> Result<(), DetourError> {
+        unsafe { crate::eat::EatHook::write_export_rva(self.slot_ptr, self.original_rva)? };
+        Ok(())
+    }
+
+    fn detach_finalize(&mut self) {
+        if self.enabled {
+            let _ = self.disable();
+        }
+        self.active = false;
+        self.enabled = false;
+    }
+}
+
+impl Drop for EatHook {
+    fn drop(&mut self) {
+        if self.active {
+            // auto unhook when dropped, best effort, ignore errors
+            let _ = self.perform_unhook();
+        }
+        // `stub` is released here via its own Drop, after the slot no longer
+        // points at it.
     }
 }
 
@@ -819,6 +922,77 @@ impl TransactionCore {
         Ok(())
     }
 
+    /// Registers an EAT (Export Address Table) hook to be installed when the
+    /// transaction is committed.
+    ///
+    /// Redirects the named export of `h_module` to `detour`. Unlike an IAT hook,
+    /// which only affects one caller module, this redirects every consumer that
+    /// resolves the export *after* commit (e.g. through `GetProcAddress`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(DetourError::NotStarted)` if the transaction is no longer
+    /// pending.
+    ///
+    /// Returns an error if the module is invalid, the export cannot be found, or
+    /// the export is a forwarder (which has no code slot to redirect).
+    ///
+    /// # Safety
+    /// The caller must ensure that `h_module` is a valid module handle, that
+    /// `target_func` names an export of that module, and that `detour` is a
+    /// valid function pointer with an ABI/signature compatible with the export.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn attach_eat(
+        &mut self,
+        h_module: HMODULE,
+        target_func: &str,
+        detour: *const u8,
+    ) -> Result<(), DetourError> {
+        if !self.is_pending {
+            return Err(DetourError::NotStarted);
+        }
+
+        if h_module.is_null() || detour.is_null() {
+            return Err(DetourError::InvalidParameter);
+        }
+
+        // Pointer validity check (mirrors attach_iat): the module base must be
+        // readable before we attempt to parse its headers.
+        unsafe {
+            let mut mbi: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION =
+                std::mem::zeroed();
+            let res = windows_sys::Win32::System::Memory::VirtualQuery(
+                h_module as *const _,
+                &mut mbi,
+                std::mem::size_of::<windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION>(),
+            );
+
+            if res == 0
+                || (mbi.Protect
+                    & (windows_sys::Win32::System::Memory::PAGE_READONLY
+                        | windows_sys::Win32::System::Memory::PAGE_READWRITE
+                        | windows_sys::Win32::System::Memory::PAGE_EXECUTE_READ
+                        | windows_sys::Win32::System::Memory::PAGE_EXECUTE_READWRITE))
+                    == 0
+            {
+                return Err(DetourError::InvalidParameter);
+            }
+        }
+
+        // Validate up front that the export exists and is hookable (not a
+        // forwarder), so we fail before any thread is suspended.
+        unsafe {
+            crate::eat::EatHook::find_export_address(h_module, target_func)?;
+        }
+
+        self.pending_hooks.push(PendingHook::Eat {
+            module: h_module,
+            target_func: target_func.to_string(),
+            detour,
+        });
+        Ok(())
+    }
+
     /// Queues a VTable hook for a specific slot.
     ///
     /// The slot is validated and patched during commit. The previous slot value
@@ -1091,6 +1265,37 @@ impl TransactionCore {
                             return Err(DetourError::CommitFailed {
                                 index: hook_index,
                                 kind: HookKind::Iat,
+                                source: Box::new(err.into()),
+                            });
+                        }
+                    }
+                },
+                PendingHook::Eat {
+                    module,
+                    target_func,
+                    detour,
+                } => unsafe {
+                    match crate::eat::EatHook::hook_export(module, &target_func, detour) {
+                        Ok(inst) => {
+                            installed.push(Hook::Eat(EatHook {
+                                module,
+                                func_name: target_func,
+                                slot_ptr: inst.slot_ptr,
+                                original_rva: inst.original_rva,
+                                detour_rva: inst.detour_rva,
+                                original_ptr: inst.original_ptr,
+                                stub: inst.stub,
+                                active: true,
+                                enabled: true,
+                            }));
+                        }
+                        Err(err) => {
+                            rollback_detaches(&mut detached);
+                            self.rollback(&mut installed);
+                            self.cleanup_threads();
+                            return Err(DetourError::CommitFailed {
+                                index: hook_index,
+                                kind: HookKind::Eat,
                                 source: Box::new(err.into()),
                             });
                         }
@@ -1411,6 +1616,9 @@ impl TransactionCore {
                 Hook::Iat(hook) => {
                     let _ = hook.unhook();
                 }
+                Hook::Eat(hook) => {
+                    let _ = hook.unhook();
+                }
                 Hook::Vtable(hook) => {
                     let _ = hook.unhook();
                 }
@@ -1542,6 +1750,9 @@ impl TransactionCore {
                     ..
                 } => {
                     println!("  [{}] IAT: {}!{}", i, target_dll, target_func);
+                }
+                PendingHook::Eat { target_func, .. } => {
+                    println!("  [{}] EAT: {}", i, target_func);
                 }
                 PendingHook::Vtable { vtable, index, .. } => {
                     println!("  [{}] VTABLE: {:p}[{}]", i, vtable, index);

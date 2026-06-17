@@ -347,6 +347,24 @@ namespace neohook
         }
 
         /**
+         * @brief Queues an EAT (Export Address Table) hook.
+         *
+         * Redirects the named export of @p h_module for every consumer that
+         * resolves it after commit (e.g. via GetProcAddress).
+         */
+        void attach_eat(void *h_module, const std::string &func, const void *detour)
+        {
+            if (!tx_)
+                throw std::runtime_error("NeoHook: Transaction invalid");
+
+            if (!detours_transaction_attach_eat(tx_, h_module, func.c_str(),
+                                                static_cast<const uint8_t *>(detour)))
+            {
+                throw std::runtime_error("NeoHook: Failed to attach EAT hook");
+            }
+        }
+
+        /**
          * @brief Queues a VTable hook for the given slot index.
          *
          * @return The original function pointer cast to type T.
@@ -424,5 +442,66 @@ namespace neohook
 
     private:
         DetourTransaction *tx_ = nullptr;
+    };
+
+    /**
+     * @brief RAII guard for a VEH (hardware-breakpoint) hook.
+     *
+     * Redirects @p target to @p detour using a CPU hardware breakpoint and a
+     * vectored exception handler, without modifying the target's bytes. The
+     * breakpoint is cleared on every thread when the guard is destroyed.
+     *
+     * At most four VEH hooks can be active at once (one per debug register).
+     */
+    class VehHook
+    {
+    public:
+        VehHook(const void *target, const void *detour)
+        {
+            hook_ = detours_veh_install(
+                static_cast<const uint8_t *>(target),
+                static_cast<const uint8_t *>(detour));
+            if (!hook_)
+                throw std::runtime_error("NeoHook: Failed to install VEH hook");
+        }
+
+        ~VehHook()
+        {
+            if (hook_)
+                detours_veh_unhook(hook_);
+        }
+
+        VehHook(const VehHook &) = delete;
+        VehHook &operator=(const VehHook &) = delete;
+
+        VehHook(VehHook &&other) noexcept : hook_(other.hook_)
+        {
+            other.hook_ = nullptr;
+        }
+
+        VehHook &operator=(VehHook &&other) noexcept
+        {
+            if (this != &other)
+            {
+                if (hook_)
+                    detours_veh_unhook(hook_);
+                hook_ = other.hook_;
+                other.hook_ = nullptr;
+            }
+            return *this;
+        }
+
+        /// Removes the hook early. Idempotent.
+        void unhook()
+        {
+            if (hook_)
+            {
+                detours_veh_unhook(hook_);
+                hook_ = nullptr;
+            }
+        }
+
+    private:
+        ::VehHook *hook_ = nullptr;
     };
 }

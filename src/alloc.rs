@@ -178,6 +178,87 @@ impl TrampolineAlloc {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+impl TrampolineAlloc {
+    /// Allocates `size` bytes at an address `A` with `base <= A` and
+    /// `A + size - base <= u32::MAX`, so the region is expressible as a 32-bit
+    /// RVA from `base`.
+    ///
+    /// This is used by EAT (export) hooking, whose table slots store 32-bit
+    /// RVAs resolved as `base + rva`. The detour usually lives far outside that
+    /// 4 GB window, so a jump stub is placed *above* the module base instead.
+    /// The search scans free regions upward from `base`.
+    ///
+    /// # Safety
+    /// `base` must be the base address of a loaded module.
+    pub unsafe fn alloc_export_stub(base: usize, size: usize) -> Option<Trampoline> {
+        use windows_sys::Win32::System::SystemInformation::SYSTEM_INFO;
+
+        if size == 0 {
+            return None;
+        }
+
+        let mut si: SYSTEM_INFO = unsafe { std::mem::zeroed() };
+        unsafe { GetSystemInfo(&mut si) };
+        let alloc_granularity = si.dwAllocationGranularity as usize;
+
+        // The stub must end within base + 4 GB so its RVA fits in a u32.
+        let max_addr = base.checked_add(u32::MAX as usize)?.saturating_sub(size);
+
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let mut current_addr = base;
+
+        while current_addr <= max_addr {
+            let query_result = unsafe {
+                VirtualQuery(
+                    current_addr as _,
+                    &mut mbi,
+                    std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                )
+            };
+            if query_result == 0 {
+                break;
+            }
+
+            if mbi.State == MEM_FREE && mbi.RegionSize >= size {
+                let region_start = mbi.BaseAddress as usize;
+                let region_end = region_start.saturating_add(mbi.RegionSize);
+                let search_start = region_start.max(current_addr).max(base);
+                let candidate = align_up(search_start, alloc_granularity);
+
+                if candidate >= base
+                    && candidate.saturating_add(size) <= region_end
+                    && candidate.saturating_add(size).saturating_sub(base) <= u32::MAX as usize
+                {
+                    let allocated = unsafe {
+                        VirtualAlloc(
+                            candidate as _,
+                            size,
+                            MEM_COMMIT | MEM_RESERVE,
+                            PAGE_EXECUTE_READWRITE,
+                        )
+                    };
+                    if !allocated.is_null() {
+                        return Some(Trampoline {
+                            ptr: allocated as *mut u8,
+                            size,
+                        });
+                    }
+                }
+            }
+
+            let next = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+            // Prevent looping forever on a zero-size / non-advancing region.
+            if next <= current_addr {
+                break;
+            }
+            current_addr = next;
+        }
+
+        None
+    }
+}
+
 impl Drop for Trampoline {
     fn drop(&mut self) {
         unsafe {

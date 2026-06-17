@@ -15,6 +15,7 @@ mod alloc;
 pub mod api;
 mod code;
 mod disasm;
+mod eat;
 mod iat;
 mod introspect;
 mod mem;
@@ -23,11 +24,13 @@ mod pe;
 mod reentrancy;
 mod threads;
 pub(crate) mod transaction;
+mod veh;
 mod vtable;
 
 // Re-exports for public API
 pub use crate::api::DetourTransaction;
 pub use crate::code::detour_code_from_pointer;
+pub use crate::eat::EatHookError;
 pub use crate::iat::IatHookError;
 pub use crate::introspect::{
     ExportInfo, ImportInfo, ModuleInfo, enumerate_exports, enumerate_imports, enumerate_modules,
@@ -39,8 +42,9 @@ pub use crate::module::{
 pub use crate::pe::PeError;
 pub use crate::reentrancy::ReentrancyGuard;
 pub use crate::transaction::{
-    Hook, IatHook, InlineHook, JumpType, TransactionCore, VtableHook, VtableInstanceHook,
+    EatHook, Hook, IatHook, InlineHook, JumpType, TransactionCore, VtableHook, VtableInstanceHook,
 };
+pub use crate::veh::{VehHook, VehHookError};
 pub use crate::vtable::VTableHookError;
 
 /// Identifies which kind of hook a [`DetourError::CommitFailed`] refers to.
@@ -48,6 +52,7 @@ pub use crate::vtable::VTableHookError;
 pub enum HookKind {
     Inline,
     Iat,
+    Eat,
     Vtable,
     VtableInstance,
     Detach,
@@ -58,6 +63,7 @@ impl fmt::Display for HookKind {
         let name = match self {
             Self::Inline => "inline",
             Self::Iat => "IAT",
+            Self::Eat => "EAT",
             Self::Vtable => "VTable",
             Self::VtableInstance => "per-instance VTable",
             Self::Detach => "detach",
@@ -79,6 +85,8 @@ pub enum DetourError {
     InvalidParameter,
     /// An error occurred while installing an IAT hook.
     Iat(crate::iat::IatHookError),
+    /// An error occurred while installing an EAT hook.
+    Eat(crate::eat::EatHookError),
     /// An error occurred while installing a VTable hook.
     Vtable(crate::vtable::VTableHookError),
     /// A pending hook failed to install during [`DetourTransaction::commit`].
@@ -104,6 +112,7 @@ impl fmt::Display for DetourError {
             Self::RelocationFailed => write!(f, "Failed to relocate instructions to trampoline"),
             Self::InvalidParameter => write!(f, "One or more parameters were invalid"),
             Self::Iat(err) => write!(f, "IAT hook error: {err}"),
+            Self::Eat(err) => write!(f, "EAT hook error: {err}"),
             Self::Vtable(err) => write!(f, "VTable hook error: {err}"),
             Self::CommitFailed {
                 index,
@@ -120,6 +129,12 @@ impl fmt::Display for DetourError {
 impl From<crate::iat::IatHookError> for DetourError {
     fn from(err: crate::iat::IatHookError) -> Self {
         Self::Iat(err)
+    }
+}
+
+impl From<crate::eat::EatHookError> for DetourError {
+    fn from(err: crate::eat::EatHookError) -> Self {
+        Self::Eat(err)
     }
 }
 

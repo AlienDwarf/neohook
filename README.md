@@ -45,6 +45,10 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 
 - **IAT Hooking** - Rewrites Import Address Table entries to redirect calls to entire DLL exports without touching function preambles.
 
+- **EAT Hooking** - Rewrites a module's Export Address Table so every consumer that resolves the export afterwards (e.g. via `GetProcAddress`) is redirected, without patching the function body. On x64 an out-of-range detour is reached through an automatically managed jump stub.
+
+- **VEH Hooking** - Redirects a function using a CPU hardware breakpoint and a vectored exception handler, **without modifying a single byte** of the target. Ideal for read-only or shared code that must not be patched. Up to four targets at a time (this is a hardware limitation not caused yb NeoHook).
+
 - **VTable Hooking** - Rewrites a selected VTable slot to detour virtual calls and restores the original slot on unhook.
 
 - **Per-Instance VTable Hooking** - Clones an object's VTable, patches the clone, and redirects only that instance.
@@ -92,8 +96,8 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 | v0.3.0  |    ✅ Done | Recursion / reentrancy guards                          |
 | v0.3.0  |    ✅ Done | Improved diagnostics / debug output                    |
 | v0.3.0  |    ✅ Done | Module / PE introspection (modules, exports, imports)  |
-| v0.4.0  | ⬜ Planned | Export / EAT hooking                                   |
-| v0.5.0  | ⬜ Planned | VEH hooking                                            |
+| v0.4.0  |    ✅ Done | Export / EAT hooking                                   |
+| v0.5.0  |    ✅ Done | VEH hooking                                            |
 
 --
 
@@ -103,7 +107,7 @@ Add the crate to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-neohook = "0.1.0"
+neohook = "0.5.0"
 ```
 
 ---
@@ -234,6 +238,89 @@ fn main() {
     }
 }
 ```
+
+---
+
+### EAT Hooking
+
+Redirect a function at its source by rewriting the exporting module's Export
+Address Table. Unlike an IAT hook - which only affects one caller module - an
+EAT hook redirects **every** consumer that resolves the export *after* the hook
+is installed (for example through `GetProcAddress`). Code that already cached
+the resolved address is unaffected, because only the lookup table changes, not
+the function body.
+
+```rust
+use neohook::DetourTransaction;
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleA;
+
+unsafe extern "system" fn get_tick_count_detour() -> u32 {
+    0xDEAD_BEEF
+}
+
+fn main() {
+    let module = unsafe { GetModuleHandleA(c"kernel32.dll".as_ptr() as *const u8) };
+
+    let mut tx = DetourTransaction::begin();
+    tx.attach_eat(module, "GetTickCount", get_tick_count_detour as *const u8)
+        .expect("EAT hook failed");
+    let hooks = tx.commit().expect("transaction failed");
+
+    // Any GetProcAddress(module, "GetTickCount") now resolves to the detour,
+    // while `hooks[0].original_ptr()` still reaches the real function.
+}
+```
+
+On x86_64 the export slot stores a 32-bit RVA. When the detour lies more than
+4 GB from the module base, NeoHook allocates a small jump stub within range and
+points the slot at it; the stub is released automatically when the hook is
+dropped or unhooked. See [`examples/eat_hook.rs`](examples/eat_hook.rs).
+
+The C ABI exposes this as
+`detours_transaction_attach_eat(tx, h_module, target_func, detour)`.
+
+---
+
+### VEH Hooking (hardware breakpoints)
+
+Redirect a function **without patching its bytes**. NeoHook arms a CPU hardware
+execution breakpoint (debug registers `DR0`-`DR3`) on the target and installs a
+vectored exception handler that rewrites the instruction pointer to the detour
+when the breakpoint fires. Because the code is never modified, this works on
+read-only or shared pages that must stay byte-for-byte intact.
+
+```rust
+use neohook::VehHook;
+
+#[inline(never)]
+extern "system" fn secret() -> u32 { 1234 }
+extern "system" fn secret_detour() -> u32 { 9999 }
+
+fn main() {
+    let hook = unsafe {
+        VehHook::install(
+            secret as *const () as *const u8,
+            secret_detour as *const () as *const u8,
+        )
+    }
+    .expect("VEH hook failed");
+
+    assert_eq!(secret(), 9999); // intercepted via the exception handler
+    hook.unhook().unwrap();     // breakpoint cleared on every thread
+}
+```
+
+VEH hooking has inherent limits worth knowing:
+
+- **Four hooks at a time** - one per hardware debug register.
+- **Per-thread arming** - debug registers are per-thread. NeoHook arms every
+  thread that exists when the hook is installed; threads created afterwards call
+  the original.
+- **Full replacement** - like `detour_inline!`, the detour replaces the target;
+  there is no trampoline to call the original through.
+
+See [`examples/veh_hook.rs`](examples/veh_hook.rs). The C ABI exposes
+`detours_veh_install(target, detour)` and `detours_veh_unhook(hook)`.
 
 ---
 
@@ -490,6 +577,10 @@ neohook/
 │   ├── alloc.rs        - TrampolineAlloc: near-memory allocation (x86 + x86_64)
 │   ├── disasm.rs       - Disassembler: instruction length, relocation via iced-x86
 │   ├── iat.rs          - IatHook: IAT parsing and pointer rewriting
+│   ├── eat.rs          - EatHook: EAT parsing and export RVA rewriting (+ near stub)
+│   ├── veh.rs          - VehHook: hardware-breakpoint hooking via a vectored handler
+│   ├── pe.rs           - Shared bounds-checked PE parsing primitives
+│   ├── introspect.rs   - Module / PE introspection (modules, exports, imports)
 │   ├── mem.rs          - Memory helpers: VirtualProtect wrapper, atomic write
 │   ├── module.rs       - Module utilities: find_function, get_module_handle
 │   └── threads.rs      - ThreadEnumerator: toolhelp32 snapshot, open/suspend threads

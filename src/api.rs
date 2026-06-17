@@ -106,6 +106,30 @@ impl DetourTransaction {
             .attach_iat(h_module, target_dll, target_func, detour)
     }
 
+    /// Registers an EAT hook to be installed when the transaction is committed.
+    ///
+    /// Redirects the named export of `h_module` for every consumer that resolves
+    /// it after commit (e.g. via `GetProcAddress`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(DetourError::NotStarted)` if the transaction has already
+    /// been committed or aborted.
+    ///
+    /// Propagates any error that occurs while preparing the EAT hook (invalid
+    /// module, missing export, or a forwarder target).
+    pub fn attach_eat(
+        &mut self,
+        h_module: windows_sys::Win32::Foundation::HMODULE,
+        target_func: &str,
+        detour: *const u8,
+    ) -> Result<(), DetourError> {
+        self.inner
+            .as_mut()
+            .ok_or(DetourError::NotStarted)?
+            .attach_eat(h_module, target_func, detour)
+    }
+
     /// Registers a VTable hook to be installed when the transaction is committed.
     ///
     /// On success, returns the original function pointer currently stored in the
@@ -491,6 +515,43 @@ pub unsafe extern "C" fn detours_transaction_attach_iat(
         .attach_iat(
             h_module as windows_sys::Win32::Foundation::HMODULE,
             target_dll,
+            target_func,
+            detour,
+        )
+        .map(|_| 1)
+        .unwrap_or(0)
+}
+
+/// Attaches an EAT detour to the given transaction.
+///
+/// Redirects the named export of `h_module` for consumers that resolve it after
+/// commit. Returns `1` on success and `0` on failure.
+///
+/// # Safety
+/// `tx` must be a valid transaction pointer previously returned by
+/// `detours_transaction_begin()`. `h_module` must be a valid module handle and
+/// `target_func` must be a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_transaction_attach_eat(
+    tx: *mut DetourTransaction,
+    h_module: *mut core::ffi::c_void,
+    target_func: *const std::ffi::c_char,
+    detour: *const u8,
+) -> i32 {
+    if tx.is_null() || target_func.is_null() || detour.is_null() {
+        return 0;
+    }
+
+    let tx_ref = unsafe { &mut *tx };
+
+    let target_func = match unsafe { std::ffi::CStr::from_ptr(target_func) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+
+    tx_ref
+        .attach_eat(
+            h_module as windows_sys::Win32::Foundation::HMODULE,
             target_func,
             detour,
         )
@@ -1024,4 +1085,45 @@ pub unsafe extern "C" fn detours_find_function_by_ordinal(
         Err(_) => return std::ptr::null(),
     };
     crate::find_function_by_ordinal(module, ordinal).unwrap_or(std::ptr::null())
+}
+
+// ----------------- FFI Entry Points: VEH (hardware breakpoint) hooking -------
+
+/// Installs a VEH (hardware-breakpoint) hook redirecting `target` to `detour`.
+///
+/// Returns an opaque hook pointer on success, or null on failure (null
+/// arguments, all four breakpoint slots in use, the target already hooked, or
+/// handler registration failure). The returned pointer must be released with
+/// `detours_veh_unhook`.
+///
+/// # Safety
+/// `target` must point at the entry of a real function in executable memory and
+/// `detour` must be a function pointer with a compatible ABI/signature.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_veh_install(
+    target: *const u8,
+    detour: *const u8,
+) -> *mut crate::veh::VehHook {
+    match unsafe { crate::veh::VehHook::install(target, detour) } {
+        Ok(hook) => Box::into_raw(Box::new(hook)),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Removes a VEH hook installed by `detours_veh_install` and frees it.
+///
+/// Returns `1` if the hook was accepted for removal, or `0` if `hook` is null.
+///
+/// # Safety
+/// `hook` must be a valid pointer previously returned by `detours_veh_install`
+/// and must not be used afterwards.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_veh_unhook(hook: *mut crate::veh::VehHook) -> i32 {
+    if hook.is_null() {
+        return 0;
+    }
+    let hook = unsafe { Box::from_raw(hook) };
+    // Dropping the box clears the breakpoint via RAII; be explicit for clarity.
+    let _ = hook.unhook();
+    1
 }
