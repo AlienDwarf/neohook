@@ -49,6 +49,10 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 
 - **VEH Hooking** - Redirects a function using a CPU hardware breakpoint and a vectored exception handler, **without modifying a single byte** of the target. Ideal for read-only or shared code that must not be patched. Up to four targets at a time (this is a hardware limitation not caused yb NeoHook).
 
+- **Pattern / Signature Scanning** - Resolve unexported, statically-linked, or stripped functions by a byte signature (IDA / x64dbg `48 8B ?? E8` syntax, or code+mask). Scans only committed, executable regions of a module - safely skipping guard pages and holes - and feeds the match straight into a hook via `attach_pattern`.
+
+- **Mid-Function / Arbitrary-Address Detours** - Hook *any* instruction boundary, not just a function entry. NeoHook snapshots all general-purpose registers and flags into a `HookContext`, calls your handler with a pointer to it, restores the (possibly modified) registers, then resumes the original instructions. Rewrite arguments, results, or loop state in flight at a spot found by a signature scan - all on the thread-safe inline engine (thread suspension, IP/stack redirection, relocation, atomic rollback).
+
 - **VTable Hooking** - Rewrites a selected VTable slot to detour virtual calls and restores the original slot on unhook.
 
 - **Per-Instance VTable Hooking** - Clones an object's VTable, patches the clone, and redirects only that instance.
@@ -98,6 +102,10 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 | v0.3.0  |    ✅ Done | Module / PE introspection (modules, exports, imports)  |
 | v0.4.0  |    ✅ Done | Export / EAT hooking                                   |
 | v0.5.0  |    ✅ Done | VEH hooking                                            |
+| v0.6.0  |    ✅ Done | Pattern / signature scanning                           |
+| v0.6.0  |    ✅ Done | Signature-based hook resolution (`attach_pattern`)     |
+| v0.7.0  |    ✅ Done | Mid-function / arbitrary-address detours (`MidHook`)   |
+| v0.7.0  |    ✅ Done | Register-context capture / modification (`HookContext`)|
 
 --
 
@@ -107,7 +115,7 @@ Add the crate to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-neohook = "0.5.0"
+neohook = "0.7.0"
 ```
 
 ---
@@ -278,6 +286,109 @@ dropped or unhooked. See [`examples/eat_hook.rs`](examples/eat_hook.rs).
 
 The C ABI exposes this as
 `detours_transaction_attach_eat(tx, h_module, target_func, detour)`.
+
+---
+
+### Pattern / Signature Scanning
+
+Direct pointers and export names cover functions the loader knows about. For
+**unexported, statically-linked, or stripped** functions - the usual situation
+when hooking a game engine or a stripped third-party DLL - the reliable handle
+is a byte **signature**: a short run of opcode bytes with wildcards over the
+parts that move between builds (relative offsets, absolute addresses).
+
+`Pattern` parses both common dialects, and `scan_module` resolves a signature
+inside a loaded module, scanning only its committed, executable regions.
+
+```rust
+use neohook::{Pattern, scan_module, get_module_handle};
+
+// IDA / x64dbg syntax: `?` / `??` are wildcard bytes.
+let pat = Pattern::parse("48 8B 05 ?? ?? ?? ?? 48 89").unwrap();
+
+// code + mask is also supported:
+// let pat = Pattern::from_code_style(b"\x48\x8B\x05\x00\x00\x00\x00", "xxx????").unwrap();
+
+let h = get_module_handle("game.dll").unwrap();
+if let Some(addr) = unsafe { scan_module(h, &pat) } {
+    println!("resolved target at {addr:p}");
+}
+```
+
+The matched address can be fed straight into `DetourTransaction::attach`, or you
+can let `attach_pattern` resolve the signature and queue the inline hook in one
+step:
+
+```rust
+use neohook::DetourTransaction;
+
+let mut tx = DetourTransaction::begin();
+tx.update_all_threads();
+
+// Resolve "game.dll!?" by signature and hook it inline. Returns the trampoline.
+let _trampoline = tx
+    .attach_pattern("game.dll", "48 89 5C 24 ?? 57 48 83 EC 20", my_detour as *const u8)
+    .expect("signature not found");
+
+let _hooks = tx.commit().expect("transaction failed");
+```
+
+The C ABI exposes `detours_scan_module`, `detours_scan_module_by_name`,
+`detours_scan_range`, and `detours_transaction_attach_pattern`. The C++ wrapper
+provides `neohook::scan_module(...)`, `neohook::scan_range(...)`, and
+`Transaction::attach_pattern(...)`. See [`examples/pattern_scan.rs`](examples/pattern_scan.rs).
+
+---
+
+### Mid-Function / Arbitrary-Address Detours
+
+Every other hook is anchored to a function entry or a table slot. A
+**mid-function detour** lets you intercept *any* instruction boundary - the
+exact spot inside a routine where a register holds the value you care about,
+typically located with a [signature scan](#pattern--signature-scanning).
+
+Because such a site is reached with arbitrary registers live, a normal detour
+would clobber them. Instead NeoHook installs a context bridge: it snapshots all
+general-purpose registers and flags into a [`HookContext`], calls your handler
+with a pointer to it, restores the (possibly modified) registers, then runs the
+original instructions and resumes the function. The patch runs on the full
+inline engine - threads suspended, instruction pointers/return addresses
+redirected, stolen bytes relocated, atomic rollback on failure.
+
+```rust
+use neohook::{HookContext, MidHook};
+
+#[inline(never)]
+extern "system" fn price_for(quantity: u64) -> u64 {
+    std::hint::black_box(quantity) * 100
+}
+
+// Reached with the live CPU state; Win64 holds the first argument in RCX.
+unsafe extern "system" fn handler(ctx: *mut HookContext) {
+    let ctx = &mut *ctx;
+    ctx.rcx = ctx.rcx.wrapping_add(5); // rewrite the argument in flight
+}
+
+fn main() {
+    let hook = unsafe { MidHook::install(price_for as *const u8, handler) }
+        .expect("mid-function hook failed");
+
+    assert_eq!(price_for(2), 700); // (2 + 5) * 100 - the edit took effect
+
+    hook.unhook().unwrap(); // original bytes restored
+    assert_eq!(price_for(2), 200);
+}
+```
+
+A handler may read any field of `HookContext` to observe a live register, or
+write one to change it before execution continues. The detour always *continues*
+the original function - it cannot skip it or redirect control flow, and only
+general-purpose registers and flags are captured (not XMM/FPU state). `target`
+must sit on a real instruction boundary.
+
+The C ABI exposes `detours_midhook_install(target, handler)` and
+`detours_midhook_unhook(hook)`; the C++ wrapper provides an RAII `neohook::MidHook`.
+See [`examples/midhook.rs`](examples/midhook.rs).
 
 ---
 
@@ -579,7 +690,9 @@ neohook/
 │   ├── iat.rs          - IatHook: IAT parsing and pointer rewriting
 │   ├── eat.rs          - EatHook: EAT parsing and export RVA rewriting (+ near stub)
 │   ├── veh.rs          - VehHook: hardware-breakpoint hooking via a vectored handler
+│   ├── midhook.rs      - MidHook: mid-function detours + register-context bridge
 │   ├── pe.rs           - Shared bounds-checked PE parsing primitives
+│   ├── scan.rs         - Pattern: signature parsing + memory/module scanning
 │   ├── introspect.rs   - Module / PE introspection (modules, exports, imports)
 │   ├── mem.rs          - Memory helpers: VirtualProtect wrapper, atomic write
 │   ├── module.rs       - Module utilities: find_function, get_module_handle
@@ -601,6 +714,8 @@ All fallible operations return `Result<T, DetourError>`:
 | `DetourError::AllocationFailed` | No suitable free memory region found near the target address                                             |
 | `DetourError::RelocationFailed` | `iced-x86` could not relocate the stolen instructions (e.g., RIP-relative target > 2 GB from trampoline) |
 | `DetourError::InvalidParameter` | Null pointer passed, or the requested IAT import was not found in the module                             |
+| `DetourError::Pattern`          | A byte signature passed to `attach_pattern` could not be parsed                                          |
+| `DetourError::PatternNotFound`  | A valid signature did not match anywhere in the target module                                            |
 
 `DetourError` implements `std::error::Error` and `Display`, so it works with `?`, `anyhow`, `thiserror`, etc.
 
