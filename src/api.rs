@@ -84,6 +84,40 @@ impl DetourTransaction {
             .attach(target, detour)
     }
 
+    /// Resolves a byte signature inside a module and registers an inline hook on
+    /// the matched address, to be installed when the transaction is committed.
+    ///
+    /// This is the signature-based counterpart to [`Self::attach`]: instead of a
+    /// raw pointer or an export name, the target is located by scanning the
+    /// module's executable regions for `pattern` (IDA / x64dbg syntax, e.g.
+    /// `"48 8B 05 ?? ?? ?? ?? E8"`). The module is loaded if it is not already
+    /// present. On success, returns the trampoline pointer that can be used to
+    /// call the original function body.
+    ///
+    /// # Errors
+    ///
+    /// - [`DetourError::NotStarted`] if the transaction has already been
+    ///   committed or aborted.
+    /// - [`DetourError::Pattern`] if `pattern` is not a valid signature.
+    /// - [`DetourError::PatternNotFound`] if the signature does not match in the
+    ///   module (or the module could not be found/loaded).
+    /// - Any error propagated while preparing the inline hook.
+    pub fn attach_pattern(
+        &mut self,
+        module_name: &str,
+        pattern: &str,
+        detour: *const u8,
+    ) -> Result<*mut u8, DetourError> {
+        let pattern = crate::scan::Pattern::parse(pattern)?;
+        let target = crate::scan::scan_module_by_name(module_name, &pattern)
+            .ok_or(DetourError::PatternNotFound)?;
+
+        self.inner
+            .as_mut()
+            .ok_or(DetourError::NotStarted)?
+            .attach(target as *mut u8, detour)
+    }
+
     /// Registers an IAT hook to be installed when the transaction is committed.
     ///
     ///
@@ -1087,6 +1121,127 @@ pub unsafe extern "C" fn detours_find_function_by_ordinal(
     crate::find_function_by_ordinal(module, ordinal).unwrap_or(std::ptr::null())
 }
 
+// ----------------- FFI Entry Points: pattern / signature scanning ------------
+
+/// Resolves a byte signature inside the module identified by `h_module`,
+/// returning the address of the first match in its executable regions.
+///
+/// `pattern` is an IDA / x64dbg-style signature string (e.g.
+/// `"48 8B 05 ?? ?? ?? ?? E8"`). Returns null if `pattern` is null, not valid
+/// UTF-8, not a valid signature, or does not match.
+///
+/// # Safety
+/// `h_module` must be the base address of a valid PE module loaded in the
+/// current process, and `pattern` must be a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_scan_module(
+    h_module: *mut c_void,
+    pattern: *const c_char,
+) -> *const u8 {
+    if pattern.is_null() {
+        return std::ptr::null();
+    }
+    let Ok(pattern) = (unsafe { CStr::from_ptr(pattern) }).to_str() else {
+        return std::ptr::null();
+    };
+    let Ok(pattern) = crate::scan::Pattern::parse(pattern) else {
+        return std::ptr::null();
+    };
+    unsafe { crate::scan::scan_module(h_module as HMODULE, &pattern) }.unwrap_or(std::ptr::null())
+}
+
+/// Resolves a byte signature inside a module identified by name, loading the
+/// module if it is not already present.
+///
+/// Returns the address of the first match in the module's executable regions,
+/// or null if `module`/`pattern` are null, not valid UTF-8, `pattern` is not a
+/// valid signature, or it does not match.
+///
+/// # Safety
+/// `module` and `pattern` must be valid NUL-terminated C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_scan_module_by_name(
+    module: *const c_char,
+    pattern: *const c_char,
+) -> *const u8 {
+    if module.is_null() || pattern.is_null() {
+        return std::ptr::null();
+    }
+    let Ok(module) = (unsafe { CStr::from_ptr(module) }).to_str() else {
+        return std::ptr::null();
+    };
+    let Ok(pattern) = (unsafe { CStr::from_ptr(pattern) }).to_str() else {
+        return std::ptr::null();
+    };
+    let Ok(pattern) = crate::scan::Pattern::parse(pattern) else {
+        return std::ptr::null();
+    };
+    crate::scan::scan_module_by_name(module, &pattern).unwrap_or(std::ptr::null())
+}
+
+/// Scans `len` bytes starting at `start` for the first occurrence of a byte
+/// signature, limited to committed, readable regions.
+///
+/// `pattern` is an IDA / x64dbg-style signature string. Returns null if
+/// `start`/`pattern` are null, `pattern` is not valid UTF-8 or not a valid
+/// signature, or it does not match.
+///
+/// # Safety
+/// `start` must point into this process's address space, and `pattern` must be
+/// a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_scan_range(
+    start: *const u8,
+    len: usize,
+    pattern: *const c_char,
+) -> *const u8 {
+    if start.is_null() || pattern.is_null() {
+        return std::ptr::null();
+    }
+    let Ok(pattern) = (unsafe { CStr::from_ptr(pattern) }).to_str() else {
+        return std::ptr::null();
+    };
+    let Ok(pattern) = crate::scan::Pattern::parse(pattern) else {
+        return std::ptr::null();
+    };
+    unsafe { crate::scan::scan_range(start, len, &pattern) }.unwrap_or(std::ptr::null())
+}
+
+/// Resolves a byte signature inside a module and queues an inline hook on the
+/// matched address.
+///
+/// On success, returns the trampoline pointer for calling the original. Returns
+/// null if `tx`/`module`/`pattern` are null, the arguments are not valid UTF-8,
+/// `pattern` is not a valid signature, it does not match, or the hook could not
+/// be prepared.
+///
+/// # Safety
+/// `tx` must be a valid transaction pointer returned by
+/// `detours_transaction_begin()`, and `module`/`pattern` must be valid
+/// NUL-terminated C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_transaction_attach_pattern(
+    tx: *mut DetourTransaction,
+    module: *const c_char,
+    pattern: *const c_char,
+    detour: *const u8,
+) -> *mut u8 {
+    if tx.is_null() || module.is_null() || pattern.is_null() {
+        return std::ptr::null_mut();
+    }
+    let Ok(module) = (unsafe { CStr::from_ptr(module) }).to_str() else {
+        return std::ptr::null_mut();
+    };
+    let Ok(pattern) = (unsafe { CStr::from_ptr(pattern) }).to_str() else {
+        return std::ptr::null_mut();
+    };
+
+    let tx_ref = unsafe { &mut *tx };
+    tx_ref
+        .attach_pattern(module, pattern, detour)
+        .unwrap_or(std::ptr::null_mut())
+}
+
 // ----------------- FFI Entry Points: VEH (hardware breakpoint) hooking -------
 
 /// Installs a VEH (hardware-breakpoint) hook redirecting `target` to `detour`.
@@ -1124,6 +1279,56 @@ pub unsafe extern "C" fn detours_veh_unhook(hook: *mut crate::veh::VehHook) -> i
     }
     let hook = unsafe { Box::from_raw(hook) };
     // Dropping the box clears the breakpoint via RAII; be explicit for clarity.
+    let _ = hook.unhook();
+    1
+}
+
+// ----------------- FFI Entry Points: mid-function detours --------------------
+
+/// Installs a mid-function / arbitrary-address detour redirecting `target` to
+/// the context handler `handler`.
+///
+/// Unlike entry-point hooks, `target` may be any instruction boundary. The
+/// handler is called with a pointer to a `HookContext` snapshot of the
+/// general-purpose registers and flags, which it may read or modify before the
+/// original instructions resume.
+///
+/// Returns an opaque hook pointer on success, or null on failure (null
+/// arguments, allocation failure, or non-relocatable bytes at `target`). The
+/// returned pointer must be released with `detours_midhook_unhook`.
+///
+/// # Safety
+/// `target` must point at the start of a real instruction in executable memory,
+/// and `handler` must be a valid context-handler function pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_midhook_install(
+    target: *const u8,
+    handler: crate::midhook::MidHookHandler,
+) -> *mut crate::midhook::MidHook {
+    if target.is_null() {
+        return std::ptr::null_mut();
+    }
+    match unsafe { crate::midhook::MidHook::install(target, handler) } {
+        Ok(hook) => Box::into_raw(Box::new(hook)),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Removes a mid-function detour installed by `detours_midhook_install` and
+/// frees it, restoring the original bytes at the target.
+///
+/// Returns `1` if the hook was accepted for removal, or `0` if `hook` is null.
+///
+/// # Safety
+/// `hook` must be a valid pointer previously returned by
+/// `detours_midhook_install` and must not be used afterwards.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_midhook_unhook(hook: *mut crate::midhook::MidHook) -> i32 {
+    if hook.is_null() {
+        return 0;
+    }
+    let hook = unsafe { Box::from_raw(hook) };
+    // Dropping the box restores the original bytes via RAII; be explicit.
     let _ = hook.unhook();
     1
 }

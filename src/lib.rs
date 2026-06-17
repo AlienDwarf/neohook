@@ -19,9 +19,11 @@ mod eat;
 mod iat;
 mod introspect;
 mod mem;
+mod midhook;
 mod module;
 mod pe;
 mod reentrancy;
+mod scan;
 mod threads;
 pub(crate) mod transaction;
 mod veh;
@@ -36,11 +38,16 @@ pub use crate::introspect::{
     ExportInfo, ImportInfo, ModuleInfo, enumerate_exports, enumerate_imports, enumerate_modules,
     get_entry_point,
 };
+pub use crate::midhook::{HookContext, MidHook, MidHookHandler};
 pub use crate::module::{
     find_function, find_function_by_ordinal, get_module_handle, get_module_size,
 };
 pub use crate::pe::PeError;
 pub use crate::reentrancy::ReentrancyGuard;
+pub use crate::scan::{
+    Pattern, PatternError, scan, scan_all, scan_module, scan_module_all, scan_module_by_name,
+    scan_range, scan_range_all,
+};
 pub use crate::transaction::{
     EatHook, Hook, IatHook, InlineHook, JumpType, TransactionCore, VtableHook, VtableInstanceHook,
 };
@@ -83,6 +90,11 @@ pub enum DetourError {
     RelocationFailed,
     /// One or more parameters were invalid.
     InvalidParameter,
+    /// A byte signature could not be parsed.
+    Pattern(crate::scan::PatternError),
+    /// A byte signature parsed correctly but did not match anywhere in the
+    /// target module.
+    PatternNotFound,
     /// An error occurred while installing an IAT hook.
     Iat(crate::iat::IatHookError),
     /// An error occurred while installing an EAT hook.
@@ -111,6 +123,8 @@ impl fmt::Display for DetourError {
             Self::AllocationFailed => write!(f, "Failed to allocate memory for trampoline"),
             Self::RelocationFailed => write!(f, "Failed to relocate instructions to trampoline"),
             Self::InvalidParameter => write!(f, "One or more parameters were invalid"),
+            Self::Pattern(err) => write!(f, "Signature parse error: {err}"),
+            Self::PatternNotFound => write!(f, "Signature did not match in the target module"),
             Self::Iat(err) => write!(f, "IAT hook error: {err}"),
             Self::Eat(err) => write!(f, "EAT hook error: {err}"),
             Self::Vtable(err) => write!(f, "VTable hook error: {err}"),
@@ -129,6 +143,12 @@ impl fmt::Display for DetourError {
 impl From<crate::iat::IatHookError> for DetourError {
     fn from(err: crate::iat::IatHookError) -> Self {
         Self::Iat(err)
+    }
+}
+
+impl From<crate::scan::PatternError> for DetourError {
+    fn from(err: crate::scan::PatternError) -> Self {
+        Self::Pattern(err)
     }
 }
 
