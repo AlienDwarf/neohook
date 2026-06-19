@@ -118,6 +118,43 @@ impl DetourTransaction {
             .attach(target as *mut u8, detour)
     }
 
+    /// Resolves an exported function by name and registers an inline hook on it,
+    /// to be installed when the transaction is committed.
+    ///
+    /// This is the convenience counterpart to [`Self::attach`] for the common
+    /// case of hooking a named export: instead of resolving the address yourself
+    /// with `GetProcAddress`, pass the module and function name. The module is
+    /// loaded if it is not already present (mirroring [`crate::find_function`]).
+    /// On success, returns the trampoline pointer that can be used to call the
+    /// original function body.
+    ///
+    /// Unlike [`Self::attach_iat`] / [`Self::attach_eat`] - which rewrite a
+    /// single table slot - this patches the function body itself, so it
+    /// intercepts **every** caller in the process, no matter how they resolved
+    /// the address.
+    ///
+    /// # Errors
+    ///
+    /// - [`DetourError::NotStarted`] if the transaction has already been
+    ///   committed or aborted.
+    /// - [`DetourError::InvalidParameter`] if the module could not be
+    ///   found/loaded or the export does not exist.
+    /// - Any error propagated while preparing the inline hook.
+    pub fn attach_export(
+        &mut self,
+        module_name: &str,
+        function_name: &str,
+        detour: *const u8,
+    ) -> Result<*mut u8, DetourError> {
+        let target =
+            crate::find_function(module_name, function_name).ok_or(DetourError::InvalidParameter)?;
+
+        self.inner
+            .as_mut()
+            .ok_or(DetourError::NotStarted)?
+            .attach(target as *mut u8, detour)
+    }
+
     /// Registers an IAT hook to be installed when the transaction is committed.
     ///
     ///
@@ -1242,6 +1279,43 @@ pub unsafe extern "C" fn detours_transaction_attach_pattern(
         .unwrap_or(std::ptr::null_mut())
 }
 
+/// Resolves an exported function by name and queues an inline hook on it.
+///
+/// Convenience entry point combining `detours_find_function` and
+/// `detours_transaction_attach`: loads `module` if needed, resolves `func`, and
+/// queues an inline hook on the function body (intercepting every caller).
+///
+/// On success, returns the trampoline pointer for calling the original. Returns
+/// null if `tx`/`module`/`func` are null, the arguments are not valid UTF-8, the
+/// export could not be resolved, or the hook could not be prepared.
+///
+/// # Safety
+/// `tx` must be a valid transaction pointer returned by
+/// `detours_transaction_begin()`, and `module`/`func` must be valid
+/// NUL-terminated C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_transaction_attach_export(
+    tx: *mut DetourTransaction,
+    module: *const c_char,
+    func: *const c_char,
+    detour: *const u8,
+) -> *mut u8 {
+    if tx.is_null() || module.is_null() || func.is_null() {
+        return std::ptr::null_mut();
+    }
+    let Ok(module) = (unsafe { CStr::from_ptr(module) }).to_str() else {
+        return std::ptr::null_mut();
+    };
+    let Ok(func) = (unsafe { CStr::from_ptr(func) }).to_str() else {
+        return std::ptr::null_mut();
+    };
+
+    let tx_ref = unsafe { &mut *tx };
+    tx_ref
+        .attach_export(module, func, detour)
+        .unwrap_or(std::ptr::null_mut())
+}
+
 // ----------------- FFI Entry Points: VEH (hardware breakpoint) hooking -------
 
 /// Installs a VEH (hardware-breakpoint) hook redirecting `target` to `detour`.
@@ -1331,4 +1405,232 @@ pub unsafe extern "C" fn detours_midhook_unhook(hook: *mut crate::midhook::MidHo
     // Dropping the box restores the original bytes via RAII; be explicit.
     let _ = hook.unhook();
     1
+}
+
+// ----------------- FFI Entry Points: INT3 software-breakpoint hooking --------
+
+/// Installs an INT3 (software-breakpoint) hook redirecting `target` to `detour`.
+///
+/// Patches a single `0xCC` byte at `target` and routes the resulting breakpoint
+/// through a vectored exception handler. Unlike `detours_veh_install`, there is
+/// no four-hook limit (up to `INT3_MAX_HOOKS` targets) and threads created after
+/// the install still trap.
+///
+/// Returns an opaque hook pointer on success, or null on failure (null
+/// arguments, all slots in use, the target already hooked, handler registration
+/// failure, or the patch byte could not be written). The returned pointer must
+/// be released with `detours_int3_unhook`.
+///
+/// # Safety
+/// `target` must point at the entry of a real function in executable memory and
+/// `detour` must be a function pointer with a compatible ABI/signature.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_int3_install(
+    target: *const u8,
+    detour: *const u8,
+) -> *mut crate::int3::Int3Hook {
+    match unsafe { crate::int3::Int3Hook::install(target, detour) } {
+        Ok(hook) => Box::into_raw(Box::new(hook)),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Removes an INT3 hook installed by `detours_int3_install` and frees it,
+/// restoring the original byte at the target.
+///
+/// Returns `1` if the hook was accepted for removal, or `0` if `hook` is null.
+///
+/// # Safety
+/// `hook` must be a valid pointer previously returned by `detours_int3_install`
+/// and must not be used afterwards.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_int3_unhook(hook: *mut crate::int3::Int3Hook) -> i32 {
+    if hook.is_null() {
+        return 0;
+    }
+    let hook = unsafe { Box::from_raw(hook) };
+    // Dropping the box restores the original byte via RAII; be explicit.
+    let _ = hook.unhook();
+    1
+}
+
+// ----------------- FFI Entry Points: relative-reference resolving ------------
+
+/// Resolves the absolute target of a near branch (`call`/`jmp`/`jcc rel`) at
+/// `addr` by decoding the instruction.
+///
+/// Returns the branch target, or null if `addr` is null/unreadable, does not
+/// decode, or is not a near-branch instruction.
+///
+/// # Safety
+/// `addr` must point into this process's address space.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_resolve_call_target(addr: *const u8) -> *const u8 {
+    unsafe { crate::resolve::resolve_call_target(addr) }.unwrap_or(std::ptr::null())
+}
+
+/// Resolves the absolute address referenced by a RIP-relative memory operand at
+/// `addr` (e.g. `lea`/`mov [rip+disp32]`) by decoding the instruction.
+///
+/// Returns the referenced address, or null if `addr` is null/unreadable, does
+/// not decode, or has no RIP-relative operand.
+///
+/// # Safety
+/// `addr` must point into this process's address space.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_resolve_rip_relative(addr: *const u8) -> *const u8 {
+    unsafe { crate::resolve::resolve_rip_relative(addr) }.unwrap_or(std::ptr::null())
+}
+
+/// Resolves a relative reference from its raw encoding: returns
+/// `addr + instr_len + *(int32_t*)(addr + disp_offset)`.
+///
+/// # Safety
+/// `addr` must be readable for at least `disp_offset + 4` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_resolve_relative(
+    addr: *const u8,
+    disp_offset: usize,
+    instr_len: usize,
+) -> *const u8 {
+    unsafe { crate::resolve::resolve_relative(addr, disp_offset, instr_len) }
+}
+
+// ----------------- FFI Entry Points: delay / on-load hooking -----------------
+
+/// Registers a delay / on-load hook that installs automatically when `module` is
+/// loaded (or immediately, if it is already present).
+///
+/// Returns an opaque hook pointer on success, or null on failure (null
+/// arguments, not valid UTF-8, or the one-time `LdrLoadDll` hook failed). The
+/// returned pointer must be released with `detours_delay_unhook`.
+///
+/// # Safety
+/// `module` and `func` must be valid NUL-terminated C strings, and `detour` must
+/// be a function pointer with an ABI/signature compatible with the eventual
+/// target (full replacement, no trampoline).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_delay_register(
+    module: *const c_char,
+    func: *const c_char,
+    detour: *const u8,
+) -> *mut crate::delay::DelayHook {
+    if module.is_null() || func.is_null() {
+        return std::ptr::null_mut();
+    }
+    let Ok(module) = (unsafe { CStr::from_ptr(module) }).to_str() else {
+        return std::ptr::null_mut();
+    };
+    let Ok(func) = (unsafe { CStr::from_ptr(func) }).to_str() else {
+        return std::ptr::null_mut();
+    };
+    match unsafe { crate::delay::DelayHook::register(module, func, detour) } {
+        Ok(hook) => Box::into_raw(Box::new(hook)),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Returns `1` if the delay hook's module has been loaded and the hook is now
+/// installed, or `0` if it is still pending (or `hook` is null).
+///
+/// # Safety
+/// `hook` must be a valid pointer previously returned by
+/// `detours_delay_register`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_delay_is_active(hook: *const crate::delay::DelayHook) -> i32 {
+    if hook.is_null() {
+        return 0;
+    }
+    unsafe { (*hook).is_active() as i32 }
+}
+
+/// Removes a delay hook registered by `detours_delay_register` and frees it,
+/// restoring the original byte if it had already been installed.
+///
+/// Returns `1` if the hook was accepted for removal, or `0` if `hook` is null.
+///
+/// # Safety
+/// `hook` must be a valid pointer previously returned by
+/// `detours_delay_register` and must not be used afterwards.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_delay_unhook(hook: *mut crate::delay::DelayHook) -> i32 {
+    if hook.is_null() {
+        return 0;
+    }
+    let hook = unsafe { Box::from_raw(hook) };
+    let _ = hook.unhook();
+    1
+}
+
+#[cfg(test)]
+mod attach_export_tests {
+    use super::*;
+
+    #[test]
+    fn attach_export_rejects_unknown_export() {
+        let mut tx = DetourTransaction::begin();
+        let err = tx
+            .attach_export(
+                "kernel32.dll",
+                "DefinitelyNotARealExport_123",
+                detours_transaction_attach as *const u8,
+            )
+            .expect_err("an unknown export must not resolve");
+        assert!(matches!(err, DetourError::InvalidParameter));
+    }
+
+    #[test]
+    fn attach_export_rejects_unknown_module() {
+        let mut tx = DetourTransaction::begin();
+        let err = tx
+            .attach_export(
+                "fantasy_dll_999.dll",
+                "Whatever",
+                detours_transaction_attach as *const u8,
+            )
+            .expect_err("an unknown module must not resolve");
+        assert!(matches!(err, DetourError::InvalidParameter));
+    }
+
+    #[test]
+    fn attach_export_hooks_a_real_export() {
+        // GetCurrentProcessId is a tiny, side-effect-free kernel32 export; hook
+        // it by name, confirm the detour wins, then unhook via RAII.
+        use std::sync::OnceLock;
+        use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+
+        type Fn0 = unsafe extern "system" fn() -> u32;
+        static ORIG: OnceLock<Fn0> = OnceLock::new();
+
+        unsafe extern "system" fn detour() -> u32 {
+            0xABCD_1234
+        }
+
+        let real = unsafe { GetCurrentProcessId() };
+        assert_ne!(real, 0xABCD_1234);
+
+        let mut tx = DetourTransaction::begin();
+        tx.update_all_threads();
+        let tramp = tx
+            .attach_export("kernel32.dll", "GetCurrentProcessId", detour as *const u8)
+            .expect("attach_export should resolve and queue the hook");
+        let hooks = tx.commit().expect("commit should succeed");
+
+        let _ = ORIG.set(unsafe { std::mem::transmute::<*mut u8, Fn0>(tramp) });
+
+        assert_eq!(
+            unsafe { GetCurrentProcessId() },
+            0xABCD_1234,
+            "the named-export hook should intercept the call"
+        );
+        // The trampoline still reaches the real implementation.
+        assert_eq!(unsafe { (ORIG.get().unwrap())() }, real);
+
+        drop(hooks); // RAII restores the original bytes.
+        assert_eq!(
+            unsafe { GetCurrentProcessId() },
+            real,
+            "original should be restored after unhook"
+        );
+    }
 }
