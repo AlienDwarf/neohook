@@ -19,7 +19,7 @@ pub(crate) struct RelocationMapping {
 ///
 /// # Safety
 /// `address` only needs to be a value to query; it is never dereferenced here.
-unsafe fn readable_bytes_from(address: *const u8) -> usize {
+pub(crate) unsafe fn readable_bytes_from(address: *const u8) -> usize {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
         PAGE_EXECUTE_WRITECOPY, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
