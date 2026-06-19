@@ -14,15 +14,19 @@ use std::fmt;
 mod alloc;
 pub mod api;
 mod code;
+mod delay;
 mod disasm;
 mod eat;
 mod iat;
+mod int3;
 mod introspect;
 mod mem;
 mod midhook;
 mod module;
 mod pe;
 mod reentrancy;
+pub mod registry;
+mod resolve;
 mod scan;
 mod threads;
 pub(crate) mod transaction;
@@ -32,8 +36,10 @@ mod vtable;
 // Re-exports for public API
 pub use crate::api::DetourTransaction;
 pub use crate::code::detour_code_from_pointer;
+pub use crate::delay::{DelayHook, DelayHookError};
 pub use crate::eat::EatHookError;
 pub use crate::iat::IatHookError;
+pub use crate::int3::{Int3Hook, Int3HookError, MAX_HOOKS as INT3_MAX_HOOKS};
 pub use crate::introspect::{
     ExportInfo, ImportInfo, ModuleInfo, enumerate_exports, enumerate_imports, enumerate_modules,
     get_entry_point,
@@ -44,6 +50,7 @@ pub use crate::module::{
 };
 pub use crate::pe::PeError;
 pub use crate::reentrancy::ReentrancyGuard;
+pub use crate::resolve::{resolve_call_target, resolve_relative, resolve_rip_relative};
 pub use crate::scan::{
     Pattern, PatternError, scan, scan_all, scan_module, scan_module_all, scan_module_by_name,
     scan_range, scan_range_all,
@@ -237,6 +244,113 @@ macro_rules! detour_helper {
     }};
 }
 
+/// Installs an inline hook whose detour is a **Rust closure** - so it can
+/// capture environment (counters, channels, configuration) that a plain `fn`
+/// detour cannot. The closure receives the original function as its first
+/// argument, so it can forward to it.
+///
+/// This is something the C/C++ hooking libraries cannot express: their detours
+/// must be bare function pointers. NeoHook generates a per-site shim that stores
+/// the boxed closure and dispatches to it with the target's ABI.
+///
+/// # Syntax
+///
+/// ```rust,ignore
+/// detour_closure!(
+///     target_fn,                          // the function to hook
+///     "system" fn(a: i32, b: i32) -> i32, // ABI + argument names/types + return
+///     move |orig, a, b| orig(a, b) * 10,  // closure: first param is the original
+/// )
+/// ```
+///
+/// The argument **names** in the signature (`a`, `b`) are reused for the
+/// closure's parameters. The first closure parameter (`orig`) is the original
+/// function, typed `extern "<abi>" fn(<args>) -> <ret>`.
+///
+/// Returns `Result<Vec<Hook>, DetourError>`, exactly like [`detour_inline!`];
+/// keep the returned value alive to keep the hook installed (RAII unhook on
+/// drop).
+///
+/// # Caveats
+///
+/// - The closure is heap-allocated and **leaked** for the lifetime of the
+///   process (the per-site shim references it through a `static`). Unhooking
+///   stops it from being called but does not free it.
+/// - Like any detour, the closure may run concurrently on multiple threads. It
+///   is `FnMut`, so if it mutates captured state you are responsible for making
+///   that state thread-safe.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use neohook::detour_closure;
+/// use std::sync::atomic::{AtomicU32, Ordering};
+///
+/// #[inline(never)]
+/// extern "system" fn add(a: i32, b: i32) -> i32 { a + b }
+///
+/// let calls = AtomicU32::new(0);
+/// let _hooks = detour_closure!(
+///     add,
+///     "system" fn(a: i32, b: i32) -> i32,
+///     move |orig, a, b| {
+///         calls.fetch_add(1, Ordering::Relaxed); // captured state!
+///         orig(a, b) * 10
+///     },
+/// ).expect("hook failed");
+///
+/// assert_eq!(add(2, 3), 50);
+/// ```
+#[macro_export]
+macro_rules! detour_closure {
+    (
+        $target:expr,
+        $abi:literal fn ( $($arg:ident : $argty:ty),* $(,)? ) $(-> $ret:ty)?,
+        $closure:expr $(,)?
+    ) => {{
+        // Concrete, monomorphic types derived from the provided signature.
+        type __OrigFn = extern $abi fn($($argty),*) $(-> $ret)?;
+        type __ClosureBox =
+            ::std::boxed::Box<dyn ::std::ops::FnMut(__OrigFn, $($argty),*) $(-> $ret)?>;
+
+        static __ORIG: ::std::sync::OnceLock<__OrigFn> = ::std::sync::OnceLock::new();
+        static __CLOSURE: ::std::sync::atomic::AtomicPtr<__ClosureBox> =
+            ::std::sync::atomic::AtomicPtr::new(::std::ptr::null_mut());
+
+        // The detour the target is patched to jump to. Enters with the target's
+        // ABI, loads the boxed closure, and dispatches with the original first.
+        extern $abi fn __shim($($arg : $argty),*) $(-> $ret)? {
+            let __p = __CLOSURE.load(::std::sync::atomic::Ordering::Acquire);
+            let __orig = *__ORIG
+                .get()
+                .expect("neohook: closure detour original not set");
+            // SAFETY: `__p` points at a leaked Box set during install and is
+            // never freed while the hook is live.
+            unsafe { (&mut **__p)(__orig $(, $arg)*) }
+        }
+
+        // Box the closure twice: the inner Box is the `dyn FnMut`, the outer Box
+        // owns it so we can hand a stable `*mut __ClosureBox` to the shim.
+        let __boxed: ::std::boxed::Box<__ClosureBox> =
+            ::std::boxed::Box::new(::std::boxed::Box::new($closure));
+        __CLOSURE.store(
+            ::std::boxed::Box::into_raw(__boxed),
+            ::std::sync::atomic::Ordering::Release,
+        );
+
+        let mut __session = $crate::DetourTransaction::begin();
+        __session.update_all_threads();
+        match __session.attach($target as *mut u8, __shim as *const u8) {
+            ::std::result::Result::Ok(__tramp) => {
+                let __orig_fn: __OrigFn = unsafe { ::std::mem::transmute(__tramp) };
+                let _ = __ORIG.set(__orig_fn);
+                __session.commit()
+            }
+            ::std::result::Result::Err(__e) => ::std::result::Result::Err(__e),
+        }
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,5 +387,40 @@ mod tests {
         assert_eq!(HookKind::Iat.to_string(), "IAT");
         assert_eq!(HookKind::Vtable.to_string(), "VTable");
         assert_eq!(HookKind::VtableInstance.to_string(), "per-instance VTable");
+    }
+
+    #[inline(never)]
+    extern "system" fn closure_add(a: i32, b: i32) -> i32 {
+        std::hint::black_box(a) + std::hint::black_box(b)
+    }
+
+    #[test]
+    fn detour_closure_captures_environment_and_forwards_to_original() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_in = Arc::clone(&calls);
+
+        let target: extern "system" fn(i32, i32) -> i32 = closure_add;
+        assert_eq!(target(2, 3), 5, "sanity before hook");
+
+        let hooks = detour_closure!(
+            closure_add,
+            "system" fn(a: i32, b: i32) -> i32,
+            move |orig, a, b| {
+                // Captured state - impossible with a bare fn detour.
+                calls_in.fetch_add(1, Ordering::Relaxed);
+                orig(a, b) * 10
+            },
+        )
+        .expect("closure hook should install");
+
+        assert_eq!(target(2, 3), 50, "(2 + 3) * 10 via the closure detour");
+        assert_eq!(target(4, 5), 90, "(4 + 5) * 10");
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "closure captured the counter");
+
+        drop(hooks); // RAII restores the original.
+        assert_eq!(target(2, 3), 5, "original restored after unhook");
     }
 }
