@@ -49,7 +49,19 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 
 - **VEH Hooking** - Redirects a function using a CPU hardware breakpoint and a vectored exception handler, **without modifying a single byte** of the target. Ideal for read-only or shared code that must not be patched. Up to four targets at a time (this is a hardware limitation not caused by NeoHook).
 
+- **INT3 Software-Breakpoint Hooking** - Redirects a function by patching a single `0xCC` byte and routing the resulting breakpoint through a vectored exception handler. Unlike VEH hooks there is **no four-hook limit** (up to 256 targets), and threads created *after* the install still trap. The single-byte write is atomic, so no thread suspension is needed.
+
 - **Pattern / Signature Scanning** - Resolve unexported, statically-linked, or stripped functions by a byte signature (IDA / x64dbg `48 8B ?? E8` syntax, or code+mask). Scans only committed, executable regions of a module - safely skipping guard pages and holes - and feeds the match straight into a hook via `attach_pattern`.
+
+- **Hook-by-Export-Name** - `attach_export("user32.dll", "MessageBoxW", detour)` resolves a named export (loading the module if needed) and queues an inline hook on the function body in a single call - no manual `GetModuleHandle` / `GetProcAddress` dance.
+
+- **Relative-Reference Resolving** - After a signature scan lands on a `call rel32` or a `lea/mov [rip + disp32]`, `resolve_call_target` / `resolve_rip_relative` decode the instruction and return the absolute address it points to (or `resolve_relative` from a known encoding). Turns "the signature near the function" into "the function".
+
+- **Closure Detours** - `detour_closure!` installs an inline hook whose body is a **Rust closure that captures environment** (counters, channels, config) - something a bare-`fn`-pointer C/C++ library cannot express. The closure receives the original function as its first argument so it can forward to it.
+
+- **Delay / On-Load Hooks** - Register a hook for a function in a module that is **not loaded yet**; NeoHook inline-hooks `ntdll!LdrLoadDll` once and installs the real hook the moment the module appears (`DelayHook::register`).
+
+- **Named Hook Registry** - Park hooks in a process-wide store and refer to them by name: `registry::register`, `enable` / `disable`, `unhook`, and `unhook_all` for a single teardown point (e.g. `DLL_PROCESS_DETACH`).
 
 - **Mid-Function / Arbitrary-Address Detours** - Hook *any* instruction boundary, not just a function entry. NeoHook snapshots all general-purpose registers and flags into a `HookContext`, calls your handler with a pointer to it, restores the (possibly modified) registers, then resumes the original instructions. Rewrite arguments, results, or loop state in flight at a spot found by a signature scan - all on the thread-safe inline engine (thread suspension, IP/stack redirection, relocation, atomic rollback).
 
@@ -106,6 +118,15 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 | v0.6.0  |    ✅ Done | Signature-based hook resolution (`attach_pattern`)     |
 | v0.7.0  |    ✅ Done | Mid-function / arbitrary-address detours (`MidHook`)   |
 | v0.7.0  |    ✅ Done | Register-context capture / modification (`HookContext`)|
+| v0.8.0  |    ✅ Done | INT3 software-breakpoint hooking (`Int3Hook`)          |
+| v0.8.0  |    ✅ Done | Hook-by-export-name (`attach_export`)                   |
+| v0.8.0  |    ✅ Done | Relative-reference resolving (`resolve_call_target`)   |
+| v0.8.0  |    ✅ Done | Closure detours (`detour_closure!`)                    |
+| v0.8.0  |    ✅ Done | Delay / on-load hooks (`DelayHook`)                    |
+| v0.8.0  |    ✅ Done | Named hook registry (`registry`)                       |
+| v0.9.0  |    Planned | XMM / FPU context capture in `MidHook`                 |
+| v0.9.0  |    Planned | Control-flow redirect from a `MidHook` handler         |
+| v0.9.0  |    Planned | ARM64 inline hooking                                   |
 
 --
 
@@ -115,7 +136,7 @@ Add the crate to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-neohook = "0.7.0"
+neohook = "0.8.0"
 ```
 
 ---
@@ -435,6 +456,232 @@ See [`examples/veh_hook.rs`](examples/veh_hook.rs). The C ABI exposes
 
 ---
 
+### INT3 Software-Breakpoint Hooking
+
+Like a VEH hook, an INT3 hook redirects a function through a vectored exception
+handler rather than overwriting its prologue with a jump - but it arms the trap
+by patching a **single `0xCC` byte** at the target instead of using a hardware
+debug register. That removes VEH's four-hook ceiling (up to 256 targets), and
+threads created *after* the install still trap. The one-byte write is atomic, so
+no threads are suspended.
+
+```rust
+use neohook::Int3Hook;
+
+#[inline(never)]
+extern "system" fn secret() -> u32 { 1234 }
+extern "system" fn secret_detour() -> u32 { 9999 }
+
+fn main() {
+    let hook = unsafe {
+        Int3Hook::install(
+            secret as *const () as *const u8,
+            secret_detour as *const () as *const u8,
+        )
+    }
+    .expect("INT3 hook failed");
+
+    assert_eq!(secret(), 9999); // intercepted via the breakpoint handler
+    hook.unhook().unwrap();     // original byte restored
+}
+```
+
+Trade-offs versus a VEH hook:
+
+- **One byte is modified.** The target is not byte-for-byte intact, so this is
+  unsuitable for read-only pages that reject the write or code guarded by an
+  integrity check. (Use a VEH hook there.)
+- **No four-hook limit.** Up to `INT3_MAX_HOOKS` (256) targets at once.
+- **Covers future threads.** Arming is not per-thread.
+- **Full replacement.** Like VEH, the detour replaces the target; there is no
+  trampoline to call the original through.
+
+See [`examples/int3_hook.rs`](examples/int3_hook.rs) (which installs six hooks at
+once to show the limit is gone). The C ABI exposes
+`detours_int3_install(target, detour)` and `detours_int3_unhook(hook)`; the C++
+wrapper provides an RAII `neohook::Int3Hook`.
+
+---
+
+### Hooking a Named Export - `attach_export`
+
+When the target is a named export, you do not need to resolve its address
+yourself. `attach_export` loads the module if necessary, resolves the export, and
+queues an inline hook on the function body in one call - intercepting **every**
+caller in the process (unlike an IAT hook, which only affects one module).
+
+```rust
+use neohook::DetourTransaction;
+
+unsafe extern "system" fn my_message_box_w(
+    hwnd: *mut core::ffi::c_void,
+    _text: *const u16,
+    caption: *const u16,
+    utype: u32,
+) -> i32 {
+    // Replace the body text, then forward through the trampoline if desired.
+    0
+}
+
+fn main() {
+    let mut tx = DetourTransaction::begin();
+    tx.update_all_threads();
+
+    // One call: resolve user32!MessageBoxW by name and queue the inline hook.
+    let _trampoline = tx
+        .attach_export("user32.dll", "MessageBoxW", my_message_box_w as *const u8)
+        .expect("export not found");
+
+    let _hooks = tx.commit().expect("transaction failed");
+}
+```
+
+The C ABI exposes `detours_transaction_attach_export(tx, module, func, detour)`;
+the C++ wrapper provides `Transaction::attach_export(...)`. See
+[`examples/attach_export.rs`](examples/attach_export.rs).
+
+---
+
+### Resolving Relative References After a Scan
+
+A [signature scan](#pattern--signature-scanning) usually lands on an instruction
+that *references* the address you want rather than being it - a `call rel32` into
+the function, or a `lea/mov [rip + disp32]` loading a global. On x86_64 these
+encodings are position-dependent, so the bytes you matched do not contain the
+absolute target; you must add the displacement to the address *past* the
+instruction. These helpers do that for you.
+
+```rust
+use neohook::{Pattern, scan_module_by_name, resolve_call_target, resolve_rip_relative};
+
+// Signature lands on `call InitWorld` inside the caller.
+let pat = Pattern::parse("E8 ?? ?? ?? ??").unwrap();
+let call_site = scan_module_by_name("game.dll", &pat).unwrap();
+
+// Follow the relative call to the real function entry, then hook that.
+let init_world = unsafe { resolve_call_target(call_site) }.unwrap();
+
+// Or, for `mov rax, [rip+disp32]` loading a global pointer:
+// let global = unsafe { resolve_rip_relative(load_site) }.unwrap();
+```
+
+`resolve_relative(addr, disp_offset, instr_len)` is the decode-free variant when
+you already know the exact encoding. The C ABI exposes `detours_resolve_call_target`,
+`detours_resolve_rip_relative`, and `detours_resolve_relative`; the C++ wrapper
+mirrors them as `neohook::resolve_*`. See
+[`examples/resolve_relative.rs`](examples/resolve_relative.rs).
+
+---
+
+### Closure Detours - `detour_closure!`
+
+Every detour shown so far is a bare `fn` pointer. `detour_closure!` lets the
+detour be a **Rust closure that captures environment** - a counter, a channel, a
+config value - which no C/C++ hooking library can express. The closure receives
+the original function as its first argument, so it can still forward to it.
+
+```rust
+use neohook::detour_closure;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+
+#[inline(never)]
+extern "system" fn add(a: i32, b: i32) -> i32 { a + b }
+
+fn main() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let calls_in = Arc::clone(&calls);
+
+    let _hooks = detour_closure!(
+        add,                                    // target
+        "system" fn(a: i32, b: i32) -> i32,     // ABI + arg names/types + return
+        move |orig, a, b| {                     // first param is the original
+            calls_in.fetch_add(1, Ordering::Relaxed); // captured state!
+            orig(a, b) * 10
+        },
+    )
+    .expect("hook failed");
+
+    assert_eq!(add(2, 3), 50);               // (2 + 3) * 10
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+}
+```
+
+The argument names in the signature are reused for the closure parameters.
+Returns `Result<Vec<Hook>, DetourError>` like `detour_inline!`; keep the value
+alive to keep the hook installed. The closure is heap-allocated and leaked for
+the process lifetime, and - like any detour - may run concurrently, so guard any
+mutable captured state yourself. See
+[`examples/closure_detour.rs`](examples/closure_detour.rs).
+
+---
+
+### Delay / On-Load Hooks
+
+Sometimes the target lives in a module that is not loaded yet - a plugin, a
+lazily-loaded codec, a graphics backend chosen at runtime. A `DelayHook`
+registers the module + export name up front and installs the hook the moment
+that module appears. NeoHook inline-hooks `ntdll!LdrLoadDll` (the chokepoint
+every `LoadLibrary*` funnels through) once, and on each load re-checks the
+pending list.
+
+```rust
+use neohook::DelayHook;
+
+unsafe extern "system" fn my_present(/* ... */) -> i32 { 0 }
+
+fn main() {
+    // d3d11.dll may not be loaded yet - register anyway.
+    let hook = unsafe {
+        DelayHook::register("d3d11.dll", "D3D11CreateDeviceAndSwapChain", my_present as *const u8)
+    }
+    .expect("register failed");
+
+    // ... later, when the game loads d3d11.dll, the hook installs itself.
+    assert!(hook.is_active() || !hook.is_active()); // query install state
+}
+```
+
+The redirect uses an INT3 hook (single byte, no thread suspension) so the install
+is safe under the loader lock. Like INT3/VEH hooks it is full-replacement (no
+trampoline to the original). The C ABI exposes `detours_delay_register`,
+`detours_delay_is_active`, and `detours_delay_unhook`; the C++ wrapper provides
+an RAII `neohook::DelayHook`. See [`examples/delay_hook.rs`](examples/delay_hook.rs).
+
+---
+
+### Named Hook Registry
+
+By default a hook is owned by the `Vec<Hook>` you hold and is unhooked when that
+value drops. In a long-lived injected DLL it is often handier to park hooks in
+one place and refer to them by name - toggling, removing, or tearing them all
+down without threading a guard through your code.
+
+```rust
+use neohook::{registry, DetourTransaction};
+
+fn install(target: *mut u8, detour: *const u8) {
+    let mut tx = DetourTransaction::begin();
+    tx.update_all_threads();
+    tx.attach(target, detour).unwrap();
+    let mut hooks = tx.commit().unwrap();
+
+    registry::register("sleep", hooks.remove(0));
+}
+
+fn shutdown() {
+    registry::disable("sleep").ok();   // temporarily off
+    registry::enable("sleep").ok();    // back on
+    registry::unhook_all();            // tear everything down (e.g. DLL_PROCESS_DETACH)
+}
+```
+
+`register`, `take`, `enable`, `disable`, `is_enabled`, `unhook`, `unhook_all`,
+`names`, and `count` operate on the shared store. This is a Rust-side ergonomic
+layer (no C ABI).
+
+---
+
 ### VTable Hooking
 
 Redirect a specific virtual slot by queueing a VTable hook in the same transaction API.
@@ -472,6 +719,30 @@ For hooking a COM-style interface (the `IUnknown` `QueryInterface`/`AddRef`/`Rel
 see [`examples/com_vtable_hook.rs`](examples/com_vtable_hook.rs).
 For an end-to-end input hook (intercepting `user32!GetMessageW` so every keystroke
 in a window becomes `'a'`), see [`examples/force_keystroke_to_a.rs`](examples/force_keystroke_to_a.rs).
+
+---
+
+### Graphics API Hooking (DirectX / OpenGL)
+
+The flagship use case for VTable and inline hooks is intercepting a graphics
+API's frame-present call - the anchor point for overlays, ESPs, and frame
+counters. NeoHook ships three **self-contained, runnable** examples that set up
+their own rendering context (no game required) and confirm the hook fires. They
+use the software rasterizer / software GL, so they run **without a GPU** (and in
+CI):
+
+| Example | Target | Technique |
+| :------ | :----- | :-------- |
+| [`examples/d3d11_present.rs`](examples/d3d11_present.rs) | `IDXGISwapChain::Present` (vtable slot 8) | VTable hook on a WARP swapchain |
+| [`examples/d3d9_endscene.rs`](examples/d3d9_endscene.rs) | `IDirect3DDevice9::EndScene` (vtable slot 42) | VTable hook on a NULLREF device |
+| [`examples/opengl_swapbuffers.rs`](examples/opengl_swapbuffers.rs) | `opengl32!wglSwapBuffers` | Inline hook via `attach_export` |
+
+The hard part of hooking DirectX is just *getting* the vtable: create a throwaway
+device/swapchain and read the vtable pointer from the COM object. Each example
+shows that, then hooks the present/end-scene slot and forwards to the original.
+In an injected DLL the hook logic is identical - only the delivery differs (you
+install it from `DllMain` instead of creating your own context). Run them with
+e.g. `cargo run --example d3d11_present`.
 
 ---
 
@@ -690,9 +961,13 @@ neohook/
 │   ├── iat.rs          - IatHook: IAT parsing and pointer rewriting
 │   ├── eat.rs          - EatHook: EAT parsing and export RVA rewriting (+ near stub)
 │   ├── veh.rs          - VehHook: hardware-breakpoint hooking via a vectored handler
+│   ├── int3.rs         - Int3Hook: INT3 software-breakpoint hooking via a vectored handler
 │   ├── midhook.rs      - MidHook: mid-function detours + register-context bridge
 │   ├── pe.rs           - Shared bounds-checked PE parsing primitives
 │   ├── scan.rs         - Pattern: signature parsing + memory/module scanning
+│   ├── resolve.rs      - Resolve relative refs (call/jmp/rip) into absolute addresses
+│   ├── delay.rs        - DelayHook: on-load hooks via an ntdll!LdrLoadDll detour
+│   ├── registry.rs     - Process-wide named hook registry (+ unhook_all)
 │   ├── introspect.rs   - Module / PE introspection (modules, exports, imports)
 │   ├── mem.rs          - Memory helpers: VirtualProtect wrapper, atomic write
 │   ├── module.rs       - Module utilities: find_function, get_module_handle

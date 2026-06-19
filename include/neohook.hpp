@@ -186,6 +186,39 @@ namespace neohook
     }
 
     /**
+     * @brief Resolves the absolute target of a near branch (call/jmp/jcc rel)
+     *        at @p addr by decoding the instruction. Returns null if @p addr is
+     *        not a near-branch instruction.
+     */
+    inline void *resolve_call_target(const void *addr)
+    {
+        return const_cast<uint8_t *>(
+            detours_resolve_call_target(static_cast<const uint8_t *>(addr)));
+    }
+
+    /**
+     * @brief Resolves the absolute address referenced by a RIP-relative memory
+     *        operand at @p addr. Returns null if there is no such operand.
+     */
+    inline void *resolve_rip_relative(const void *addr)
+    {
+        return const_cast<uint8_t *>(
+            detours_resolve_rip_relative(static_cast<const uint8_t *>(addr)));
+    }
+
+    /**
+     * @brief Resolves a relative reference from its raw encoding:
+     *        addr + instr_len + *(int32_t*)(addr + disp_offset).
+     */
+    inline void *resolve_relative(const void *addr, size_t disp_offset, size_t instr_len)
+    {
+        return const_cast<uint8_t *>(detours_resolve_relative(
+            static_cast<const uint8_t *>(addr),
+            static_cast<uintptr_t>(disp_offset),
+            static_cast<uintptr_t>(instr_len)));
+    }
+
+    /**
      * @brief Manages the lifetime of installed hooks.
      *
      * When this object is destroyed, all hooks referenced by the underlying
@@ -428,6 +461,34 @@ namespace neohook
         }
 
         /**
+         * @brief Resolves an exported function by name and queues an inline hook
+         *        on it.
+         *
+         * Convenience counterpart to attach() for named exports: loads @p module
+         * if needed, resolves @p func, and queues an inline hook on the function
+         * body, intercepting every caller in the process.
+         *
+         * @return The original function pointer (trampoline) cast to type T.
+         */
+        template <typename T>
+        T attach_export(const std::string &module, const std::string &func, T detour)
+        {
+            if (!tx_)
+                throw std::runtime_error("NeoHook: Transaction is no longer valid");
+
+            auto *tramp = detours_transaction_attach_export(
+                tx_,
+                module.c_str(),
+                func.c_str(),
+                reinterpret_cast<const uint8_t *>(detour));
+
+            if (!tramp)
+                throw std::runtime_error("NeoHook: Failed to attach export hook");
+
+            return reinterpret_cast<T>(tramp);
+        }
+
+        /**
          * @brief Queues a VTable hook for the given slot index.
          *
          * @return The original function pointer cast to type T.
@@ -627,5 +688,135 @@ namespace neohook
 
     private:
         ::MidHook *hook_ = nullptr;
+    };
+
+    /**
+     * @brief RAII guard for an INT3 (software-breakpoint) hook.
+     *
+     * Redirects @p target to @p detour by patching a single 0xCC byte at the
+     * target entry and routing the resulting breakpoint through a vectored
+     * exception handler. Unlike VehHook there is no four-hook limit, and threads
+     * created after the install still trap. The original byte is restored when
+     * the guard is destroyed.
+     *
+     * Like VehHook, the detour fully replaces the target; there is no trampoline
+     * to call the original through.
+     */
+    class Int3Hook
+    {
+    public:
+        Int3Hook(const void *target, const void *detour)
+        {
+            hook_ = detours_int3_install(
+                static_cast<const uint8_t *>(target),
+                static_cast<const uint8_t *>(detour));
+            if (!hook_)
+                throw std::runtime_error("NeoHook: Failed to install INT3 hook");
+        }
+
+        ~Int3Hook()
+        {
+            if (hook_)
+                detours_int3_unhook(hook_);
+        }
+
+        Int3Hook(const Int3Hook &) = delete;
+        Int3Hook &operator=(const Int3Hook &) = delete;
+
+        Int3Hook(Int3Hook &&other) noexcept : hook_(other.hook_)
+        {
+            other.hook_ = nullptr;
+        }
+
+        Int3Hook &operator=(Int3Hook &&other) noexcept
+        {
+            if (this != &other)
+            {
+                if (hook_)
+                    detours_int3_unhook(hook_);
+                hook_ = other.hook_;
+                other.hook_ = nullptr;
+            }
+            return *this;
+        }
+
+        /// Removes the hook early, restoring the original byte. Idempotent.
+        void unhook()
+        {
+            if (hook_)
+            {
+                detours_int3_unhook(hook_);
+                hook_ = nullptr;
+            }
+        }
+
+    private:
+        ::Int3Hook *hook_ = nullptr;
+    };
+
+    /**
+     * @brief RAII guard for a delay / on-load hook.
+     *
+     * Registers @p detour for @p module ! @p func and installs it automatically
+     * when @p module is loaded (or immediately, if it is already present).
+     * NeoHook inline-hooks ntdll!LdrLoadDll once to detect the load. The detour
+     * fully replaces the target (no trampoline). The request is removed - and the
+     * original byte restored if it was installed - when the guard is destroyed.
+     */
+    class DelayHook
+    {
+    public:
+        DelayHook(const std::string &module, const std::string &func, const void *detour)
+        {
+            hook_ = detours_delay_register(
+                module.c_str(), func.c_str(), static_cast<const uint8_t *>(detour));
+            if (!hook_)
+                throw std::runtime_error("NeoHook: Failed to register delay hook");
+        }
+
+        ~DelayHook()
+        {
+            if (hook_)
+                detours_delay_unhook(hook_);
+        }
+
+        DelayHook(const DelayHook &) = delete;
+        DelayHook &operator=(const DelayHook &) = delete;
+
+        DelayHook(DelayHook &&other) noexcept : hook_(other.hook_)
+        {
+            other.hook_ = nullptr;
+        }
+
+        DelayHook &operator=(DelayHook &&other) noexcept
+        {
+            if (this != &other)
+            {
+                if (hook_)
+                    detours_delay_unhook(hook_);
+                hook_ = other.hook_;
+                other.hook_ = nullptr;
+            }
+            return *this;
+        }
+
+        /// True once the module has been loaded and the hook is installed.
+        bool is_active() const
+        {
+            return hook_ && detours_delay_is_active(hook_) != 0;
+        }
+
+        /// Removes the request early, restoring the original byte if installed.
+        void unhook()
+        {
+            if (hook_)
+            {
+                detours_delay_unhook(hook_);
+                hook_ = nullptr;
+            }
+        }
+
+    private:
+        ::DelayHook *hook_ = nullptr;
     };
 }
