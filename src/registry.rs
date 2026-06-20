@@ -33,8 +33,8 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::transaction::Hook;
 use crate::DetourError;
+use crate::transaction::Hook;
 
 /// Wraps a [`Hook`] so it can live in a `static`.
 ///
@@ -106,7 +106,10 @@ pub fn disable(name: &str) -> Result<bool, DetourError> {
 /// registered under `name`, or `None` if no such hook is registered.
 pub fn is_enabled(name: &str) -> Option<bool> {
     let guard = lock();
-    guard.as_ref().and_then(|m| m.get(name)).map(|h| h.0.is_enabled())
+    guard
+        .as_ref()
+        .and_then(|m| m.get(name))
+        .map(|h| h.0.is_enabled())
 }
 
 /// Removes the hook registered under `name` and unhooks it, restoring the
@@ -192,15 +195,24 @@ mod tests {
         assert_eq!(target(), 77, "hook should be active once registered");
         assert_eq!(is_enabled("reg-a"), Some(true));
 
-        assert_eq!(disable("reg-a").unwrap(), true);
+        assert!(
+            disable("reg-a").unwrap(),
+            "disable should report it was enabled"
+        );
         assert_eq!(target(), 7, "disabled hook should not intercept");
         assert_eq!(is_enabled("reg-a"), Some(false));
 
-        assert_eq!(enable("reg-a").unwrap(), true);
+        assert!(
+            enable("reg-a").unwrap(),
+            "enable should report it was disabled"
+        );
         assert_eq!(target(), 77, "re-enabled hook should intercept again");
 
         // Unknown names are reported, not errors.
-        assert_eq!(enable("nope").unwrap(), false);
+        assert!(
+            !enable("nope").unwrap(),
+            "enabling an unknown name reports false"
+        );
         assert_eq!(is_enabled("nope"), None);
 
         let torn = unhook_all();

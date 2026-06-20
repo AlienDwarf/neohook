@@ -68,8 +68,7 @@ pub fn enumerate_modules() -> Vec<ModuleInfo> {
     // Snapshot the modules of the current process (pid 0 == self). Both the
     // native and 32-bit module lists are requested so a WoW64 process sees all
     // of its modules.
-    let snapshot =
-        unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, 0) };
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
         return modules;
     }
@@ -131,7 +130,8 @@ pub unsafe fn enumerate_exports(h_module: HMODULE) -> Result<Vec<ExportInfo>, Pe
     let mut exports = Vec::new();
 
     // No export directory => the module has no exports.
-    let Some((exp_rva, exp_size)) = pe::data_directory(&image, IMAGE_DIRECTORY_ENTRY_EXPORT as usize)
+    let Some((exp_rva, exp_size)) =
+        pe::data_directory(&image, IMAGE_DIRECTORY_ENTRY_EXPORT as usize)
     else {
         return Ok(exports);
     };
@@ -260,7 +260,8 @@ pub unsafe fn enumerate_imports(h_module: HMODULE) -> Result<Vec<ImportInfo>, Pe
                 } else {
                     // `lookup` is the RVA of an IMAGE_IMPORT_BY_NAME (WORD hint
                     // followed by the NUL-terminated name).
-                    let name = pe::read_c_string_from_rva(&image, lookup + std::mem::size_of::<u16>());
+                    let name =
+                        pe::read_c_string_from_rva(&image, lookup + std::mem::size_of::<u16>());
                     (name, None)
                 };
 

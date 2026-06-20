@@ -64,7 +64,10 @@ impl std::fmt::Display for PatternError {
         match self {
             Self::Empty => write!(f, "signature is empty"),
             Self::InvalidToken(tok) => {
-                write!(f, "invalid signature token '{tok}' (expected a hex byte or '?')")
+                write!(
+                    f,
+                    "invalid signature token '{tok}' (expected a hex byte or '?')"
+                )
             }
             Self::InvalidMaskChar(c) => {
                 write!(f, "invalid mask character '{c}' (expected 'x' or '?')")

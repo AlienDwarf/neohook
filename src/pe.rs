@@ -193,3 +193,92 @@ pub fn read_c_string_from_rva(image: &ModuleImage, rva: usize) -> Option<String>
 
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A DOS header immediately followed by the NT headers, laid out the same
+    /// way a real loaded module is. Driving `parse_module_image` against a
+    /// pointer to one of these lets each validation branch be hit deliberately
+    /// by corrupting a single field of an otherwise-valid image.
+    #[repr(C)]
+    struct FakeImage {
+        dos: IMAGE_DOS_HEADER,
+        nt: IMAGE_NT_HEADERS,
+    }
+
+    /// Builds a synthetic image whose headers pass every check, so each test
+    /// can corrupt exactly one field and assert the resulting `PeError`.
+    fn valid_image() -> Box<FakeImage> {
+        // SAFETY: `IMAGE_DOS_HEADER` / `IMAGE_NT_HEADERS` are plain C POD
+        // structs, so an all-zero instance is a sound starting point that we
+        // then populate with the few fields the parser inspects.
+        let mut img: Box<FakeImage> = Box::new(unsafe { std::mem::zeroed() });
+        img.dos.e_magic = IMAGE_DOS_SIGNATURE;
+        img.dos.e_lfanew = std::mem::offset_of!(FakeImage, nt) as i32;
+        img.nt.Signature = IMAGE_NT_SIGNATURE;
+        img.nt.OptionalHeader.Magic = IMAGE_OPTIONAL_MAGIC;
+        img.nt.OptionalHeader.SizeOfImage = std::mem::size_of::<FakeImage>() as u32;
+        img
+    }
+
+    fn parse(img: &FakeImage) -> Result<ModuleImage, PeError> {
+        parse_module_image(img as *const FakeImage as HMODULE)
+    }
+
+    #[test]
+    fn valid_headers_parse() {
+        let img = valid_image();
+        let parsed = parse(&img).expect("a well-formed image must parse");
+        assert_eq!(parsed.base_address, &*img as *const FakeImage as usize);
+        assert_eq!(parsed.size, std::mem::size_of::<FakeImage>());
+    }
+
+    #[test]
+    fn null_module_is_rejected() {
+        assert!(matches!(
+            parse_module_image(std::ptr::null_mut()),
+            Err(PeError::NullModule)
+        ));
+    }
+
+    #[test]
+    fn missing_dos_signature_is_rejected() {
+        let mut img = valid_image();
+        img.dos.e_magic = 0; // not "MZ"
+        assert!(matches!(parse(&img), Err(PeError::InvalidDosHeader)));
+    }
+
+    #[test]
+    fn non_positive_e_lfanew_is_rejected() {
+        // Zero and negative offsets to the NT headers are both invalid.
+        for bad in [0, -1] {
+            let mut img = valid_image();
+            img.dos.e_lfanew = bad;
+            assert!(matches!(parse(&img), Err(PeError::InvalidNtHeader)));
+        }
+    }
+
+    #[test]
+    fn missing_nt_signature_is_rejected() {
+        let mut img = valid_image();
+        img.nt.Signature = 0; // not "PE\0\0"
+        assert!(matches!(parse(&img), Err(PeError::InvalidNtSignature)));
+    }
+
+    #[test]
+    fn wrong_optional_header_magic_is_rejected() {
+        let mut img = valid_image();
+        // Flip to the magic of the *other* architecture so it never matches.
+        img.nt.OptionalHeader.Magic = !IMAGE_OPTIONAL_MAGIC;
+        assert!(matches!(parse(&img), Err(PeError::InvalidOptionalHeader)));
+    }
+
+    #[test]
+    fn zero_size_of_image_is_rejected() {
+        let mut img = valid_image();
+        img.nt.OptionalHeader.SizeOfImage = 0;
+        assert!(matches!(parse(&img), Err(PeError::InvalidOptionalHeader)));
+    }
+}

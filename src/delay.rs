@@ -183,10 +183,10 @@ impl DelayHook {
             }
         }
         // Once no delay hooks remain, retire the LdrLoadDll inline hook.
-        if mgr.pending.is_empty() {
-            if let Some(hook) = mgr.ldr_hook.take() {
-                let _ = hook.unhook();
-            }
+        if mgr.pending.is_empty()
+            && let Some(hook) = mgr.ldr_hook.take()
+        {
+            let _ = hook.unhook();
         }
     }
 }
@@ -218,8 +218,8 @@ fn ensure_ldr_hook(mgr: &mut DelayManager) -> Result<(), DelayHookError> {
         return Ok(());
     }
 
-    let target = crate::find_function("ntdll.dll", "LdrLoadDll")
-        .ok_or(DelayHookError::LdrHookFailed)?;
+    let target =
+        crate::find_function("ntdll.dll", "LdrLoadDll").ok_or(DelayHookError::LdrHookFailed)?;
 
     let mut tx = TransactionCore::begin();
     tx.update_all_threads();
@@ -299,8 +299,9 @@ mod tests {
         // first and loading afterwards exercises the LdrLoadDll path. (If it is
         // already loaded, the immediate-install path still leaves the hook
         // active, so the end-state assertions below hold either way.)
-        let hook = unsafe { DelayHook::register("winmm.dll", "timeGetTime", fake_time as *const u8) }
-            .expect("register should succeed");
+        let hook =
+            unsafe { DelayHook::register("winmm.dll", "timeGetTime", fake_time as *const u8) }
+                .expect("register should succeed");
 
         // Force the load; our LdrLoadDll detour installs the pending hook.
         let module = unsafe { LoadLibraryW(wide("winmm.dll").as_ptr()) };
@@ -312,11 +313,10 @@ mod tests {
         );
 
         // Resolve and call the real export: the INT3 redirect should win.
-        let proc = unsafe {
-            GetProcAddress(module, c"timeGetTime".as_ptr() as *const u8)
-        }
-        .expect("timeGetTime should resolve");
-        let time_get_time: unsafe extern "system" fn() -> u32 = unsafe { std::mem::transmute(proc) };
+        let proc = unsafe { GetProcAddress(module, c"timeGetTime".as_ptr() as *const u8) }
+            .expect("timeGetTime should resolve");
+        let time_get_time: unsafe extern "system" fn() -> u32 =
+            unsafe { std::mem::transmute(proc) };
         assert_eq!(
             unsafe { time_get_time() },
             0xABCD_1234,

@@ -80,9 +80,7 @@ fn find_function_by_ordinal_matches_named_lookup() {
 
     let sample = exports
         .iter()
-        .find(|e| {
-            e.name.is_some() && e.forwarder.is_none() && e.ordinal <= u16::MAX as u32
-        })
+        .find(|e| e.name.is_some() && e.forwarder.is_none() && e.ordinal <= u16::MAX as u32)
         .expect("kernel32 should have a named, non-forwarded export");
 
     let name = sample.name.as_deref().unwrap();

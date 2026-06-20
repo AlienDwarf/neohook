@@ -44,7 +44,7 @@ pub use crate::introspect::{
     ExportInfo, ImportInfo, ModuleInfo, enumerate_exports, enumerate_imports, enumerate_modules,
     get_entry_point,
 };
-pub use crate::midhook::{HookContext, MidHook, MidHookHandler};
+pub use crate::midhook::{HookContext, MidHook, MidHookHandler, Xmm};
 pub use crate::module::{
     find_function, find_function_by_ordinal, get_module_handle, get_module_size,
 };
@@ -396,8 +396,8 @@ mod tests {
 
     #[test]
     fn detour_closure_captures_environment_and_forwards_to_original() {
-        use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
 
         let calls = Arc::new(AtomicU32::new(0));
         let calls_in = Arc::clone(&calls);
@@ -418,7 +418,11 @@ mod tests {
 
         assert_eq!(target(2, 3), 50, "(2 + 3) * 10 via the closure detour");
         assert_eq!(target(4, 5), 90, "(4 + 5) * 10");
-        assert_eq!(calls.load(Ordering::Relaxed), 2, "closure captured the counter");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "closure captured the counter"
+        );
 
         drop(hooks); // RAII restores the original.
         assert_eq!(target(2, 3), 5, "original restored after unhook");

@@ -11,8 +11,8 @@
 */
 use neohook::detour_closure;
 use std::error::Error;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 #[inline(never)]
 extern "system" fn add(a: i32, b: i32) -> i32 {
@@ -40,9 +40,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         },
     )?;
 
-    println!("after hook:  add(2, 3) = {}   (intercepted, call #1)", call(2, 3));
-    println!("after hook:  add(4, 5) = {}   (intercepted, call #2)", call(4, 5));
-    println!("total intercepted calls: {}", counter.load(Ordering::Relaxed));
+    println!(
+        "after hook:  add(2, 3) = {}   (intercepted, call #1)",
+        call(2, 3)
+    );
+    println!(
+        "after hook:  add(4, 5) = {}   (intercepted, call #2)",
+        call(4, 5)
+    );
+    println!(
+        "total intercepted calls: {}",
+        counter.load(Ordering::Relaxed)
+    );
 
     drop(hooks); // RAII restores the original bytes.
     println!("after unhook: add(2, 3) = {}", call(2, 3));

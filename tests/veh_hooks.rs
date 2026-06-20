@@ -33,15 +33,19 @@ fn detour_ptr() -> *const u8 {
 fn veh_hook_redirects_and_restores_on_calling_thread() {
     assert_eq!(call_target(), 1234, "precondition");
 
-    let hook = unsafe { VehHook::install(target_ptr(), detour_ptr()) }
-        .expect("install should succeed");
+    let hook =
+        unsafe { VehHook::install(target_ptr(), detour_ptr()) }.expect("install should succeed");
     assert_eq!(hook.target(), target_ptr());
     assert_eq!(hook.detour(), detour_ptr());
 
     assert_eq!(call_target(), 9999, "calling thread should hit the detour");
 
     hook.unhook().expect("unhook should succeed");
-    assert_eq!(call_target(), 1234, "original must be restored after unhook");
+    assert_eq!(
+        call_target(),
+        1234,
+        "original must be restored after unhook"
+    );
 }
 
 #[test]
@@ -52,7 +56,11 @@ fn veh_hook_drop_restores() {
         assert_eq!(call_target(), 9999);
         // _hook drops here, clearing the breakpoint.
     }
-    assert_eq!(call_target(), 1234, "dropping the guard should restore the original");
+    assert_eq!(
+        call_target(),
+        1234,
+        "dropping the guard should restore the original"
+    );
 }
 
 #[test]
@@ -72,8 +80,8 @@ fn veh_hook_covers_threads_that_exist_at_install_time() {
 
     ready_rx.recv().unwrap();
 
-    let hook = unsafe { VehHook::install(target_ptr(), detour_ptr()) }
-        .expect("install should succeed");
+    let hook =
+        unsafe { VehHook::install(target_ptr(), detour_ptr()) }.expect("install should succeed");
 
     go_tx.send(()).unwrap();
     let worker_result = result_rx.recv().unwrap();

@@ -245,9 +245,11 @@ unsafe fn find_export_slot(
         }
 
         let slot_rva = functions_rva
-            .checked_add(func_index.checked_mul(std::mem::size_of::<u32>()).ok_or(
-                EatHookError::ExportTableUnavailable,
-            )?)
+            .checked_add(
+                func_index
+                    .checked_mul(std::mem::size_of::<u32>())
+                    .ok_or(EatHookError::ExportTableUnavailable)?,
+            )
             .ok_or(EatHookError::ExportTableUnavailable)?;
 
         let slot_ptr = pe::rva_to_mut_ptr::<u32>(image, slot_rva)

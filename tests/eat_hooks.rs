@@ -38,7 +38,10 @@ fn eat_hook_redirects_getprocaddress_and_restores() {
     let module = kernel32();
 
     let before = unsafe { resolve(module, "GetTickCount")() };
-    assert_ne!(before, SENTINEL, "precondition: real function must not return the sentinel");
+    assert_ne!(
+        before, SENTINEL,
+        "precondition: real function must not return the sentinel"
+    );
 
     let mut tx = TransactionCore::begin();
     tx.attach_eat(module, "GetTickCount", get_tick_count_detour as *const u8)
@@ -47,19 +50,29 @@ fn eat_hook_redirects_getprocaddress_and_restores() {
 
     // A fresh resolution now lands on the detour (directly or via the jump stub).
     let hooked = unsafe { resolve(module, "GetTickCount")() };
-    assert_eq!(hooked, SENTINEL, "EAT lookup should hit the detour after commit");
+    assert_eq!(
+        hooked, SENTINEL,
+        "EAT lookup should hit the detour after commit"
+    );
 
     // The recorded original pointer still reaches the real function body.
     let original =
         unsafe { std::mem::transmute::<*const u8, GetTickCountFn>(hooks[0].original_ptr()) };
-    assert_ne!(unsafe { original() }, SENTINEL, "original_ptr must bypass the detour");
+    assert_ne!(
+        unsafe { original() },
+        SENTINEL,
+        "original_ptr must bypass the detour"
+    );
 
     for hook in hooks {
         hook.unhook().expect("unhook should succeed");
     }
 
     let after = unsafe { resolve(module, "GetTickCount")() };
-    assert_ne!(after, SENTINEL, "EAT lookup should be restored after unhook");
+    assert_ne!(
+        after, SENTINEL,
+        "EAT lookup should be restored after unhook"
+    );
 }
 
 #[test]
@@ -73,7 +86,9 @@ fn eat_hook_disable_enable_round_trip() {
 
     assert_eq!(unsafe { resolve(module, "GetTickCount")() }, SENTINEL);
 
-    hooks[0].disable().expect("disable should restore the original RVA");
+    hooks[0]
+        .disable()
+        .expect("disable should restore the original RVA");
     assert_ne!(
         unsafe { resolve(module, "GetTickCount")() },
         SENTINEL,
@@ -81,7 +96,9 @@ fn eat_hook_disable_enable_round_trip() {
     );
     assert!(!hooks[0].is_enabled());
 
-    hooks[0].enable().expect("enable should re-point at the detour");
+    hooks[0]
+        .enable()
+        .expect("enable should re-point at the detour");
     assert_eq!(
         unsafe { resolve(module, "GetTickCount")() },
         SENTINEL,
@@ -104,7 +121,10 @@ fn attach_eat_rejects_missing_export() {
         "DefinitelyNotARealExport_123",
         get_tick_count_detour as *const u8,
     );
-    assert!(result.is_err(), "missing export should be rejected at attach time");
+    assert!(
+        result.is_err(),
+        "missing export should be rejected at attach time"
+    );
 }
 
 #[test]

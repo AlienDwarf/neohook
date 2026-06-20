@@ -146,8 +146,8 @@ impl DetourTransaction {
         function_name: &str,
         detour: *const u8,
     ) -> Result<*mut u8, DetourError> {
-        let target =
-            crate::find_function(module_name, function_name).ok_or(DetourError::InvalidParameter)?;
+        let target = crate::find_function(module_name, function_name)
+            .ok_or(DetourError::InvalidParameter)?;
 
         self.inner
             .as_mut()

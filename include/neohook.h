@@ -64,17 +64,45 @@ typedef struct MidHook MidHook;
  */
 typedef struct VehHook VehHook;
 
+/**
+ * A 128-bit XMM register, captured for a [`MidHook`] handler.
+ *
+ * The two halves are stored little-endian, matching how `movups` writes the
+ * register to memory: `low` is bytes 0..8 (a packed `f64`, the scalar `f32`,
+ * or the low quadword of a vector) and `high` is bytes 8..16. A handler reads
+ * or writes these directly - e.g. `f64::from_bits(ctx.xmm[0].low)` to read a
+ * scalar `double` argument, or `ctx.xmm[0].low = v.to_bits()` to replace it.
+ */
+typedef struct Xmm {
+  /**
+   * Bytes 0..8 of the register (the low quadword).
+   */
+  uint64_t low;
+  /**
+   * Bytes 8..16 of the register (the high quadword).
+   */
+  uint64_t high;
+} Xmm;
+
 #if defined(_M_X64)
 /**
- * Snapshot of the general-purpose registers and flags at the hook site,
- * captured for an x86_64 [`MidHook`] handler.
+ * Snapshot of the general-purpose registers, flags and SSE / floating-point
+ * state at the hook site, captured for an x86_64 [`MidHook`] handler.
  *
- * The field order matches the order in which the stub pushes registers, so the
+ * The field order matches the order in which the stub saves the state, so the
  * pointer passed to the handler aliases this layout exactly. A handler may read
  * any field to observe the live value, or write any field to change the
  * register before the original instructions resume. `rsp` is captured for
  * inspection but writing it has no effect (the stack pointer is managed by the
  * stub).
+ *
+ * `xmm` holds `XMM0`..`XMM15` in order, and `mxcsr` holds the SSE
+ * control/status word. The x87 stack registers are not captured (see the
+ * module-level limits).
+ *
+ * `redirect_rip` is **0 on entry**. Leave it 0 to continue the original
+ * function normally; set it to a code address to redirect control flow there
+ * instead (see the [module docs](self#control-flow-redirect)).
  */
 typedef struct HookContext {
   /**
@@ -96,16 +124,40 @@ typedef struct HookContext {
   uint64_t r13;
   uint64_t r14;
   uint64_t r15;
+  /**
+   * The SSE control/status register (`MXCSR`).
+   */
+  uint32_t mxcsr;
+  /**
+   * Padding so `xmm` is 8-byte aligned; mirrors a reserved slot in the stub.
+   */
+  uint32_t _reserved;
+  /**
+   * `XMM0` through `XMM15`, in register-number order.
+   */
+  struct Xmm xmm[16];
+  /**
+   * Control-flow redirect target. `0` (the default) continues the original
+   * function; any other value is jumped to after the registers are restored,
+   * skipping the stolen instructions. See the [module docs](self#control-flow-redirect).
+   */
+  uint64_t redirect_rip;
 } HookContext;
 #endif
 
 #if defined(_M_IX86)
 /**
- * Snapshot of the general-purpose registers and flags at the hook site,
- * captured for an x86 [`MidHook`] handler.
+ * Snapshot of the general-purpose registers, flags and SSE / floating-point
+ * state at the hook site, captured for an x86 [`MidHook`] handler.
  *
- * The layout matches the `pushad` + `pushfd` block the stub writes. Writing
- * `esp` has no effect (`popad` discards its saved stack pointer slot).
+ * The layout matches the `pushad` + `pushfd` block the stub writes, preceded
+ * by the saved `MXCSR` and `XMM0`..`XMM7`. Writing `esp` has no effect
+ * (`popad` discards its saved stack pointer slot). The x87 stack registers are
+ * not captured (see the module-level limits).
+ *
+ * `redirect_eip` is **0 on entry**. Leave it 0 to continue the original
+ * function normally; set it to a code address to redirect control flow there
+ * instead (see the [module docs](self#control-flow-redirect)).
  */
 typedef struct HookContext {
   /**
@@ -120,6 +172,20 @@ typedef struct HookContext {
   uint32_t edx;
   uint32_t ecx;
   uint32_t eax;
+  /**
+   * The SSE control/status register (`MXCSR`).
+   */
+  uint32_t mxcsr;
+  /**
+   * `XMM0` through `XMM7`, in register-number order.
+   */
+  struct Xmm xmm[8];
+  /**
+   * Control-flow redirect target. `0` (the default) continues the original
+   * function; any other value is jumped to after the registers are restored,
+   * skipping the stolen instructions. See the [module docs](self#control-flow-redirect).
+   */
+  uint32_t redirect_eip;
 } HookContext;
 #endif
 
@@ -127,9 +193,10 @@ typedef struct HookContext {
  * A handler invoked at a mid-function hook site with a pointer to the captured
  * [`HookContext`].
  *
- * The handler runs with every register snapshotted and restored around it, so
- * it may freely clobber registers and modify the context block in place. It
- * must not block indefinitely or unwind across the FFI boundary.
+ * The handler runs with every general-purpose register, the flags, all XMM
+ * registers and `MXCSR` snapshotted and restored around it, so it may freely
+ * clobber registers and modify the context block in place. It must not block
+ * indefinitely or unwind across the FFI boundary.
  */
 typedef void (*MidHookHandler)(struct HookContext *context);
 
