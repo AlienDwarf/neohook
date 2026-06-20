@@ -63,7 +63,7 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 
 - **Named Hook Registry** - Park hooks in a process-wide store and refer to them by name: `registry::register`, `enable` / `disable`, `unhook`, and `unhook_all` for a single teardown point (e.g. `DLL_PROCESS_DETACH`).
 
-- **Mid-Function / Arbitrary-Address Detours** - Hook *any* instruction boundary, not just a function entry. NeoHook snapshots all general-purpose registers and flags into a `HookContext`, calls your handler with a pointer to it, restores the (possibly modified) registers, then resumes the original instructions. Rewrite arguments, results, or loop state in flight at a spot found by a signature scan - all on the thread-safe inline engine (thread suspension, IP/stack redirection, relocation, atomic rollback).
+- **Mid-Function / Arbitrary-Address Detours** - Hook *any* instruction boundary, not just a function entry. NeoHook snapshots all general-purpose registers, flags, the XMM registers and `MXCSR` into a `HookContext`, calls your handler with a pointer to it, restores the (possibly modified) state, then resumes the original instructions. Rewrite integer or floating-point/SIMD arguments, results, or loop state in flight at a spot found by a signature scan - all on the thread-safe inline engine (thread suspension, IP/stack redirection, relocation, atomic rollback).
 
 - **VTable Hooking** - Rewrites a selected VTable slot to detour virtual calls and restores the original slot on unhook.
 
@@ -124,7 +124,7 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 | v0.8.0  |    ✅ Done | Closure detours (`detour_closure!`)                    |
 | v0.8.0  |    ✅ Done | Delay / on-load hooks (`DelayHook`)                    |
 | v0.8.0  |    ✅ Done | Named hook registry (`registry`)                       |
-| v0.9.0  |    Planned | XMM / FPU context capture in `MidHook`                 |
+| v0.9.0  |    ✅ Done | XMM / MXCSR context capture in `MidHook`               |
 | v0.9.0  |    Planned | Control-flow redirect from a `MidHook` handler         |
 | v0.9.0  |    Planned | ARM64 inline hooking                                   |
 
@@ -370,11 +370,12 @@ typically located with a [signature scan](#pattern--signature-scanning).
 
 Because such a site is reached with arbitrary registers live, a normal detour
 would clobber them. Instead NeoHook installs a context bridge: it snapshots all
-general-purpose registers and flags into a [`HookContext`], calls your handler
-with a pointer to it, restores the (possibly modified) registers, then runs the
-original instructions and resumes the function. The patch runs on the full
-inline engine - threads suspended, instruction pointers/return addresses
-redirected, stolen bytes relocated, atomic rollback on failure.
+general-purpose registers, flags, every XMM register and `MXCSR` into a
+[`HookContext`], calls your handler with a pointer to it, restores the
+(possibly modified) state, then runs the original instructions and resumes the
+function. The patch runs on the full inline engine - threads suspended,
+instruction pointers/return addresses redirected, stolen bytes relocated,
+atomic rollback on failure.
 
 ```rust
 use neohook::{HookContext, MidHook};
@@ -402,10 +403,13 @@ fn main() {
 ```
 
 A handler may read any field of `HookContext` to observe a live register, or
-write one to change it before execution continues. The detour always *continues*
-the original function - it cannot skip it or redirect control flow, and only
-general-purpose registers and flags are captured (not XMM/FPU state). `target`
-must sit on a real instruction boundary.
+write one to change it before execution continues - including the floating-point
+/ SIMD argument registers via `ctx.xmm[..]` (e.g.
+`f64::from_bits(ctx.xmm[0].low)` for a scalar `double`). The detour always
+*continues* the original function - it cannot skip it or redirect control flow.
+General-purpose registers, flags, all XMM registers and `MXCSR` are captured;
+the legacy x87 stack registers are not. `target` must sit on a real instruction
+boundary.
 
 The C ABI exposes `detours_midhook_install(target, handler)` and
 `detours_midhook_unhook(hook)`; the C++ wrapper provides an RAII `neohook::MidHook`.

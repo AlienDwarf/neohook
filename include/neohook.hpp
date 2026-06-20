@@ -634,8 +634,9 @@ namespace neohook
      *
      * Redirects @p target - which may be any instruction boundary, not just a
      * function entry - to a context @p handler. The handler receives a pointer
-     * to a ::HookContext snapshot of the general-purpose registers and flags,
-     * which it may read or modify before the original instructions resume.
+     * to a ::HookContext snapshot of the general-purpose registers, flags, XMM
+     * registers and MXCSR, which it may read or modify before the original
+     * instructions resume.
      *
      * The original bytes are restored when the guard is destroyed.
      */

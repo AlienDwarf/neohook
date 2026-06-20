@@ -44,7 +44,7 @@ pub use crate::introspect::{
     ExportInfo, ImportInfo, ModuleInfo, enumerate_exports, enumerate_imports, enumerate_modules,
     get_entry_point,
 };
-pub use crate::midhook::{HookContext, MidHook, MidHookHandler};
+pub use crate::midhook::{HookContext, MidHook, MidHookHandler, Xmm};
 pub use crate::module::{
     find_function, find_function_by_ordinal, get_module_handle, get_module_size,
 };
