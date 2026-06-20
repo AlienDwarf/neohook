@@ -9,7 +9,10 @@
 //! "called" and "unhook restores" tests on every target.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+// AtomicU64 backs the register-observation statics, which are x86_64-only.
+#[cfg(target_arch = "x86_64")]
+use std::sync::atomic::AtomicU64;
 
 use neohook::{HookContext, MidHook};
 
@@ -26,6 +29,9 @@ fn install_guard() -> std::sync::MutexGuard<'static, ()> {
 
 // A function whose entry we treat as an arbitrary code address to detour.
 // `black_box` keeps the compiler from constant-folding or inlining it away.
+// Only the register-observing/rewriting tests use it, and those are x86_64-only
+// (x86 passes integer arguments on the stack), so gate it to avoid dead code.
+#[cfg(target_arch = "x86_64")]
 #[inline(never)]
 extern "system" fn triple(x: u64) -> u64 {
     std::hint::black_box(x).wrapping_mul(3)
@@ -37,6 +43,7 @@ extern "system" fn noop_work(x: u64) -> u64 {
 }
 
 static HANDLER_RAN: AtomicBool = AtomicBool::new(false);
+#[cfg(target_arch = "x86_64")]
 static OBSERVED_ARG: AtomicU64 = AtomicU64::new(0);
 
 unsafe extern "system" fn observe_handler(ctx: *mut HookContext) {

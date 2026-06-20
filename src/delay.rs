@@ -183,10 +183,10 @@ impl DelayHook {
             }
         }
         // Once no delay hooks remain, retire the LdrLoadDll inline hook.
-        if mgr.pending.is_empty() {
-            if let Some(hook) = mgr.ldr_hook.take() {
-                let _ = hook.unhook();
-            }
+        if mgr.pending.is_empty()
+            && let Some(hook) = mgr.ldr_hook.take()
+        {
+            let _ = hook.unhook();
         }
     }
 }
