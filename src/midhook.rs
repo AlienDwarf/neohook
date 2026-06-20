@@ -433,7 +433,11 @@ mod tests {
 
     #[test]
     fn stub_fits_within_capacity() {
-        let bytes = build_stub(0x1000 as *mut u8, 0xDEAD_BEEF as *const u8, 0x2000 as *mut u8);
+        let bytes = build_stub(
+            0x1000 as *mut u8,
+            0xDEAD_BEEF as *const u8,
+            0x2000 as *mut u8,
+        );
         assert!(
             bytes.len() <= STUB_CAPACITY,
             "stub ({} bytes) must fit in the reserved buffer",
@@ -461,17 +465,26 @@ mod tests {
         // The gateway is the trailing 8 bytes after the FF 25 absolute jump.
         let tail = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap());
         assert_eq!(tail, gateway);
-        assert_eq!(&bytes[bytes.len() - 14..bytes.len() - 8], &[0xFF, 0x25, 0, 0, 0, 0]);
+        assert_eq!(
+            &bytes[bytes.len() - 14..bytes.len() - 8],
+            &[0xFF, 0x25, 0, 0, 0, 0]
+        );
 
         // The SSE state is saved (stmxcsr 0F AE 1C 24) and restored
         // (ldmxcsr 0F AE 14 24) exactly once around the call.
         assert_eq!(
-            bytes.windows(4).filter(|w| *w == [0x0F, 0xAE, 0x1C, 0x24]).count(),
+            bytes
+                .windows(4)
+                .filter(|w| *w == [0x0F, 0xAE, 0x1C, 0x24])
+                .count(),
             1,
             "exactly one stmxcsr"
         );
         assert_eq!(
-            bytes.windows(4).filter(|w| *w == [0x0F, 0xAE, 0x14, 0x24]).count(),
+            bytes
+                .windows(4)
+                .filter(|w| *w == [0x0F, 0xAE, 0x14, 0x24])
+                .count(),
             1,
             "exactly one ldmxcsr"
         );
@@ -517,7 +530,11 @@ mod tests {
     fn x86_stub_encodes_relative_jump_to_gateway() {
         let stub_addr = 0x0040_0000i64;
         let gateway = 0x0050_0000i64;
-        let bytes = build_stub(stub_addr as *mut u8, 0xCAFE as *const u8, gateway as *mut u8);
+        let bytes = build_stub(
+            stub_addr as *mut u8,
+            0xCAFE as *const u8,
+            gateway as *mut u8,
+        );
 
         // The XMM spill prologue now runs before pushad; the first thing the
         // stub does is reserve a 16-byte slot (sub esp, 16) for xmm7.

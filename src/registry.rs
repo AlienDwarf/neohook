@@ -33,8 +33,8 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::transaction::Hook;
 use crate::DetourError;
+use crate::transaction::Hook;
 
 /// Wraps a [`Hook`] so it can live in a `static`.
 ///
@@ -106,7 +106,10 @@ pub fn disable(name: &str) -> Result<bool, DetourError> {
 /// registered under `name`, or `None` if no such hook is registered.
 pub fn is_enabled(name: &str) -> Option<bool> {
     let guard = lock();
-    guard.as_ref().and_then(|m| m.get(name)).map(|h| h.0.is_enabled())
+    guard
+        .as_ref()
+        .and_then(|m| m.get(name))
+        .map(|h| h.0.is_enabled())
 }
 
 /// Removes the hook registered under `name` and unhooks it, restoring the

@@ -60,7 +60,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // The hook records the original resolved address; calling it bypasses the
     // detour and reaches the real function body.
-    let original = unsafe { std::mem::transmute::<*const u8, GetTickCountFn>(hooks[0].original_ptr()) };
+    let original =
+        unsafe { std::mem::transmute::<*const u8, GetTickCountFn>(hooks[0].original_ptr()) };
     println!("original still returns ~{}", unsafe { original() });
 
     for hook in hooks {

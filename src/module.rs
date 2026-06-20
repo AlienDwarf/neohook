@@ -205,10 +205,7 @@ mod tests {
     #[test]
     fn find_function_by_ordinal_returns_none_for_absurd_ordinal() {
         let addr = module::find_function_by_ordinal("kernel32.dll", u16::MAX);
-        assert!(
-            addr.is_none(),
-            "an out-of-range ordinal should not resolve"
-        );
+        assert!(addr.is_none(), "an out-of-range ordinal should not resolve");
     }
 
     #[test]

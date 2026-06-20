@@ -8,8 +8,8 @@
 //! restore, continue - is identical on both architectures and is covered by the
 //! "called" and "unhook restores" tests on every target.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use neohook::{HookContext, MidHook};
 
@@ -99,7 +99,10 @@ fn handler_runs_and_function_still_returns_correctly() {
     // The detour fires, then the original instructions resume unchanged.
     let result = noop_work(41);
     assert!(HANDLER_RAN.load(Ordering::SeqCst), "handler must have run");
-    assert_eq!(result, 42, "original computation must complete after the detour");
+    assert_eq!(
+        result, 42,
+        "original computation must complete after the detour"
+    );
 
     hook.unhook().expect("unhook should succeed");
 
@@ -118,8 +121,7 @@ fn handler_observes_live_argument_register() {
     let _serial = install_guard();
     OBSERVED_ARG.store(0, Ordering::SeqCst);
 
-    let hook = unsafe { MidHook::install(triple as *const u8, observe_handler) }
-        .expect("install");
+    let hook = unsafe { MidHook::install(triple as *const u8, observe_handler) }.expect("install");
 
     let _ = triple(7);
     assert_eq!(
@@ -137,8 +139,8 @@ fn handler_can_rewrite_a_register_in_flight() {
     let _serial = install_guard();
     assert_eq!(triple(5), 15); // baseline: 5 * 3
 
-    let hook = unsafe { MidHook::install(triple as *const u8, add_to_arg_handler) }
-        .expect("install");
+    let hook =
+        unsafe { MidHook::install(triple as *const u8, add_to_arg_handler) }.expect("install");
 
     // Handler bumps RCX (the argument) by 10 before the body runs: (5 + 10) * 3.
     assert_eq!(triple(5), 45, "register edit must take effect");
@@ -195,8 +197,8 @@ fn dropping_the_guard_unhooks() {
     HANDLER_RAN.store(false, Ordering::SeqCst);
 
     {
-        let _hook = unsafe { MidHook::install(noop_work as *const u8, observe_handler) }
-            .expect("install");
+        let _hook =
+            unsafe { MidHook::install(noop_work as *const u8, observe_handler) }.expect("install");
         let _ = noop_work(1);
         assert!(HANDLER_RAN.load(Ordering::SeqCst));
     } // _hook drops here -> original bytes restored

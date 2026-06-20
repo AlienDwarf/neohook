@@ -29,7 +29,8 @@ extern "system" fn add_detour(a: i32, b: i32) -> i32 {
 /// File name (without path) of the test executable, e.g. `pattern_scan-XXXX.exe`.
 fn main_module_name() -> String {
     let mut buf = [0u16; 1024];
-    let len = unsafe { GetModuleFileNameW(std::ptr::null_mut(), buf.as_mut_ptr(), buf.len() as u32) };
+    let len =
+        unsafe { GetModuleFileNameW(std::ptr::null_mut(), buf.as_mut_ptr(), buf.len() as u32) };
     assert!(len > 0, "GetModuleFileNameW failed");
     let full = String::from_utf16_lossy(&buf[..len as usize]);
     full.rsplit(['\\', '/']).next().unwrap_or(&full).to_string()
@@ -68,7 +69,10 @@ fn scan_range_round_trips_a_local_function() {
 
     // Scan a window that comfortably contains the function.
     let found = unsafe { scan_range(target, 256, &pat) }.expect("signature should resolve");
-    assert_eq!(found, target, "scan_range should land on the function start");
+    assert_eq!(
+        found, target,
+        "scan_range should land on the function start"
+    );
 }
 
 #[test]
@@ -147,8 +151,8 @@ fn attach_pattern_reports_not_found() {
 #[test]
 fn scan_module_by_name_matches_get_module_handle_path() {
     // A signature taken from a real kernel32 export must resolve to that export.
-    let target = neohook::find_function("kernel32.dll", "GetProcAddress")
-        .expect("GetProcAddress resolves");
+    let target =
+        neohook::find_function("kernel32.dll", "GetProcAddress").expect("GetProcAddress resolves");
     let pat = signature_from(target, 12);
 
     let h = get_module_handle("kernel32.dll").expect("kernel32 handle");

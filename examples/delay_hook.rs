@@ -40,13 +40,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let proc = unsafe { GetProcAddress(module, c"timeGetTime".as_ptr() as *const u8) }
         .ok_or("timeGetTime not found")?;
     let time_get_time: unsafe extern "system" fn() -> u32 = unsafe { std::mem::transmute(proc) };
-    println!(
-        "timeGetTime() = {}   (0xDEADBEE1 - intercepted)",
-        unsafe { time_get_time() }
-    );
+    println!("timeGetTime() = {}   (0xDEADBEE1 - intercepted)", unsafe {
+        time_get_time()
+    });
 
     hook.unhook()?;
-    println!("after unhook: timeGetTime() = {}", unsafe { time_get_time() });
+    println!("after unhook: timeGetTime() = {}", unsafe {
+        time_get_time()
+    });
 
     Ok(())
 }

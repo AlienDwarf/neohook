@@ -24,7 +24,9 @@ unsafe extern "system" fn hooked_get_tick_count() -> u32 {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    println!("before hook: GetTickCount() = {}", unsafe { GetTickCount() });
+    println!("before hook: GetTickCount() = {}", unsafe {
+        GetTickCount()
+    });
 
     let mut tx = DetourTransaction::begin();
     tx.update_all_threads();
@@ -39,15 +41,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     let _hooks = tx.commit()?;
     let _ = ORIG.set(unsafe { std::mem::transmute::<*mut u8, GetTickCountFn>(tramp) });
 
-    println!("after hook:  GetTickCount() = {}", unsafe { GetTickCount() });
-    println!(
-        "original via trampoline:    = {}",
-        unsafe { (ORIG.get().unwrap())() }
-    );
+    println!("after hook:  GetTickCount() = {}", unsafe {
+        GetTickCount()
+    });
+    println!("original via trampoline:    = {}", unsafe {
+        (ORIG.get().unwrap())()
+    });
 
     // _hooks drops here -> the original bytes are restored automatically.
     drop(_hooks);
-    println!("after unhook:GetTickCount() = {}", unsafe { GetTickCount() });
+    println!("after unhook:GetTickCount() = {}", unsafe {
+        GetTickCount()
+    });
 
     Ok(())
 }

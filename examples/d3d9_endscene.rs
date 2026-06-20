@@ -19,9 +19,9 @@ use std::sync::OnceLock;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, MSG, PM_REMOVE,
-    PeekMessageW, PostQuitMessage, RegisterClassW, SW_SHOW, ShowWindow, TranslateMessage,
-    WM_DESTROY, WM_QUIT, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, MSG, PM_REMOVE, PeekMessageW,
+    PostQuitMessage, RegisterClassW, SW_SHOW, ShowWindow, TranslateMessage, WM_DESTROY, WM_QUIT,
+    WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 
 // --- Minimal Direct3D 9 definitions (not provided by windows-sys) ---
@@ -90,8 +90,13 @@ type SceneFn = unsafe extern "system" fn(*mut c_void) -> i32;
 type ClearFn =
     unsafe extern "system" fn(*mut c_void, u32, *const D3dRect, u32, u32, f32, u32) -> i32;
 /// `HRESULT Present(this, pSrcRect, pDstRect, hDestWindow, pDirtyRegion)`.
-type PresentFn =
-    unsafe extern "system" fn(*mut c_void, *const c_void, *const c_void, HWND, *const c_void) -> i32;
+type PresentFn = unsafe extern "system" fn(
+    *mut c_void,
+    *const c_void,
+    *const c_void,
+    HWND,
+    *const c_void,
+) -> i32;
 type ReleaseFn = unsafe extern "system" fn(*mut c_void) -> u32;
 
 /// The original `EndScene` returned by `attach_vtable`, used to finalize frames.
@@ -265,7 +270,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
-            clear(device, 0, std::ptr::null(), D3DCLEAR_TARGET, 0xFF00_0000, 1.0, 0);
+            clear(
+                device,
+                0,
+                std::ptr::null(),
+                D3DCLEAR_TARGET,
+                0xFF00_0000,
+                1.0,
+                0,
+            );
             begin_scene(device);
             // EndScene dispatches through the hooked vtable slot.
             let end_scene: SceneFn = std::mem::transmute(*vtable.add(END_SCENE_SLOT));

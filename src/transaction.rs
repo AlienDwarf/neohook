@@ -696,11 +696,7 @@ impl TransactionCore {
     /// # Safety
     /// The caller must ensure that `target` and `detour` are valid pointers. NeoHook performs basic validation but does not guarantee that the pointers are valid or that the memory they point to is properly aligned or accessible. Invalid pointers may cause undefined behavior, including crashes.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
-    pub fn attach(
-        &mut self,
-        target: *mut u8,
-        detour: *const u8,
-    ) -> Result<*mut u8, DetourError> {
+    pub fn attach(&mut self, target: *mut u8, detour: *const u8) -> Result<*mut u8, DetourError> {
         self.attach_inner(target, detour, true)
     }
 

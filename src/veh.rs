@@ -3,7 +3,7 @@
 
 //! VEH (Vectored Exception Handler)
 //!
-//! A VEH hook does **not** modify a single byte of the target - 
+//! A VEH hook does **not** modify a single byte of the target -
 //! neither its code nor any pointer table. Instead
 //! it uses a CPU hardware execution breakpoint (debug registers `DR0`-`DR3`) on
 //! the target address and installs a process-wide vectored exception handler.
@@ -411,7 +411,8 @@ mod tests {
         let target = slot_target_a as *const () as *const u8;
         let detour = slot_detour as *const () as *const u8;
 
-        let hook = unsafe { VehHook::install(target, detour) }.expect("first install should succeed");
+        let hook =
+            unsafe { VehHook::install(target, detour) }.expect("first install should succeed");
         assert!(matches!(
             unsafe { VehHook::install(target, detour) },
             Err(VehHookError::AlreadyHooked)

@@ -11,9 +11,9 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, MSG, PM_REMOVE,
-    PeekMessageW, PostQuitMessage, RegisterClassW, SW_SHOW, ShowWindow, TranslateMessage,
-    WM_DESTROY, WM_QUIT, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, MSG, PM_REMOVE, PeekMessageW,
+    PostQuitMessage, RegisterClassW, SW_SHOW, ShowWindow, TranslateMessage, WM_DESTROY, WM_QUIT,
+    WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 use windows_sys::core::GUID;
 
@@ -109,9 +109,11 @@ type D3d11CreateFn = unsafe extern "system" fn(
 /// `HRESULT IDXGISwapChain::Present(this, SyncInterval, Flags)`.
 type PresentFn = unsafe extern "system" fn(*mut c_void, u32, u32) -> i32;
 /// `HRESULT GetBuffer(this, Buffer, riid, ppSurface)`.
-type GetBufferFn = unsafe extern "system" fn(*mut c_void, u32, *const GUID, *mut *mut c_void) -> i32;
+type GetBufferFn =
+    unsafe extern "system" fn(*mut c_void, u32, *const GUID, *mut *mut c_void) -> i32;
 /// `HRESULT QueryInterface(this, riid, ppvObject)`.
-type QueryInterfaceFn = unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> i32;
+type QueryInterfaceFn =
+    unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> i32;
 /// `HRESULT CreateRenderTargetView(this, pResource, pDesc, ppRTV)`.
 type CreateRtvFn =
     unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, *mut *mut c_void) -> i32;
@@ -184,14 +186,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!("skipped: d3d11.dll not available");
             return Ok(());
         }
-        let create_ptr =
-            match GetProcAddress(d3d11, c"D3D11CreateDeviceAndSwapChain".as_ptr() as *const u8) {
-                Some(p) => p,
-                None => {
-                    println!("skipped: D3D11CreateDeviceAndSwapChain not found");
-                    return Ok(());
-                }
-            };
+        let create_ptr = match GetProcAddress(
+            d3d11,
+            c"D3D11CreateDeviceAndSwapChain".as_ptr() as *const u8,
+        ) {
+            Some(p) => p,
+            None => {
+                println!("skipped: D3D11CreateDeviceAndSwapChain not found");
+                return Ok(());
+            }
+        };
         let create: D3d11CreateFn = std::mem::transmute(create_ptr);
 
         //Create the window
@@ -308,7 +312,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         RTV.store(rtv, Ordering::Relaxed);
         CTX1.store(context1, Ordering::Relaxed);
 
-        // Hook Present by cloning the swapchain's vtable, replacing the Present slot, and writing a 
+        // Hook Present by cloning the swapchain's vtable, replacing the Present slot, and writing a
         // pointer to the clone back into the swapchain.
         let mut tx = DetourTransaction::begin();
         let original = tx.attach_vtable_instance(

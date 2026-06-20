@@ -67,8 +67,8 @@ fn main() {
     }
 
     // You can also build a signature from a byte array + mask string:
-    let _code_style = Pattern::from_code_style(b"\x48\x8B\x00\x00", "xx??")
-        .expect("valid code-style signature");
+    let _code_style =
+        Pattern::from_code_style(b"\x48\x8B\x00\x00", "xx??").expect("valid code-style signature");
 
     // --- 2. Hook the function purely by signature ---------------------------
     println!("\ncompute(10) before hook = {}", compute(10)); // 31
