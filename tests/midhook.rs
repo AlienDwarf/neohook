@@ -192,6 +192,71 @@ fn handler_can_rewrite_an_xmm_register_in_flight() {
     assert_eq!(add_half(1.0), 1.5, "behaviour restored after unhook");
 }
 
+// --- Control-flow redirect (works on both architectures) ---------------------
+
+#[inline(never)]
+extern "system" fn redir_original(x: u64) -> u64 {
+    std::hint::black_box(x).wrapping_mul(3)
+}
+
+// A drop-in replacement with the same ABI. Redirecting `redir_original`'s entry
+// here makes the call behave as if `redir_replacement` had been called: it runs
+// with the same arguments/stack and returns to the original caller.
+#[inline(never)]
+extern "system" fn redir_replacement(x: u64) -> u64 {
+    std::hint::black_box(x).wrapping_add(1000)
+}
+
+unsafe extern "system" fn redirect_handler(ctx: *mut HookContext) {
+    let ctx = unsafe { &mut *ctx };
+    #[cfg(target_arch = "x86_64")]
+    {
+        ctx.redirect_rip = redir_replacement as usize as u64;
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        ctx.redirect_eip = redir_replacement as usize as u32;
+    }
+}
+
+#[test]
+fn handler_can_redirect_control_flow() {
+    let _serial = install_guard();
+    assert_eq!(redir_original(5), 15); // baseline: 5 * 3
+
+    let hook = unsafe { MidHook::install(redir_original as *const u8, redirect_handler) }
+        .expect("install");
+
+    // The handler redirects to redir_replacement, skipping the original body:
+    // 5 + 1000.
+    assert_eq!(
+        redir_original(5),
+        1005,
+        "control flow must be redirected to the replacement"
+    );
+
+    hook.unhook().expect("unhook");
+    assert_eq!(redir_original(5), 15, "original restored after unhook");
+}
+
+#[test]
+fn resume_address_is_past_the_patched_bytes() {
+    let _serial = install_guard();
+    let hook =
+        unsafe { MidHook::install(redir_original as *const u8, observe_handler) }.expect("install");
+
+    let target = hook.target() as usize;
+    let resume = hook.resume_address() as usize;
+    // resume == target + stolen_len; the patch steals at least a 5-byte jmp and
+    // never an unreasonable amount.
+    assert!(
+        resume > target && resume - target >= 5 && resume - target <= 24,
+        "resume_address ({resume:#x}) must sit just past the patch at target ({target:#x})"
+    );
+
+    hook.unhook().expect("unhook");
+}
+
 #[test]
 fn install_rejects_null_target() {
     let err = unsafe { MidHook::install(std::ptr::null(), observe_handler) };

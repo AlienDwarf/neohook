@@ -99,6 +99,10 @@ typedef struct Xmm {
  * `xmm` holds `XMM0`..`XMM15` in order, and `mxcsr` holds the SSE
  * control/status word. The x87 stack registers are not captured (see the
  * module-level limits).
+ *
+ * `redirect_rip` is **0 on entry**. Leave it 0 to continue the original
+ * function normally; set it to a code address to redirect control flow there
+ * instead (see the [module docs](self#control-flow-redirect)).
  */
 typedef struct HookContext {
   /**
@@ -132,6 +136,12 @@ typedef struct HookContext {
    * `XMM0` through `XMM15`, in register-number order.
    */
   struct Xmm xmm[16];
+  /**
+   * Control-flow redirect target. `0` (the default) continues the original
+   * function; any other value is jumped to after the registers are restored,
+   * skipping the stolen instructions. See the [module docs](self#control-flow-redirect).
+   */
+  uint64_t redirect_rip;
 } HookContext;
 #endif
 
@@ -144,6 +154,10 @@ typedef struct HookContext {
  * by the saved `MXCSR` and `XMM0`..`XMM7`. Writing `esp` has no effect
  * (`popad` discards its saved stack pointer slot). The x87 stack registers are
  * not captured (see the module-level limits).
+ *
+ * `redirect_eip` is **0 on entry**. Leave it 0 to continue the original
+ * function normally; set it to a code address to redirect control flow there
+ * instead (see the [module docs](self#control-flow-redirect)).
  */
 typedef struct HookContext {
   /**
@@ -166,6 +180,12 @@ typedef struct HookContext {
    * `XMM0` through `XMM7`, in register-number order.
    */
   struct Xmm xmm[8];
+  /**
+   * Control-flow redirect target. `0` (the default) continues the original
+   * function; any other value is jumped to after the registers are restored,
+   * skipping the stolen instructions. See the [module docs](self#control-flow-redirect).
+   */
+  uint32_t redirect_eip;
 } HookContext;
 #endif
 

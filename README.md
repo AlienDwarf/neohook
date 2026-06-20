@@ -125,7 +125,7 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 | v0.8.0  |    ✅ Done | Delay / on-load hooks (`DelayHook`)                    |
 | v0.8.0  |    ✅ Done | Named hook registry (`registry`)                       |
 | v0.9.0  |    ✅ Done | XMM / MXCSR context capture in `MidHook`               |
-| v0.9.0  |    Planned | Control-flow redirect from a `MidHook` handler         |
+| v0.9.0  |    ✅ Done | Control-flow redirect from a `MidHook` handler         |
 | v0.9.0  |    Planned | ARM64 inline hooking                                   |
 
 --
@@ -405,11 +405,18 @@ fn main() {
 A handler may read any field of `HookContext` to observe a live register, or
 write one to change it before execution continues - including the floating-point
 / SIMD argument registers via `ctx.xmm[..]` (e.g.
-`f64::from_bits(ctx.xmm[0].low)` for a scalar `double`). The detour always
-*continues* the original function - it cannot skip it or redirect control flow.
-General-purpose registers, flags, all XMM registers and `MXCSR` are captured;
-the legacy x87 stack registers are not. `target` must sit on a real instruction
-boundary.
+`f64::from_bits(ctx.xmm[0].low)` for a scalar `double`). General-purpose
+registers, flags, all XMM registers and `MXCSR` are captured; the legacy x87
+stack registers are not. `target` must sit on a real instruction boundary.
+
+By default the detour *continues* the original function. A handler can instead
+**redirect control flow** by setting `ctx.redirect_rip` (`redirect_eip` on x86)
+to a code address: the stub restores the (possibly modified) state and jumps
+there, skipping the stolen instructions. Use it to replace a routine wholesale
+(redirect a hooked entry to a same-ABI drop-in that returns to the caller) or to
+skip the patched region via `hook.resume_address()` (`= target + stolen_len`).
+The redirect is an indirect `jmp`, not a `ret`, so it leaves the CET shadow
+stack intact.
 
 The C ABI exposes `detours_midhook_install(target, handler)` and
 `detours_midhook_unhook(hook)`; the C++ wrapper provides an RAII `neohook::MidHook`.
