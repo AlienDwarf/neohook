@@ -51,6 +51,8 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 
 - **INT3 Software-Breakpoint Hooking** - Redirects a function by patching a single `0xCC` byte and routing the resulting breakpoint through a vectored exception handler. Unlike VEH hooks there is **no four-hook limit** (up to 256 targets), and threads created *after* the install still trap. The single-byte write is atomic, so no thread suspension is needed.
 
+- **Call-the-Original Gateway (VEH / INT3)** - Breakpoint-style hooks normally *replace* the target with no way back to it. `install_with_original` builds a small gateway holding the relocated prologue plus a jump into the body, so the detour can forward to the original (use its return value, conditionally fall through) without re-triggering the breakpoint or recursing.
+
 - **Pattern / Signature Scanning** - Resolve unexported, statically-linked, or stripped functions by a byte signature (IDA / x64dbg `48 8B ?? E8` syntax, or code+mask). Scans only committed, executable regions of a module - safely skipping guard pages and holes - and feeds the match straight into a hook via `attach_pattern`.
 
 - **Hook-by-Export-Name** - `attach_export("user32.dll", "MessageBoxW", detour)` resolves a named export (loading the module if needed) and queues an inline hook on the function body in a single call - no manual `GetModuleHandle` / `GetProcAddress` dance.
@@ -126,7 +128,8 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 | v0.8.0  |    ✅ Done | Named hook registry (`registry`)                       |
 | v0.9.0  |    ✅ Done | XMM / MXCSR context capture in `MidHook`               |
 | v0.9.0  |    ✅ Done | Control-flow redirect from a `MidHook` handler         |
-| v0.9.0  |    Planned | ARM64 inline hooking                                   |
+| v0.10.0 |    ✅ Done | Call-the-original gateway for VEH / INT3 hooks          |
+| v0.10.0 |    Planned | ARM64 inline hooking                                   |
 
 --
 
@@ -462,8 +465,15 @@ VEH hooking has inherent limits worth knowing:
 - **Full replacement** - like `detour_inline!`, the detour replaces the target;
   there is no trampoline to call the original through.
 
+To **call the original** anyway, install with `VehHook::install_with_original`:
+it builds a small gateway holding the relocated prologue, retrievable with
+`hook.original_ptr()`, that runs the original without re-triggering the
+breakpoint. (The plain `install` stays a pure full replacement.)
+
 See [`examples/veh_hook.rs`](examples/veh_hook.rs). The C ABI exposes
-`detours_veh_install(target, detour)` and `detours_veh_unhook(hook)`.
+`detours_veh_install(target, detour)`,
+`detours_veh_install_with_original(target, detour)`, `detours_veh_original(hook)`,
+and `detours_veh_unhook(hook)`.
 
 ---
 
@@ -505,12 +515,17 @@ Trade-offs versus a VEH hook:
 - **No four-hook limit.** Up to `INT3_MAX_HOOKS` (256) targets at once.
 - **Covers future threads.** Arming is not per-thread.
 - **Full replacement.** Like VEH, the detour replaces the target; there is no
-  trampoline to call the original through.
+  trampoline to call the original through - unless you install with
+  `Int3Hook::install_with_original`, which builds a gateway (retrievable via
+  `hook.original_ptr()`) so the detour can forward to the original without
+  re-triggering the breakpoint.
 
 See [`examples/int3_hook.rs`](examples/int3_hook.rs) (which installs six hooks at
 once to show the limit is gone). The C ABI exposes
-`detours_int3_install(target, detour)` and `detours_int3_unhook(hook)`; the C++
-wrapper provides an RAII `neohook::Int3Hook`.
+`detours_int3_install(target, detour)`,
+`detours_int3_install_with_original(target, detour)`, `detours_int3_original(hook)`,
+and `detours_int3_unhook(hook)`; the C++ wrapper provides an RAII
+`neohook::Int3Hook`.
 
 ---
 
@@ -973,6 +988,7 @@ neohook/
 │   ├── eat.rs          - EatHook: EAT parsing and export RVA rewriting (+ near stub)
 │   ├── veh.rs          - VehHook: hardware-breakpoint hooking via a vectored handler
 │   ├── int3.rs         - Int3Hook: INT3 software-breakpoint hooking via a vectored handler
+│   ├── gateway.rs      - Call-original gateway builder for VEH / INT3 hooks
 │   ├── midhook.rs      - MidHook: mid-function detours + register-context bridge
 │   ├── pe.rs           - Shared bounds-checked PE parsing primitives
 │   ├── scan.rs         - Pattern: signature parsing + memory/module scanning

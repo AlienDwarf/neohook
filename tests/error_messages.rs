@@ -111,6 +111,7 @@ fn veh_hook_error_display() {
         VehHookError::NoFreeSlot,
         VehHookError::AlreadyHooked,
         VehHookError::HandlerRegistrationFailed,
+        VehHookError::GatewayBuildFailed,
     ] {
         assert!(!err.to_string().is_empty());
     }
@@ -124,6 +125,7 @@ fn int3_hook_error_display() {
         Int3HookError::AlreadyHooked,
         Int3HookError::HandlerRegistrationFailed,
         Int3HookError::PatchFailed,
+        Int3HookError::GatewayBuildFailed,
     ] {
         assert!(!err.to_string().is_empty());
     }

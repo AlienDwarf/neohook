@@ -564,6 +564,86 @@ fn ffi_int3_install_redirects_and_unhooks() {
     }
 }
 
+// --- VEH / INT3 call-original gateways ---------------------------------------
+
+#[test]
+fn ffi_veh_install_with_original_forwards_and_guards() {
+    use std::sync::OnceLock;
+
+    #[inline(never)]
+    extern "system" fn base() -> u32 {
+        std::hint::black_box(200)
+    }
+    type Fn = extern "system" fn() -> u32;
+    static ORIG: OnceLock<Fn> = OnceLock::new();
+    extern "system" fn det() -> u32 {
+        ORIG.get().unwrap()() + 1
+    }
+    fn call() -> u32 {
+        std::hint::black_box(base as Fn)()
+    }
+
+    assert_eq!(call(), 200);
+    unsafe {
+        let hook = detours_veh_install_with_original(base as *const u8, det as *const u8);
+        assert!(!hook.is_null());
+        let orig = detours_veh_original(hook);
+        assert!(!orig.is_null(), "gateway pointer must be exposed");
+        ORIG.set(std::mem::transmute::<*const u8, Fn>(orig)).ok();
+
+        assert_eq!(
+            call(),
+            201,
+            "detour forwarded to the original via the gateway"
+        );
+        assert_eq!(detours_veh_unhook(hook), 1);
+        assert_eq!(call(), 200, "restored after unhook");
+
+        // Null guards.
+        assert!(detours_veh_original(ptr::null()).is_null());
+        assert!(detours_veh_install_with_original(ptr::null(), det as *const u8).is_null());
+    }
+}
+
+#[test]
+fn ffi_int3_install_with_original_forwards_and_guards() {
+    use std::sync::OnceLock;
+
+    #[inline(never)]
+    extern "system" fn base() -> u32 {
+        std::hint::black_box(300)
+    }
+    type Fn = extern "system" fn() -> u32;
+    static ORIG: OnceLock<Fn> = OnceLock::new();
+    extern "system" fn det() -> u32 {
+        ORIG.get().unwrap()() + 1
+    }
+    fn call() -> u32 {
+        std::hint::black_box(base as Fn)()
+    }
+
+    assert_eq!(call(), 300);
+    unsafe {
+        let hook = detours_int3_install_with_original(base as *const u8, det as *const u8);
+        assert!(!hook.is_null());
+        let orig = detours_int3_original(hook);
+        assert!(!orig.is_null(), "gateway pointer must be exposed");
+        ORIG.set(std::mem::transmute::<*const u8, Fn>(orig)).ok();
+
+        assert_eq!(
+            call(),
+            301,
+            "detour forwarded to the original via the gateway"
+        );
+        assert_eq!(detours_int3_unhook(hook), 1);
+        assert_eq!(call(), 300, "restored after unhook");
+
+        // Null guards.
+        assert!(detours_int3_original(ptr::null()).is_null());
+        assert!(detours_int3_install_with_original(ptr::null(), det as *const u8).is_null());
+    }
+}
+
 // --- mid-function ------------------------------------------------------------
 
 #[test]

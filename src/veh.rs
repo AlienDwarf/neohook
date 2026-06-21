@@ -32,6 +32,8 @@ use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::Diagnostics::Debug::*;
 use windows_sys::Win32::System::Threading::*;
 
+use crate::alloc::Trampoline;
+use crate::gateway::build_original_gateway;
 use crate::threads::ThreadEnumerator;
 
 /// Number of hardware breakpoint registers (`DR0`-`DR3`).
@@ -89,6 +91,10 @@ pub enum VehHookError {
     AlreadyHooked,
     /// `AddVectoredExceptionHandler` failed.
     HandlerRegistrationFailed,
+    /// The call-original gateway could not be built (the prologue was not
+    /// relocatable, or no executable memory was free within jump range). Only
+    /// returned by [`VehHook::install_with_original`].
+    GatewayBuildFailed,
 }
 
 impl fmt::Display for VehHookError {
@@ -99,6 +105,12 @@ impl fmt::Display for VehHookError {
             Self::AlreadyHooked => write!(f, "target address is already VEH-hooked"),
             Self::HandlerRegistrationFailed => {
                 write!(f, "failed to register the vectored exception handler")
+            }
+            Self::GatewayBuildFailed => {
+                write!(
+                    f,
+                    "failed to build the call-original gateway for the target"
+                )
             }
         }
     }
@@ -117,6 +129,9 @@ pub struct VehHook {
     detour: *const u8,
     slot: usize,
     active: bool,
+    /// Callable gateway to the original function, present only when the hook was
+    /// installed via [`Self::install_with_original`]. Freed on drop/unhook.
+    gateway: Option<Trampoline>,
 }
 
 // The hook owns no thread-local state; the breakpoint lives in per-thread debug
@@ -147,9 +162,53 @@ impl VehHook {
     ///   with `target`, since it is entered with the target's original register
     ///   and stack state.
     pub unsafe fn install(target: *const u8, detour: *const u8) -> Result<Self, VehHookError> {
+        unsafe { Self::install_inner(target, detour, false) }
+    }
+
+    /// Installs a VEH hook that also exposes a callable gateway to the original
+    /// function via [`Self::original_ptr`].
+    ///
+    /// Identical to [`Self::install`], but it also builds a small trampoline
+    /// holding the relocated prologue so the detour can forward to the original
+    /// without re-entering the armed address. Use this when the detour needs the
+    /// original's behaviour or return value; prefer [`Self::install`] for a pure
+    /// full replacement. The target's bytes are still never modified.
+    ///
+    /// # Errors
+    ///
+    /// In addition to the errors documented on [`Self::install`], returns
+    /// [`VehHookError::GatewayBuildFailed`] if the prologue cannot be relocated
+    /// or no executable memory is free within jump range of `target`.
+    ///
+    /// # Safety
+    ///
+    /// Same requirements as [`Self::install`].
+    pub unsafe fn install_with_original(
+        target: *const u8,
+        detour: *const u8,
+    ) -> Result<Self, VehHookError> {
+        unsafe { Self::install_inner(target, detour, true) }
+    }
+
+    unsafe fn install_inner(
+        target: *const u8,
+        detour: *const u8,
+        want_gateway: bool,
+    ) -> Result<Self, VehHookError> {
         if target.is_null() || detour.is_null() {
             return Err(VehHookError::InvalidParameter);
         }
+
+        // The target's bytes are never patched, so the gateway can be built at
+        // any point; do it up front so a failure leaves nothing to roll back.
+        let gateway = if want_gateway {
+            Some(
+                unsafe { build_original_gateway(target) }
+                    .ok_or(VehHookError::GatewayBuildFailed)?,
+            )
+        } else {
+            None
+        };
 
         let target_addr = target as usize;
         let detour_addr = detour as usize;
@@ -194,6 +253,7 @@ impl VehHook {
             detour,
             slot,
             active: true,
+            gateway,
         })
     }
 
@@ -205,6 +265,17 @@ impl VehHook {
     /// Returns the detour the target is redirected to.
     pub fn detour(&self) -> *const u8 {
         self.detour
+    }
+
+    /// Returns a callable pointer to the original function, or `None` if the
+    /// hook was installed with [`Self::install`] (full replacement) rather than
+    /// [`Self::install_with_original`].
+    ///
+    /// Transmute the pointer to the target's function type and call it to run
+    /// the original; because it resumes past the armed address it neither
+    /// re-enters the detour nor re-triggers the breakpoint.
+    pub fn original_ptr(&self) -> Option<*const u8> {
+        self.gateway.as_ref().map(|t| t.ptr as *const u8)
     }
 
     /// Removes the hook: clears the breakpoint on every thread and frees its
@@ -417,6 +488,57 @@ mod tests {
             unsafe { VehHook::install(target, detour) },
             Err(VehHookError::AlreadyHooked)
         ));
+        hook.unhook().unwrap();
+    }
+
+    #[test]
+    fn original_gateway_forwards_to_real_function() {
+        use std::sync::OnceLock;
+
+        #[inline(never)]
+        extern "system" fn base(x: u32) -> u32 {
+            std::hint::black_box(x).wrapping_mul(3)
+        }
+
+        type Fn = extern "system" fn(u32) -> u32;
+        static ORIG: OnceLock<Fn> = OnceLock::new();
+
+        extern "system" fn detour_calls_orig(x: u32) -> u32 {
+            ORIG.get().unwrap()(x) + 1
+        }
+
+        let target: Fn = base;
+        let t = base as *const () as *const u8;
+        let d = detour_calls_orig as *const () as *const u8;
+
+        assert_eq!(target(4), 12, "sanity before hook");
+
+        let hook = unsafe { VehHook::install_with_original(t, d) }.expect("install_with_original");
+        let orig_ptr = hook.original_ptr().expect("gateway pointer present");
+        ORIG.set(unsafe { std::mem::transmute::<*const u8, Fn>(orig_ptr) })
+            .ok();
+
+        // Detour ran (+1) and forwarded to the original (4 -> 12) through the
+        // gateway, without re-triggering the hardware breakpoint.
+        assert_eq!(
+            target(4),
+            13,
+            "detour forwarded to the original via the gateway"
+        );
+
+        hook.unhook().unwrap();
+        assert_eq!(target(4), 12, "original behaviour after unhook");
+    }
+
+    #[test]
+    fn install_without_gateway_has_no_original_ptr() {
+        let t = slot_target_a as *const () as *const u8;
+        let d = slot_detour as *const () as *const u8;
+        let hook = unsafe { VehHook::install(t, d) }.expect("install");
+        assert!(
+            hook.original_ptr().is_none(),
+            "plain install must not expose a gateway"
+        );
         hook.unhook().unwrap();
     }
 

@@ -17,6 +17,7 @@ mod code;
 mod delay;
 mod disasm;
 mod eat;
+mod gateway;
 mod iat;
 mod int3;
 mod introspect;

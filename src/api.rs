@@ -1339,6 +1339,44 @@ pub unsafe extern "C" fn detours_veh_install(
     }
 }
 
+/// Installs a VEH hook that also exposes a callable gateway to the original
+/// function, retrievable with `detours_veh_original`.
+///
+/// Behaves like `detours_veh_install`, but lets the detour forward to the
+/// original (e.g. to use its return value) without re-triggering the
+/// breakpoint. Returns null on failure, including when the original gateway
+/// could not be built. The returned pointer must be released with
+/// `detours_veh_unhook`.
+///
+/// # Safety
+/// `target` must point at the entry of a real function in executable memory and
+/// `detour` must be a function pointer with a compatible ABI/signature.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_veh_install_with_original(
+    target: *const u8,
+    detour: *const u8,
+) -> *mut crate::veh::VehHook {
+    match unsafe { crate::veh::VehHook::install_with_original(target, detour) } {
+        Ok(hook) => Box::into_raw(Box::new(hook)),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Returns the callable original-function pointer for a VEH hook installed with
+/// `detours_veh_install_with_original`, or null if `hook` is null or was
+/// installed without a gateway.
+///
+/// # Safety
+/// `hook` must be a valid pointer previously returned by `detours_veh_install*`
+/// and still live (not yet unhooked).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_veh_original(hook: *const crate::veh::VehHook) -> *const u8 {
+    if hook.is_null() {
+        return std::ptr::null();
+    }
+    unsafe { &*hook }.original_ptr().unwrap_or(std::ptr::null())
+}
+
 /// Removes a VEH hook installed by `detours_veh_install` and frees it.
 ///
 /// Returns `1` if the hook was accepted for removal, or `0` if `hook` is null.
@@ -1433,6 +1471,44 @@ pub unsafe extern "C" fn detours_int3_install(
         Ok(hook) => Box::into_raw(Box::new(hook)),
         Err(_) => std::ptr::null_mut(),
     }
+}
+
+/// Installs an INT3 hook that also exposes a callable gateway to the original
+/// function, retrievable with `detours_int3_original`.
+///
+/// Behaves like `detours_int3_install`, but lets the detour forward to the
+/// original (e.g. to use its return value) without re-triggering the
+/// breakpoint. Returns null on failure, including when the original gateway
+/// could not be built. The returned pointer must be released with
+/// `detours_int3_unhook`.
+///
+/// # Safety
+/// `target` must point at the entry of a real function in executable memory and
+/// `detour` must be a function pointer with a compatible ABI/signature.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_int3_install_with_original(
+    target: *const u8,
+    detour: *const u8,
+) -> *mut crate::int3::Int3Hook {
+    match unsafe { crate::int3::Int3Hook::install_with_original(target, detour) } {
+        Ok(hook) => Box::into_raw(Box::new(hook)),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Returns the callable original-function pointer for an INT3 hook installed
+/// with `detours_int3_install_with_original`, or null if `hook` is null or was
+/// installed without a gateway.
+///
+/// # Safety
+/// `hook` must be a valid pointer previously returned by `detours_int3_install*`
+/// and still live (not yet unhooked).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_int3_original(hook: *const crate::int3::Int3Hook) -> *const u8 {
+    if hook.is_null() {
+        return std::ptr::null();
+    }
+    unsafe { &*hook }.original_ptr().unwrap_or(std::ptr::null())
 }
 
 /// Removes an INT3 hook installed by `detours_int3_install` and frees it,

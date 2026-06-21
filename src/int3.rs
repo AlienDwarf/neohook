@@ -39,6 +39,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use windows_sys::Win32::System::Diagnostics::Debug::*;
 
+use crate::alloc::Trampoline;
+use crate::gateway::build_original_gateway;
 use crate::mem::write_memory_atomic;
 
 /// Maximum number of simultaneously installed INT3 hooks.
@@ -93,6 +95,10 @@ pub enum Int3HookError {
     /// Writing the `0xCC` byte into the target failed (e.g. the page rejected
     /// the protection change).
     PatchFailed,
+    /// The call-original gateway could not be built (the prologue was not
+    /// relocatable, or no executable memory was free within jump range). Only
+    /// returned by [`Int3Hook::install_with_original`].
+    GatewayBuildFailed,
 }
 
 impl fmt::Display for Int3HookError {
@@ -105,6 +111,12 @@ impl fmt::Display for Int3HookError {
                 write!(f, "failed to register the vectored exception handler")
             }
             Self::PatchFailed => write!(f, "failed to write the INT3 byte into the target"),
+            Self::GatewayBuildFailed => {
+                write!(
+                    f,
+                    "failed to build the call-original gateway for the target"
+                )
+            }
         }
     }
 }
@@ -124,6 +136,9 @@ pub struct Int3Hook {
     original_byte: u8,
     slot: usize,
     active: bool,
+    /// Callable gateway to the original function, present only when the hook was
+    /// installed via [`Self::install_with_original`]. Freed on drop/unhook.
+    gateway: Option<Trampoline>,
 }
 
 // The hook owns no thread-local state; the breakpoint lives in the patched byte
@@ -155,9 +170,53 @@ impl Int3Hook {
     ///   with `target`, since it is entered with the target's original register
     ///   and stack state.
     pub unsafe fn install(target: *const u8, detour: *const u8) -> Result<Self, Int3HookError> {
+        unsafe { Self::install_inner(target, detour, false) }
+    }
+
+    /// Installs an INT3 hook that also exposes a callable gateway to the
+    /// original function via [`Self::original_ptr`].
+    ///
+    /// Identical to [`Self::install`], but before patching the `0xCC` byte it
+    /// builds a small trampoline holding the relocated prologue, so the detour
+    /// can forward to the original without re-triggering the breakpoint. Use
+    /// this when the detour needs the original's behaviour or return value;
+    /// prefer [`Self::install`] for a pure full replacement.
+    ///
+    /// # Errors
+    ///
+    /// In addition to the errors documented on [`Self::install`], returns
+    /// [`Int3HookError::GatewayBuildFailed`] if the prologue cannot be relocated
+    /// or no executable memory is free within jump range of `target`.
+    ///
+    /// # Safety
+    ///
+    /// Same requirements as [`Self::install`].
+    pub unsafe fn install_with_original(
+        target: *const u8,
+        detour: *const u8,
+    ) -> Result<Self, Int3HookError> {
+        unsafe { Self::install_inner(target, detour, true) }
+    }
+
+    unsafe fn install_inner(
+        target: *const u8,
+        detour: *const u8,
+        want_gateway: bool,
+    ) -> Result<Self, Int3HookError> {
         if target.is_null() || detour.is_null() {
             return Err(Int3HookError::InvalidParameter);
         }
+
+        // Build the gateway from the still-original bytes, before the `0xCC`
+        // patch overwrites the first byte. On failure nothing has been changed.
+        let gateway = if want_gateway {
+            Some(
+                unsafe { build_original_gateway(target) }
+                    .ok_or(Int3HookError::GatewayBuildFailed)?,
+            )
+        } else {
+            None
+        };
 
         let target_addr = target as usize;
         let detour_addr = detour as usize;
@@ -217,6 +276,7 @@ impl Int3Hook {
             original_byte,
             slot,
             active: true,
+            gateway,
         })
     }
 
@@ -228,6 +288,17 @@ impl Int3Hook {
     /// Returns the detour the target is redirected to.
     pub fn detour(&self) -> *const u8 {
         self.detour
+    }
+
+    /// Returns a callable pointer to the original function, or `None` if the
+    /// hook was installed with [`Self::install`] (full replacement) rather than
+    /// [`Self::install_with_original`].
+    ///
+    /// Transmute the pointer to the target's function type and call it to run
+    /// the original; this neither re-enters the detour nor re-triggers the
+    /// breakpoint.
+    pub fn original_ptr(&self) -> Option<*const u8> {
+        self.gateway.as_ref().map(|t| t.ptr as *const u8)
     }
 
     /// Removes the hook: restores the original byte and frees its slot, removing
@@ -389,6 +460,58 @@ mod tests {
 
         hook.unhook().unwrap();
         assert_eq!(target(), 1, "original byte should be restored after unhook");
+    }
+
+    #[test]
+    fn original_gateway_forwards_to_real_function() {
+        use std::sync::OnceLock;
+
+        // A distinct target so it does not collide with the other tests' slots.
+        #[inline(never)]
+        extern "system" fn base(x: u32) -> u32 {
+            std::hint::black_box(x).wrapping_add(1)
+        }
+
+        type Fn = extern "system" fn(u32) -> u32;
+        static ORIG: OnceLock<Fn> = OnceLock::new();
+
+        extern "system" fn detour_calls_orig(x: u32) -> u32 {
+            // Forward to the original through the gateway, then add a marker.
+            ORIG.get().unwrap()(x) + 1000
+        }
+
+        let target: Fn = base;
+        let t = base as *const () as *const u8;
+        let d = detour_calls_orig as *const () as *const u8;
+
+        assert_eq!(target(5), 6, "sanity before hook");
+
+        let hook = unsafe { Int3Hook::install_with_original(t, d) }.expect("install_with_original");
+        let orig_ptr = hook.original_ptr().expect("gateway pointer present");
+        ORIG.set(unsafe { std::mem::transmute::<*const u8, Fn>(orig_ptr) })
+            .ok();
+
+        // Detour ran (added 1000) *and* called through to the original (5 -> 6).
+        assert_eq!(
+            target(5),
+            1006,
+            "detour forwarded to the original via the gateway"
+        );
+
+        hook.unhook().unwrap();
+        assert_eq!(target(5), 6, "original restored after unhook");
+    }
+
+    #[test]
+    fn install_without_gateway_has_no_original_ptr() {
+        let t = t_a as *const () as *const u8;
+        let d = detour as *const () as *const u8;
+        let hook = unsafe { Int3Hook::install(t, d) }.expect("install");
+        assert!(
+            hook.original_ptr().is_none(),
+            "plain install must not expose a gateway"
+        );
+        hook.unhook().unwrap();
     }
 
     #[test]
