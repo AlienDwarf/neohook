@@ -468,7 +468,9 @@ fn sweep(shared: &Shared) {
                 found: &hit.found,
                 restored: hit.restored,
             };
-            callback(&event);
+            // Contain a panicking callback so it cannot unwind out of and kill
+            // the watchdog thread (which would silently stop all guarding).
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(&event)));
         }
     }
 }
@@ -650,5 +652,33 @@ mod tests {
     fn guard_id_round_trips_through_raw() {
         let id = GuardId::from_raw(42);
         assert_eq!(id.raw(), 42);
+    }
+
+    #[test]
+    fn panicking_callback_does_not_kill_the_watchdog() {
+        let page = Page::new();
+        let patched = [0xE9u8, 0x01, 0x02, 0x03, 0x04];
+        page.write(&patched);
+
+        let wd = Watchdog::with_interval(Duration::from_millis(10));
+        wd.on_tamper(|_e| panic!("intentional panic in tamper callback"));
+        let _id = unsafe { wd.guard(page.0, patched.len()) }.expect("guard");
+
+        // Silence the contained-panic message printed on the watchdog thread.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        // Tamper: the callback will panic, but the watchdog must survive and keep
+        // restoring on this and subsequent sweeps.
+        page.write(&[0x90, 0x90, 0x90, 0x90, 0x90]);
+        let restored = wait_until(Duration::from_secs(5), || page.read(5) == patched);
+
+        std::panic::set_hook(prev);
+
+        assert!(
+            restored,
+            "watchdog must keep restoring despite a panicking callback"
+        );
+        assert!(wd.restorations() >= 1);
     }
 }

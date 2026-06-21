@@ -75,8 +75,15 @@ pub fn clear_sink() {
 }
 
 /// The default sink: writes a single line per call to standard error.
+///
+/// Uses a fallible write rather than `eprintln!` (which panics if stderr cannot
+/// be written): a tracing detour must never abort the host process over a failed
+/// log write.
 fn default_sink(record: &TraceRecord) {
-    eprintln!(
+    use std::io::Write;
+    let mut err = std::io::stderr().lock();
+    let _ = writeln!(
+        err,
         "[neohook::trace] (tid {}) {}({}) -> {}",
         record.thread_id, record.function, record.args, record.ret
     );
@@ -86,16 +93,24 @@ fn default_sink(record: &TraceRecord) {
 ///
 /// Called by the detour [`crate::detour_trace!`] generates; you normally do not
 /// call this directly.
+///
+/// The sink runs inside a [`std::panic::catch_unwind`] guard: a tracing detour is
+/// reached from a target's call site (and `trace_raw!` from a vectored
+/// exception-handler context), so a panicking sink that unwound across that
+/// boundary would abort the host process. A panic is contained and the call
+/// continues.
 pub fn emit(record: &TraceRecord) {
     let raw = SINK.load(Ordering::Acquire);
-    if raw == 0 {
-        default_sink(record);
-    } else {
-        // SAFETY: `raw` was produced by `set_sink` from a valid `TraceSink`
-        // function pointer and is only ever cleared to `0` (handled above).
-        let sink: TraceSink = unsafe { std::mem::transmute::<usize, TraceSink>(raw) };
-        sink(record);
-    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if raw == 0 {
+            default_sink(record);
+        } else {
+            // SAFETY: `raw` was produced by `set_sink` from a valid `TraceSink`
+            // function pointer and is only ever cleared to `0` (handled above).
+            let sink: TraceSink = unsafe { std::mem::transmute::<usize, TraceSink>(raw) };
+            sink(record);
+        }
+    }));
 }
 
 /// Builds a [`TraceRecord`] from the pieces a tracing detour has on hand
@@ -200,5 +215,23 @@ mod tests {
         // the default writer rather than dereferencing a null sink.
         clear_sink();
         record("lonely", "1", "1");
+    }
+
+    fn panicking_sink(_record: &TraceRecord) {
+        panic!("intentional panic in trace sink");
+    }
+
+    #[test]
+    fn emit_contains_a_panicking_sink() {
+        // A tracing detour runs at a target's call site (trace_raw! even inside a
+        // vectored exception handler); a panicking sink must be contained, never
+        // unwound across that boundary. If emit did not catch it, this test would
+        // itself panic and fail.
+        set_sink(panicking_sink);
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // silence the contained panic message
+        record("boom", "1", "2"); // must return normally
+        std::panic::set_hook(prev);
+        clear_sink();
     }
 }
