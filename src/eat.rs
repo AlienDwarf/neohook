@@ -280,7 +280,11 @@ unsafe fn resolve_detour_rva(
     #[cfg(target_arch = "x86")]
     {
         // 32-bit address space: wrapping subtraction always round-trips through
-        // base + rva, so the detour is directly reachable.
+        // base + rva, so the detour is directly reachable. Consumers resolve the
+        // export and call it indirectly; mark the detour as a valid CFG call
+        // target so the redirect holds under strict CFG / export suppression
+        // (no-op otherwise, see crate::cfg).
+        crate::cfg::register_valid_target(detour);
         let rva = (detour as u32).wrapping_sub(base as u32);
         Ok((rva, None))
     }
@@ -289,7 +293,12 @@ unsafe fn resolve_detour_rva(
     {
         let diff = (detour as usize).wrapping_sub(base);
         // Directly encodable when the detour sits above the base within 4 GB.
+        // The slot then points straight at the detour, which consumers call
+        // indirectly; mark it as a valid CFG call target (no-op unless strict
+        // CFG / export suppression is in effect). The out-of-range stub path
+        // below is covered by the stub's own `make_rx`.
         if detour as usize >= base && diff <= u32::MAX as usize {
+            crate::cfg::register_valid_target(detour);
             return Ok((diff as u32, None));
         }
 

@@ -154,11 +154,24 @@ impl Trampoline {
     }
 
     /// Change protection to RX (PAGE_EXECUTE_READ). Returns true on success.
+    ///
+    /// On success the stub's entry (its page-aligned base) is registered as a
+    /// valid Control Flow Guard call target, so code reached through this stub's
+    /// address - most importantly the trampoline/gateway handed back as the
+    /// original function - survives a guarded indirect call under strict CFG,
+    /// where private executable memory is no longer exempt. Default CFG already
+    /// permits such memory, and the call is a no-op when CFG is not enforced
+    /// (see [`crate::cfg`]).
     pub fn make_rx(&self) -> bool {
         unsafe {
             let mut old = 0u32;
             let res = VirtualProtect(self.ptr as _, self.size, PAGE_EXECUTE_READ, &mut old);
-            res != 0
+            if res != 0 {
+                crate::cfg::register_valid_target(self.ptr as *const u8);
+                true
+            } else {
+                false
+            }
         }
     }
 }

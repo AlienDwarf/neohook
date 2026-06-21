@@ -218,6 +218,39 @@ namespace neohook
             static_cast<uintptr_t>(instr_len)));
     }
 
+    // ----------------- Control Flow Guard (CFG) awareness -----------------
+
+    namespace cfg
+    {
+        /**
+         * @brief Returns whether NeoHook will register CFG call targets for this
+         *        process (its CFG mitigation policy, or an override).
+         */
+        inline bool is_enforced()
+        {
+            return detours_cfg_is_enforced() != 0;
+        }
+
+        /**
+         * @brief Overrides CFG handling. Pass -1 for auto-detection, 0 to force
+         *        it off (no-op), or 1 to force it on.
+         */
+        inline void set_enforcement(int mode)
+        {
+            detours_cfg_set_enforcement(mode);
+        }
+
+        /**
+         * @brief Marks @p entry as a valid CFG indirect-call target so
+         *        runtime-generated code is callable through a guarded call.
+         *        Returns true if it was registered.
+         */
+        inline bool register_valid_target(const void *entry)
+        {
+            return detours_cfg_register_valid_target(static_cast<const uint8_t *>(entry)) != 0;
+        }
+    } // namespace cfg
+
     /**
      * @brief Manages the lifetime of installed hooks.
      *

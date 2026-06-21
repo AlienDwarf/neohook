@@ -130,6 +130,12 @@ impl IatHook {
             return Err(map_err(InternalIatHookError::NullDetour));
         }
 
+        // The import slot is reached through a CFG-guarded indirect call. Mark
+        // the detour as a valid call target so the redirect holds under strict
+        // CFG / export suppression. No-op in the common case and when the process
+        // does not enforce CFG (see crate::cfg).
+        crate::cfg::register_valid_target(detour_function);
+
         // Parse the PE headers and find the target import thunk
         let image = unsafe { parse_loaded_module(h_module)? };
         let thunk = unsafe { find_import_thunk(&image, target_dll, target_func)? };

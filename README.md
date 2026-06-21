@@ -57,6 +57,8 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 
 - **Anti-Tamper / Re-Hook Watchdog** - A background `Watchdog` snapshots a hook's patched bytes and, on tamper, either **re-applies** them (`WatchMode::Restore`) or just **reports** the event (`WatchMode::DetectOnly`) via an `on_tamper` callback - defeating or surfacing periodic integrity checks (anti-cheat, DRM) that restore the original prologue to tear a hook out. Works at the byte level, so it guards inline jumps, the INT3 `0xCC`, or any patch.
 
+- **Control Flow Guard (CFG) Awareness** - On a process that enforces CFG, neohook registers the entry points it generates (inline trampolines, VEH/INT3 gateways, EAT jump stubs) and the IAT/EAT/VTable detours as valid indirect-call targets via `SetProcessValidCallTargets` - the same mechanism Microsoft Detours uses. Auto-detected and a no-op when CFG is off, so it is safe to leave on; it keeps hooks holding up under **strict CFG** and **export suppression**, where the default permit for private executable memory no longer applies. `cfg::register_valid_target` is public for your own runtime-generated code.
+
 - **Tracing Detours** - Two generators, no hand-written boilerplate: `detour_trace!` takes a signature and `Debug`-formats every call's arguments **and return value**; `trace_raw!` needs **no signature** and dumps the integer argument registers at entry via the `MidHook`/`HookContext` bridge. Both emit to a process-wide sink (stderr by default, or your own logger).
 
 - **Pattern / Signature Scanning** - Resolve unexported, statically-linked, or stripped functions by a byte signature (IDA / x64dbg `48 8B ?? E8` syntax, or code+mask). Scans only committed, executable regions of a module - safely skipping guard pages and holes - and feeds the match straight into a hook via `attach_pattern`.
@@ -92,8 +94,6 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 - **Zero-Boilerplate Macros** - `detour_inline!` and `detour_helper!` install a complete hook with a single expression.
 
 - **C FFI** - Exposes a C ABI with auto-generated headers (`cbindgen`), usable from C, C++, Python (`ctypes`), or any FFI-capable language.
-
----
 
 ---
 
@@ -138,7 +138,8 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 | v0.10.0 |    ✅ Done | Symbol-based resolution via `dbghelp` (`resolve_symbol`)|
 | v0.10.0 |    ✅ Done | Anti-tamper / re-hook watchdog (`Watchdog`)            |
 | v0.10.0 |    ✅ Done | Tracing / logging detour generator (`detour_trace!`)   |
-| v0.10.0 |    Planned | ARM64 inline hooking                                   |
+| v0.10.0 |    ✅ Done | Control Flow Guard (CFG) awareness (`cfg`)             |
+| v0.11.0 |    Planned | ARM64 inline hooking                                   |
 
 --
 
@@ -1004,6 +1005,55 @@ as a snapshot instead (use `detour_trace!` for typed x86 arguments).
 Like the [named registry](#named-hook-registry), tracing is a Rust-side ergonomic
 layer (no C ABI), because formatting arbitrary argument types is a Rust-language
 feature. See [`examples/trace_detour.rs`](examples/trace_detour.rs).
+
+---
+
+### Control Flow Guard (CFG) Awareness
+
+[Control Flow Guard](https://learn.microsoft.com/en-us/windows/win32/secbp/control-flow-guard)
+validates every **indirect** call (through a function pointer, a vtable slot, or
+an import thunk) against a per-process bitmap of legal targets. A rejected target
+ends the process with a non-catchable `RtlFailFast`.
+
+Most hooking survives default CFG untouched, because the default configuration is
+permissive in two ways that happen to cover the common cases: private executable
+memory (where trampolines live) is allowed, and modules without a Guard CF table
+are allowed wholesale. The stricter configurations a hardened or anti-tamper
+target may turn on are where registration becomes load-bearing:
+
+- **Strict mode** removes the private-memory exemption - trampolines, gateways,
+  and export stubs must be registered.
+- **Export suppression** drops exports from the valid set unless re-validated.
+- A detour that points *inside* a CFG image at a non-entry address is rejected in
+  any mode.
+
+neohook registers its generated entry points and its IAT/EAT/VTable detours
+through `SetProcessValidCallTargets` automatically. The layer auto-detects the
+process's CFG mitigation policy and does nothing when CFG is not enforced, so it
+costs nothing in the common case and hardens the strict ones.
+
+```rust
+use neohook::cfg;
+
+// Usually nothing to do - registration is automatic inside the hook engines.
+// Query or override the behaviour if you need to:
+if cfg::is_enforced() {
+    // Mark your own runtime-generated (e.g. JIT-emitted) code as callable
+    // through a guarded indirect call.
+    cfg::register_valid_target(my_generated_code_ptr);
+}
+
+// Force the handling on/off (e.g. for deterministic tests); None = auto-detect.
+cfg::set_enforcement(None);
+```
+
+`GetProcessMitigationPolicy` / `SetProcessValidCallTargets` are resolved from
+kernel32 at runtime, so neohook adds no static import on these APIs and still
+loads on systems that predate them.
+
+The C ABI exposes `detours_cfg_is_enforced`, `detours_cfg_set_enforcement`, and
+`detours_cfg_register_valid_target`; the C++ wrapper mirrors them under
+`neohook::cfg`.
 
 ---
 

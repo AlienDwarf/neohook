@@ -294,3 +294,27 @@ fn ffi_vtable_instance_attach_happy_path_and_restore() {
         assert_eq!(restored(), 1);
     }
 }
+
+#[test]
+fn cfg_ffi_enforcement_override_and_register() {
+    unsafe {
+        // mode 0 forces handling off -> is_enforced reports 0 and registration is
+        // skipped (returns 0); mode 1 forces it on.
+        detours_cfg_set_enforcement(0);
+        assert_eq!(detours_cfg_is_enforced(), 0);
+        assert_eq!(
+            detours_cfg_register_valid_target(target_func as *const u8),
+            0,
+            "registration must be skipped while forced off"
+        );
+
+        detours_cfg_set_enforcement(1);
+        assert_eq!(detours_cfg_is_enforced(), 1);
+
+        // Null entry is rejected regardless of enforcement.
+        assert_eq!(detours_cfg_register_valid_target(ptr::null()), 0);
+
+        // Restore auto-detection (mode < 0) for any later test in this binary.
+        detours_cfg_set_enforcement(-1);
+    }
+}

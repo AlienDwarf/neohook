@@ -1836,6 +1836,45 @@ pub unsafe extern "C" fn detours_watchdog_destroy(wd: *mut crate::watchdog::Watc
     1
 }
 
+// ---------------------------------------------------------------------------
+// Control Flow Guard (CFG) awareness
+// ---------------------------------------------------------------------------
+
+/// Returns `1` if NeoHook will register Control Flow Guard call targets for this
+/// process, `0` otherwise.
+///
+/// Reflects a `detours_cfg_set_enforcement` override if one is set, otherwise the
+/// process's CFG mitigation policy. See [`crate::cfg`].
+#[unsafe(no_mangle)]
+pub extern "C" fn detours_cfg_is_enforced() -> i32 {
+    crate::cfg::is_enforced() as i32
+}
+
+/// Overrides CFG handling: `mode < 0` returns to auto-detection, `mode == 0`
+/// forces it off (the whole layer becomes a no-op), `mode > 0` forces it on.
+#[unsafe(no_mangle)]
+pub extern "C" fn detours_cfg_set_enforcement(mode: i32) {
+    let state = match mode {
+        m if m < 0 => None,
+        0 => Some(false),
+        _ => Some(true),
+    };
+    crate::cfg::set_enforcement(state);
+}
+
+/// Marks `entry` as a valid Control Flow Guard indirect-call target, so
+/// runtime-generated code can be reached through a guarded indirect call.
+///
+/// Returns `1` if the target was registered, `0` if registration was skipped
+/// (CFG not enforced) or `entry` is null. See [`crate::cfg::register_valid_target`].
+///
+/// # Safety
+/// `entry` must point at the entry of executable, committed memory.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_cfg_register_valid_target(entry: *const u8) -> i32 {
+    crate::cfg::register_valid_target(entry) as i32
+}
+
 #[cfg(test)]
 mod attach_export_tests {
     use super::*;

@@ -53,3 +53,30 @@ jobs:
 
       - name: Build docs
         run: cargo doc --no-deps --target ${{ matrix.target }}
+
+  cfg-guard:
+    name: Control Flow Guard build
+    runs-on: windows-latest
+    env:
+      # Build the whole graph with Control Flow Guard so the process enforces CFG
+      # and every indirect call is instrumented. Confirms CFG-aware hooking keeps
+      # hooks correct while registering call targets via SetProcessValidCallTargets.
+      RUSTFLAGS: "-C control-flow-guard=yes"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSVC developer command prompt
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: cfg-guard
+
+      - name: Test with Control Flow Guard enabled
+        run: cargo test --target x86_64-pc-windows-msvc -- --test-threads=1

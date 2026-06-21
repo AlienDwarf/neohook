@@ -55,6 +55,8 @@ typedef struct Int3Hook Int3Hook;
  */
 typedef struct MidHook MidHook;
 
+typedef struct Option_DetoursTamperCallback Option_DetoursTamperCallback;
+
 /**
  * An installed VEH (hardware-breakpoint) hook.
  *
@@ -63,6 +65,16 @@ typedef struct MidHook MidHook;
  * vectored handler is removed once the last hook is gone.
  */
 typedef struct VehHook VehHook;
+
+/**
+ * A background guard that reacts to tampered byte patches.
+ *
+ * Created with [`Self::with_interval`], it spawns a thread that wakes every
+ * `interval`, compares each guarded region against its snapshot, and - per the
+ * active [`WatchMode`] - rewrites or merely reports any that differ. The thread
+ * is stopped and joined when the `Watchdog` is dropped.
+ */
+typedef struct Watchdog Watchdog;
 
 /**
  * A 128-bit XMM register, captured for a [`MidHook`] handler.
@@ -668,6 +680,19 @@ void detours_imports_free(void *handle);
 const uint8_t *detours_find_function(const char *module, const char *func);
 
 /**
+ * Resolves `symbol` within `module` to its absolute address using `dbghelp`,
+ * covering PDB symbols (when symbols are available) as well as exports - so
+ * non-exported functions can be located by name.
+ *
+ * Returns null if either argument is null or not valid UTF-8, `dbghelp` cannot
+ * initialize, the module cannot be found, or the symbol is unknown.
+ *
+ * # Safety
+ * `module` and `symbol` must be valid NUL-terminated C strings.
+ */
+const uint8_t *detours_resolve_symbol(const char *module, const char *symbol);
+
+/**
  * Resolves an exported function by ordinal within a module, loading the module
  * if it is not already present.
  *
@@ -775,6 +800,33 @@ uint8_t *detours_transaction_attach_export(DetourTransaction *tx,
 struct VehHook *detours_veh_install(const uint8_t *target, const uint8_t *detour);
 
 /**
+ * Installs a VEH hook that also exposes a callable gateway to the original
+ * function, retrievable with `detours_veh_original`.
+ *
+ * Behaves like `detours_veh_install`, but lets the detour forward to the
+ * original (e.g. to use its return value) without re-triggering the
+ * breakpoint. Returns null on failure, including when the original gateway
+ * could not be built. The returned pointer must be released with
+ * `detours_veh_unhook`.
+ *
+ * # Safety
+ * `target` must point at the entry of a real function in executable memory and
+ * `detour` must be a function pointer with a compatible ABI/signature.
+ */
+struct VehHook *detours_veh_install_with_original(const uint8_t *target, const uint8_t *detour);
+
+/**
+ * Returns the callable original-function pointer for a VEH hook installed with
+ * `detours_veh_install_with_original`, or null if `hook` is null or was
+ * installed without a gateway.
+ *
+ * # Safety
+ * `hook` must be a valid pointer previously returned by `detours_veh_install*`
+ * and still live (not yet unhooked).
+ */
+const uint8_t *detours_veh_original(const struct VehHook *hook);
+
+/**
  * Removes a VEH hook installed by `detours_veh_install` and frees it.
  *
  * Returns `1` if the hook was accepted for removal, or `0` if `hook` is null.
@@ -834,6 +886,33 @@ int32_t detours_midhook_unhook(struct MidHook *hook);
  * `detour` must be a function pointer with a compatible ABI/signature.
  */
 struct Int3Hook *detours_int3_install(const uint8_t *target, const uint8_t *detour);
+
+/**
+ * Installs an INT3 hook that also exposes a callable gateway to the original
+ * function, retrievable with `detours_int3_original`.
+ *
+ * Behaves like `detours_int3_install`, but lets the detour forward to the
+ * original (e.g. to use its return value) without re-triggering the
+ * breakpoint. Returns null on failure, including when the original gateway
+ * could not be built. The returned pointer must be released with
+ * `detours_int3_unhook`.
+ *
+ * # Safety
+ * `target` must point at the entry of a real function in executable memory and
+ * `detour` must be a function pointer with a compatible ABI/signature.
+ */
+struct Int3Hook *detours_int3_install_with_original(const uint8_t *target, const uint8_t *detour);
+
+/**
+ * Returns the callable original-function pointer for an INT3 hook installed
+ * with `detours_int3_install_with_original`, or null if `hook` is null or was
+ * installed without a gateway.
+ *
+ * # Safety
+ * `hook` must be a valid pointer previously returned by `detours_int3_install*`
+ * and still live (not yet unhooked).
+ */
+const uint8_t *detours_int3_original(const struct Int3Hook *hook);
 
 /**
  * Removes an INT3 hook installed by `detours_int3_install` and frees it,
@@ -920,6 +999,112 @@ int32_t detours_delay_is_active(const struct DelayHook *hook);
  * `detours_delay_register` and must not be used afterwards.
  */
 int32_t detours_delay_unhook(struct DelayHook *hook);
+
+/**
+ * Creates an anti-tamper watchdog whose background thread re-applies tampered
+ * byte patches every `interval_ms` milliseconds.
+ *
+ * Returns an opaque watchdog pointer (non-null), which must later be released
+ * with `detours_watchdog_destroy`. An `interval_ms` of `0` is treated as 1 ms.
+ */
+struct Watchdog *detours_watchdog_create(uint32_t interval_ms);
+
+/**
+ * Snapshots `len` bytes at `target` and guards them, returning a non-zero guard
+ * id usable with `detours_watchdog_unguard`.
+ *
+ * Install the hook first: the bytes are read now and become the image the
+ * watchdog re-applies. Returns `0` if `wd`/`target` is null or `len` is zero.
+ *
+ * # Safety
+ * `wd` must be a valid watchdog pointer from `detours_watchdog_create`, and
+ * `target` must point at `len` readable bytes for the lifetime of the guard.
+ */
+uint64_t detours_watchdog_guard(struct Watchdog *wd, const uint8_t *target, uintptr_t len);
+
+/**
+ * Stops guarding the region identified by `id`.
+ *
+ * Returns `1` if a matching region was being guarded, `0` otherwise (including
+ * when `wd` is null). Call this before unhooking the target.
+ *
+ * # Safety
+ * `wd` must be a valid watchdog pointer from `detours_watchdog_create`.
+ */
+int32_t detours_watchdog_unguard(struct Watchdog *wd, uint64_t id);
+
+/**
+ * Returns how many times the watchdog has rewritten a tampered region since it
+ * was created, or `0` if `wd` is null.
+ *
+ * # Safety
+ * `wd` must be a valid watchdog pointer from `detours_watchdog_create`.
+ */
+uint64_t detours_watchdog_restorations(const struct Watchdog *wd);
+
+/**
+ * Sets the watchdog's reaction to tampering: re-apply the patch
+ * (`detect_only == 0`, the default) or only report it (`detect_only != 0`).
+ *
+ * Returns `1` on success, or `0` if `wd` is null.
+ *
+ * # Safety
+ * `wd` must be a valid watchdog pointer from `detours_watchdog_create`.
+ */
+int32_t detours_watchdog_set_mode(const struct Watchdog *wd, int32_t detect_only);
+
+/**
+ * Installs (`cb != NULL`) or clears (`cb == NULL`) the tamper callback. The
+ * callback runs on the watchdog's background thread.
+ *
+ * Returns `1` on success, or `0` if `wd` is null.
+ *
+ * # Safety
+ * `wd` must be a valid watchdog pointer from `detours_watchdog_create`. `cb`,
+ * when non-null, must be callable for the watchdog's lifetime, and `user` is
+ * passed through unchanged on every invocation.
+ */
+int32_t detours_watchdog_set_on_tamper(const struct Watchdog *wd,
+                                       struct Option_DetoursTamperCallback cb,
+                                       void *user);
+
+/**
+ * Stops the watchdog's background thread and frees it.
+ *
+ * Returns `1` if the watchdog was accepted for destruction, or `0` if null.
+ *
+ * # Safety
+ * `wd` must be a valid watchdog pointer previously returned by
+ * `detours_watchdog_create` and must not be used afterwards.
+ */
+int32_t detours_watchdog_destroy(struct Watchdog *wd);
+
+/**
+ * Returns `1` if NeoHook will register Control Flow Guard call targets for this
+ * process, `0` otherwise.
+ *
+ * Reflects a `detours_cfg_set_enforcement` override if one is set, otherwise the
+ * process's CFG mitigation policy. See [`crate::cfg`].
+ */
+int32_t detours_cfg_is_enforced(void);
+
+/**
+ * Overrides CFG handling: `mode < 0` returns to auto-detection, `mode == 0`
+ * forces it off (the whole layer becomes a no-op), `mode > 0` forces it on.
+ */
+void detours_cfg_set_enforcement(int32_t mode);
+
+/**
+ * Marks `entry` as a valid Control Flow Guard indirect-call target, so
+ * runtime-generated code can be reached through a guarded indirect call.
+ *
+ * Returns `1` if the target was registered, `0` if registration was skipped
+ * (CFG not enforced) or `entry` is null. See [`crate::cfg::register_valid_target`].
+ *
+ * # Safety
+ * `entry` must point at the entry of executable, committed memory.
+ */
+int32_t detours_cfg_register_valid_target(const uint8_t *entry);
 
 #ifdef __cplusplus
 }  // extern "C"

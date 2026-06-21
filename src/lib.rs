@@ -13,6 +13,7 @@ use std::fmt;
 
 mod alloc;
 pub mod api;
+pub mod cfg;
 mod code;
 mod delay;
 mod disasm;
