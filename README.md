@@ -57,6 +57,8 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 
 - **Anti-Tamper / Re-Hook Watchdog** - A background `Watchdog` snapshots a hook's patched bytes and, on tamper, either **re-applies** them (`WatchMode::Restore`) or just **reports** the event (`WatchMode::DetectOnly`) via an `on_tamper` callback - defeating or surfacing periodic integrity checks (anti-cheat, DRM) that restore the original prologue to tear a hook out. Works at the byte level, so it guards inline jumps, the INT3 `0xCC`, or any patch.
 
+- **Tracing Detours** - Two generators, no hand-written boilerplate: `detour_trace!` takes a signature and `Debug`-formats every call's arguments **and return value**; `trace_raw!` needs **no signature** and dumps the integer argument registers at entry via the `MidHook`/`HookContext` bridge. Both emit to a process-wide sink (stderr by default, or your own logger).
+
 - **Pattern / Signature Scanning** - Resolve unexported, statically-linked, or stripped functions by a byte signature (IDA / x64dbg `48 8B ?? E8` syntax, or code+mask). Scans only committed, executable regions of a module - safely skipping guard pages and holes - and feeds the match straight into a hook via `attach_pattern`.
 
 - **Hook-by-Export-Name** - `attach_export("user32.dll", "MessageBoxW", detour)` resolves a named export (loading the module if needed) and queues an inline hook on the function body in a single call - no manual `GetModuleHandle` / `GetProcAddress` dance.
@@ -135,6 +137,7 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 | v0.10.0 |    ✅ Done | Call-the-original gateway for VEH / INT3 hooks          |
 | v0.10.0 |    ✅ Done | Symbol-based resolution via `dbghelp` (`resolve_symbol`)|
 | v0.10.0 |    ✅ Done | Anti-tamper / re-hook watchdog (`Watchdog`)            |
+| v0.10.0 |    ✅ Done | Tracing / logging detour generator (`detour_trace!`)   |
 | v0.10.0 |    Planned | ARM64 inline hooking                                   |
 
 --
@@ -947,6 +950,62 @@ faithfully re-install the very patch you are trying to remove. The C ABI exposes
 
 ---
 
+### Tracing Detours - `detour_trace!`
+
+Writing a detour whose only job is to log "this function was called with these
+arguments and returned this" is pure boilerplate. `detour_trace!` generates it:
+give it a target and its signature and it installs an inline hook that
+`Debug`-formats every call's arguments and return value, emits a record, and
+forwards to the original unchanged.
+
+```rust
+use neohook::{detour_trace, trace};
+
+#[inline(never)]
+extern "system" fn add(a: i32, b: i32) -> i32 { a + b }
+
+fn main() {
+    // Optional: route records into your logger instead of the default stderr.
+    trace::set_sink(|r| println!("[trace] {}({}) => {}", r.function, r.args, r.ret));
+
+    let _hooks = detour_trace!(add, "system" fn(a: i32, b: i32) -> i32)
+        .expect("trace hook failed");
+
+    assert_eq!(add(2, 3), 5); // logs: add(2, 3) => 5, returns the real result
+}
+```
+
+Every argument type and the return type must implement `Debug` (integers,
+pointers, and most FFI types already do). Where records go is decided by a
+process-wide sink: the default writes one line per call to standard error;
+`trace::set_sink` overrides it and `trace::clear_sink` restores the default.
+
+When you do **not** want to spell out a signature, `trace_raw!` builds the tracer
+on the `MidHook` / `HookContext` register-context bridge instead. It needs only
+the target, hooks the entry, and dumps the integer argument registers as hex:
+
+```rust
+use neohook::trace_raw;
+
+// No ABI, no argument types - just the function. Dumps the first 2 integer args.
+let _hook = trace_raw!(some_function, args = 2).expect("raw trace failed");
+// emits e.g.:  some_function(0x10, 0x20) -> <entry>
+```
+
+The trade-off mirrors the two foundations: `detour_trace!` (closure engine) gives
+**typed arguments and the return value** but needs the signature; `trace_raw!`
+(`HookContext`) needs **no signature** but only sees raw integer registers at
+entry and has no return value to report, so its record's return field is the
+literal `<entry>`. On **x86_64** those registers *are* the first four integer
+arguments (`rcx`/`rdx`/`r8`/`r9`); on **x86**, where arguments are stack-passed
+and not reachable from a mid-hook context, it dumps the general-purpose registers
+as a snapshot instead (use `detour_trace!` for typed x86 arguments).
+
+Like the [named registry](#named-hook-registry), tracing is a Rust-side ergonomic
+layer (no C ABI), because formatting arbitrary argument types is a Rust-language
+feature. See [`examples/trace_detour.rs`](examples/trace_detour.rs).
+
+---
 
 ## How It Works - Under the Hood
 
@@ -1082,6 +1141,7 @@ neohook/
 │   ├── delay.rs        - DelayHook: on-load hooks via an ntdll!LdrLoadDll detour
 │   ├── registry.rs     - Process-wide named hook registry (+ unhook_all)
 │   ├── watchdog.rs     - Watchdog: anti-tamper / re-hook byte-region guard
+│   ├── trace.rs        - Tracing detour sink for detour_trace!
 │   ├── introspect.rs   - Module / PE introspection (modules, exports, imports)
 │   ├── mem.rs          - Memory helpers: VirtualProtect wrapper, atomic write
 │   ├── module.rs       - Module utilities: find_function, get_module_handle

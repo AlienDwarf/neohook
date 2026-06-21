@@ -31,6 +31,7 @@ mod resolve;
 mod scan;
 mod symbols;
 mod threads;
+pub mod trace;
 pub(crate) mod transaction;
 mod veh;
 mod vtable;
@@ -356,6 +357,140 @@ macro_rules! detour_closure {
     }};
 }
 
+/// Installs an inline hook that **logs every call** to `$target` - its arguments
+/// and return value - and forwards to the original, without writing the logging
+/// detour by hand.
+///
+/// It is the tracing counterpart to [`detour_closure!`]: you declare the
+/// target's ABI and signature once, and NeoHook generates a detour that
+/// [`Debug`]-formats each call's arguments and its return value, hands them to
+/// the process-wide trace sink ([`crate::trace`]), then returns the original's
+/// result unchanged. The default sink prints one line per call to standard
+/// error; install your own with [`crate::trace::set_sink`] to route records into
+/// a logging framework.
+///
+/// # Syntax
+///
+/// ```rust,ignore
+/// detour_trace!(
+///     target_fn,                          // the function to hook
+///     "system" fn(a: i32, b: i32) -> i32, // ABI + argument names/types + return
+/// )
+/// ```
+///
+/// Returns `Result<Vec<Hook>, DetourError>`, exactly like [`detour_inline!`];
+/// keep the returned value alive to keep the trace installed (RAII unhook on
+/// drop).
+///
+/// # Requirements
+///
+/// Every argument type and the return type must implement [`std::fmt::Debug`]
+/// (integers, pointers, and most FFI types already do). The original is invoked
+/// once per call, so this is unsuitable for functions with observable
+/// double-call side effects only if you also forward - which this macro always
+/// does.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use neohook::{detour_trace, trace};
+///
+/// #[inline(never)]
+/// extern "system" fn add(a: i32, b: i32) -> i32 { a + b }
+///
+/// // Optional: route records somewhere other than stderr.
+/// trace::set_sink(|r| eprintln!("TRACE {}({}) = {}", r.function, r.args, r.ret));
+///
+/// let _hooks = detour_trace!(add, "system" fn(a: i32, b: i32) -> i32)
+///     .expect("trace hook failed");
+///
+/// assert_eq!(add(2, 3), 5); // logs: add(2, 3) -> 5, returns the real result
+/// ```
+#[macro_export]
+macro_rules! detour_trace {
+    (
+        $target:expr,
+        $abi:literal fn ( $($arg:ident : $argty:ty),* $(,)? ) $(-> $ret:ty)?
+        $(,)?
+    ) => {{
+        $crate::detour_closure!(
+            $target,
+            $abi fn ( $($arg : $argty),* ) $(-> $ret)?,
+            move |__neohook_orig, $($arg),*| {
+                // Format the arguments *before* invoking the original, so the
+                // logged values reflect the call's inputs even if the original
+                // mutates through them.
+                let __neohook_args: ::std::vec::Vec<::std::string::String> =
+                    ::std::vec![ $( ::std::format!("{:?}", $arg) ),* ];
+                #[allow(clippy::let_unit_value)]
+                let __neohook_ret = __neohook_orig($($arg),*);
+                $crate::trace::record(
+                    ::std::stringify!($target),
+                    &__neohook_args.join(", "),
+                    &::std::format!("{:?}", __neohook_ret),
+                );
+                __neohook_ret
+            },
+        )
+    }};
+}
+
+/// Installs a **signature-free** tracing detour built on the [`MidHook`]
+/// register-context bridge: it logs the integer arguments of every call to
+/// `$target` and forwards to the original, **without** you declaring the
+/// function's ABI or argument types.
+///
+/// Where [`detour_trace!`] needs the full signature (and in return gives typed
+/// arguments *and* the return value), `trace_raw!` needs only the target. It
+/// hooks the entry with a [`MidHook`], reads the argument registers from the
+/// captured [`HookContext`] (`rcx`/`rdx`/`r8`/`r9` on x86_64; the stack slots
+/// above the return address on x86), formats them as hex, and emits a record to
+/// the same process-wide [`trace`] sink. Because it captures state *at entry*,
+/// there is no return value - the record's return field is the literal
+/// `<entry>`.
+///
+/// # Syntax
+///
+/// ```rust,ignore
+/// // Trace the default first 4 integer arguments:
+/// let _hook = trace_raw!(some_function)?;
+/// // Trace a specific number of leading integer arguments:
+/// let _hook = trace_raw!(some_function, args = 2)?;
+/// ```
+///
+/// Returns `Result<MidHook, DetourError>`; keep the returned [`MidHook`] alive to
+/// keep the trace installed (RAII unhook on drop).
+///
+/// # Caveats
+///
+/// - `$target` must be a real **function entry** (the argument layout assumes a
+///   normal call frame).
+/// - Only integer/pointer arguments are shown, as raw hex - there is no type
+///   information to format them otherwise. For typed arguments and the return
+///   value, use [`detour_trace!`] with the signature.
+/// - The handler allocates and writes to the sink; do not trace functions on the
+///   allocator or logging path or you risk re-entrancy.
+#[macro_export]
+macro_rules! trace_raw {
+    ($target:expr $(,)?) => {
+        $crate::trace_raw!($target, args = 4)
+    };
+    ($target:expr, args = $n:expr $(,)?) => {{
+        // A fresh handler per expansion: macro hygiene gives each its own item,
+        // so each hardcodes its own target name via `stringify!`.
+        unsafe extern "system" fn __neohook_raw_handler(__ctx: *mut $crate::HookContext) {
+            // SAFETY: the MidHook stub passes a valid pointer to the captured
+            // context for the duration of this call.
+            let __ctx = unsafe { &*__ctx };
+            $crate::trace::record_raw(::std::stringify!($target), __ctx, $n);
+        }
+        // Evaluate the user expression outside the `unsafe` block so the unsafe
+        // call references only locals/items (not a macro metavariable).
+        let __neohook_target = $target as *const u8;
+        unsafe { $crate::MidHook::install(__neohook_target, __neohook_raw_handler) }
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,5 +566,94 @@ mod tests {
 
         drop(hooks); // RAII restores the original.
         assert_eq!(target(2, 3), 5, "original restored after unhook");
+    }
+
+    #[inline(never)]
+    extern "system" fn traced_mul(a: i32, b: i32) -> i32 {
+        std::hint::black_box(a) * std::hint::black_box(b)
+    }
+
+    static TRACE_LINES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    fn trace_capture(record: &crate::trace::TraceRecord) {
+        TRACE_LINES.lock().unwrap().push(format!(
+            "{}({}) -> {}",
+            record.function, record.args, record.ret
+        ));
+    }
+
+    #[test]
+    fn detour_trace_logs_args_and_return_then_forwards() {
+        TRACE_LINES.lock().unwrap().clear();
+        crate::trace::set_sink(trace_capture);
+
+        let target: extern "system" fn(i32, i32) -> i32 = traced_mul;
+        assert_eq!(target(6, 7), 42, "sanity before hook");
+
+        let hooks =
+            detour_trace!(traced_mul, "system" fn(a: i32, b: i32) -> i32).expect("trace hook");
+
+        // The original result is forwarded unchanged...
+        assert_eq!(
+            target(6, 7),
+            42,
+            "trace detour must forward the real result"
+        );
+
+        // ...and the call was logged with its arguments and return value.
+        let lines = TRACE_LINES.lock().unwrap().clone();
+        assert!(
+            lines.iter().any(|l| l == "traced_mul(6, 7) -> 42"),
+            "expected a trace line for the call, got {lines:?}"
+        );
+
+        crate::trace::clear_sink();
+        drop(hooks);
+        assert_eq!(target(6, 7), 42, "original restored after unhook");
+    }
+
+    #[inline(never)]
+    extern "system" fn raw_traced(a: u64, b: u64) -> u64 {
+        std::hint::black_box(a).wrapping_add(std::hint::black_box(b))
+    }
+
+    #[test]
+    fn trace_raw_logs_argument_registers_and_continues() {
+        TRACE_LINES.lock().unwrap().clear();
+        crate::trace::set_sink(trace_capture);
+
+        let target: extern "system" fn(u64, u64) -> u64 = raw_traced;
+        assert_eq!(target(0x10, 0x20), 0x30, "sanity before hook");
+
+        let hook = trace_raw!(raw_traced, args = 2).expect("raw trace hook");
+
+        // The original still runs to completion (MidHook continues the function).
+        assert_eq!(
+            target(0x10, 0x20),
+            0x30,
+            "trace_raw must not alter behavior"
+        );
+
+        let lines = TRACE_LINES.lock().unwrap().clone();
+        // The record must name the function, carry hex register values, and mark
+        // the entry-time snapshot (no return value).
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("raw_traced(") && l.contains("0x") && l.contains("<entry>")),
+            "expected a raw trace line, got {lines:?}"
+        );
+        // Only on x86_64 are the integer arguments passed in the captured
+        // registers (rcx/rdx); on x86 they are stack-passed and not reachable
+        // from a mid-hook context (see trace::raw_arg_values).
+        #[cfg(target_arch = "x86_64")]
+        assert!(
+            lines.iter().any(|l| l.contains("0x10, 0x20")),
+            "x86_64 should capture the Win64 argument registers, got {lines:?}"
+        );
+
+        crate::trace::clear_sink();
+        hook.unhook().expect("unhook");
+        assert_eq!(target(0x10, 0x20), 0x30, "original restored after unhook");
     }
 }
