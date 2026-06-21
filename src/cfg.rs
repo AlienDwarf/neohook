@@ -26,8 +26,8 @@
 //! * Inline hooks patch the prologue with a direct `jmp` (`E9 ...`), which is not
 //!   a guarded indirect call at all.
 //!
-//! Registration becomes load-bearing under the stricter configurations a
-//! hardened or anti-tamper target may enable:
+//! Registration becomes load-bearing when a process opts into the stricter
+//! configurations:
 //!
 //! * **Strict mode** removes the private-memory exemption, so trampolines,
 //!   gateways and stubs must be registered explicitly.

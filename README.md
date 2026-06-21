@@ -1061,8 +1061,8 @@ ends the process with a non-catchable `RtlFailFast`.
 Most hooking survives default CFG untouched, because the default configuration is
 permissive in two ways that happen to cover the common cases: private executable
 memory (where trampolines live) is allowed, and modules without a Guard CF table
-are allowed wholesale. The stricter configurations a hardened or anti-tamper
-target may turn on are where registration becomes load-bearing:
+are allowed wholesale. The stricter configurations a process can opt into are
+where registration becomes load-bearing:
 
 - **Strict mode** removes the private-memory exemption - trampolines, gateways,
   and export stubs must be registered.
