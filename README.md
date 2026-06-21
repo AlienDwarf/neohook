@@ -13,7 +13,7 @@ Hook any function in one line - transactional, and thread-safe. Leave pointer-to
 NeoHook makes runtime function hooking simple and reliable: Win32 APIs, game engine functions, third-party DLL exports, anything with a code pointer. It brings the precision of low-level binary patching together with Rust's memory safety, type system, and RAII ownership model.
 
 > [!IMPORTANT]
-> **For lawful, authorised use only.** NeoHook is a systems toolkit for debugging, profiling, instrumentation, interoperability, security research, and modding software you own or have permission to modify. You are responsible for complying with the licences, terms, and laws that govern any software you use it with. The authors do not endorse using it to circumvent security or licensing controls, to violate terms of service, or to cause harm.
+> NeoHook is a systems toolkit for debugging, profiling, instrumentation, interoperability, security research, and modding software you own or have permission to modify. You are responsible for complying with the licences, terms, and laws that govern any software you use it with. The authors do not endorse using it to circumvent security or licensing controls, to violate terms of service, or to cause harm.
 
 ---
 
