@@ -1180,6 +1180,24 @@ cargo test -- --test-threads=1
 
 You have to make sure that you use one thread or you risk race conditions.
 
+### Fuzzing the relocator
+
+Instruction relocation is the most safety-critical component (it re-encodes
+build-controlled prologue bytes), so it has a dedicated fuzz harness. A fast,
+deterministic invariant pass runs as part of the normal suite; the deep,
+mutation-based fuzzer is `#[ignore]`d so it can be run on demand or on a
+schedule:
+
+```bash
+# millions of corpus-seeded mutations; reproducible via the seed
+NEOHOOK_FUZZ_ITERS=5000000 cargo test --release fuzz_relocate_deep -- --ignored --nocapture
+```
+
+It asserts the relocator never panics, never writes past the trampoline budget
+(canary-guarded), keeps the old→new instruction-offset map consistent, and
+preserves absolute branch / RIP-relative targets. Set `NEOHOOK_FUZZ_SEED` to
+reproduce a specific run.
+
 ---
 
 ## Disclaimer
