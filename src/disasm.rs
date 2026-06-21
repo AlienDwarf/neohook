@@ -370,7 +370,7 @@ mod tests {
     // Fuzzing harness for the relocator.
     //
     // Relocation is the single most dangerous operation in the library: it
-    // decodes attacker-/build-controlled bytes from a function prologue and
+    // decodes build-controlled bytes from a function prologue and
     // re-encodes them somewhere else. A subtle bug here corrupts a live process.
     // These harnesses hammer `relocate` / `get_instruction_len` with a corpus of
     // real instruction sequences plus byte-level mutations and assert hard
