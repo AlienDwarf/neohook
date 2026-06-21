@@ -97,6 +97,49 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 
 ---
 
+## Comparison
+
+How NeoHook relates to the other established Windows hooking libraries. This is a
+factual feature-presence matrix, not a benchmark - each project has different
+goals, and Detours and MinHook in particular have a far longer production track
+record (see the note below the table).
+
+Legend: ✅ built in · ◐ partial / via a different mechanism · ❌ not provided.
+Accurate as of June 2026; corrections welcome via an issue.
+
+| Capability | NeoHook | MS Detours | PolyHook2 | MinHook |
+| :--------- | :-----: | :--------: | :-------: | :-----: |
+| Inline hook + instruction relocation | ✅ | ✅ | ✅ | ✅ |
+| Atomic transaction + rollback | ✅ | ✅ | ❌ | ◐ |
+| Thread suspend + IP redirect | ✅ | ◐ | ◐ | ✅ |
+| Stack return-address rewrite | ✅ | ❌ | ❌ | ❌ |
+| IAT hooking | ✅ | ◐ | ✅ | ❌ |
+| EAT hooking | ✅ | ❌ | ✅ | ❌ |
+| VTable hook (+ per-instance) | ✅ | ❌ | ✅ | ❌ |
+| VEH (hardware-breakpoint) hook | ✅ | ❌ | ✅ | ❌ |
+| INT3 software-breakpoint hook | ✅ | ❌ | ❌ | ❌ |
+| Mid-function / register-context detour | ✅ | ❌ | ◐ | ❌ |
+| Pattern / signature scanning | ✅ | ❌ | ❌ | ❌ |
+| Symbol resolution (dbghelp / PDB) | ✅ | ❌ | ❌ | ❌ |
+| Closure detours (capturing) | ✅ | ❌ | ◐ | ❌ |
+| Tracing / logging detour generators | ✅ | ❌ | ❌ | ❌ |
+| Anti-tamper / re-hook watchdog | ✅ | ❌ | ❌ | ❌ |
+| Delay / on-load hooks | ✅ | ❌ | ❌ | ❌ |
+| Control Flow Guard awareness | ✅ | ✅ | ❌ | ❌ |
+| RAII / memory-safe ownership | ✅ | ❌ | ❌ | ❌ |
+| C ABI | ✅ | ✅ | ❌ | ✅ |
+| ARM64 inline hooking | ❌ | ✅ | ❌ | ❌ |
+| Cross-process / remote patching | ❌ | ✅ | ◐ | ❌ |
+| Process-launch DLL injection | ❌ | ✅ | ❌ | ❌ |
+| On-disk PE import editing | ❌ | ✅ | ❌ | ❌ |
+
+NeoHook is the broadest in-process engine on x86/x64 here; the areas Detours
+still owns are out-of-process / launch-time injection, on-disk binary editing,
+and ARM64. Detours and MinHook are also more battle-tested at scale, so treat
+this as a feature comparison rather than a maturity one.
+
+---
+
 ## Roadmap
 
 | Version |     Status | Features                                               |
