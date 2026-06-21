@@ -3,11 +3,11 @@
 
 //! Anti-tamper / re-hook watchdog.
 //!
-//! Some targets fight back. An anti-cheat, a DRM shell, or a periodic
-//! integrity check may scan its own code and *restore* the original bytes,
-//! silently tearing out an inline or INT3 hook some time after it was
-//! installed. A [`Watchdog`] is the countermeasure: it snapshots the bytes a
-//! hook left at the target and watches a background thread for tampering.
+//! Some code verifies its own integrity. A periodic self-check may scan the
+//! bytes it shipped with and *restore* the original bytes, silently removing an
+//! inline or INT3 hook some time after it was installed. A [`Watchdog`] keeps a
+//! hook stable across such a check: it snapshots the bytes a hook left at the
+//! target and watches a background thread for tampering.
 //!
 //! What it does on tamper is **your choice**:
 //!

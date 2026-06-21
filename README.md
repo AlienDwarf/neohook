@@ -55,7 +55,7 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 
 - **Symbol-Based Resolution** - Resolve a target by name through the Debug Help library (`dbghelp`): `resolve_symbol("ntdll.dll", "LdrpInitializeProcess")`. With a PDB available (next to the binary or via a symbol server / `_NT_SYMBOL_PATH`) this reaches **non-exported** internal routines that export-table and signature lookups cannot; without a PDB it still resolves export names.
 
-- **Anti-Tamper / Re-Hook Watchdog** - A background `Watchdog` snapshots a hook's patched bytes and, on tamper, either **re-applies** them (`WatchMode::Restore`) or just **reports** the event (`WatchMode::DetectOnly`) via an `on_tamper` callback - defeating or surfacing periodic integrity checks (anti-cheat, DRM) that restore the original prologue to tear a hook out. Works at the byte level, so it guards inline jumps, the INT3 `0xCC`, or any patch.
+- **Anti-Tamper / Re-Hook Watchdog** - A background `Watchdog` snapshots a hook's patched bytes and, on tamper, either **re-applies** them (`WatchMode::Restore`) or just **reports** the event (`WatchMode::DetectOnly`) via an `on_tamper` callback - keeping a hook in place across, or surfacing, periodic self-integrity checks that restore the original prologue. Works at the byte level, so it guards inline jumps, the INT3 `0xCC`, or any patch.
 
 - **Control Flow Guard (CFG) Awareness** - On a process that enforces CFG, neohook registers the entry points it generates (inline trampolines, VEH/INT3 gateways, EAT jump stubs) and the IAT/EAT/VTable detours as valid indirect-call targets via `SetProcessValidCallTargets` - the same mechanism Microsoft Detours uses. Auto-detected and a no-op when CFG is off, so it is safe to leave on; it keeps hooks holding up under **strict CFG** and **export suppression**, where the default permit for private executable memory no longer applies. `cfg::register_valid_target` is public for your own runtime-generated code.
 
@@ -946,9 +946,9 @@ contract) is serialized through one process-wide lock. The C ABI exposes
 
 ### Anti-Tamper / Re-Hook Watchdog
 
-Some targets fight back: an anti-cheat, a DRM shell, or a periodic integrity
-check scans its own code and **restores the original bytes**, silently tearing
-out a hook some time after it was installed. A `Watchdog` is the countermeasure -
+Some code verifies its own integrity: a periodic self-check scans the bytes it
+shipped with and **restores the original bytes**, silently removing a hook some
+time after it was installed. A `Watchdog` keeps a hook stable across such a check -
 it snapshots the bytes a hook left at the target and watches a background thread
 for tampering. What it does next is **your choice**: re-apply the patch
 (`WatchMode::Restore`, the default) or just report it (`WatchMode::DetectOnly`).

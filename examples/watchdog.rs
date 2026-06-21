@@ -1,9 +1,9 @@
 // Demonstrates the anti-tamper / re-hook watchdog.
 //
-// Some targets (anti-cheats, DRM shells) periodically scan their own code and
-// restore the original bytes, silently tearing out an inline hook. A Watchdog
-// snapshots the patched bytes and re-applies them from a background thread the
-// moment anything reverts them.
+// Some code periodically verifies its own integrity and restores the original
+// bytes, silently removing an inline hook. A Watchdog snapshots the patched
+// bytes and re-applies them from a background thread the moment anything reverts
+// them.
 //
 // Here we install a normal inline hook, simulate an integrity check restoring
 // the original prologue, and watch the watchdog put the hook back.
@@ -11,7 +11,7 @@
    interleave):
     before hook:    1
     after hook:     9999
-    after tamper:   1 (hook torn out)
+    after tamper:   1 (hook removed)
     [watchdog] tamper at 0x... restored=true
     after watchdog: 9999 (re-applied 1 time(s))
     after unhook:   1
@@ -90,9 +90,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let _id = unsafe { wd.guard(target_addr as *const u8, orig_bytes.len()) }?;
 
-    // An "anti-cheat" restores the original bytes -> the hook is bypassed.
+    // A self-integrity check restores the original bytes -> the hook is removed.
     unsafe { tamper(target_addr, &orig_bytes) };
-    println!("after tamper:   {} (hook torn out)", call(target_fn));
+    println!("after tamper:   {} (hook removed)", call(target_fn));
 
     // Wait for the watchdog's next sweep to re-apply the patch.
     let start = Instant::now();
