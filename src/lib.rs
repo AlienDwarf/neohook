@@ -34,6 +34,7 @@ mod threads;
 pub(crate) mod transaction;
 mod veh;
 mod vtable;
+mod watchdog;
 
 // Re-exports for public API
 pub use crate::api::DetourTransaction;
@@ -63,6 +64,7 @@ pub use crate::transaction::{
 };
 pub use crate::veh::{VehHook, VehHookError};
 pub use crate::vtable::VTableHookError;
+pub use crate::watchdog::{GuardId, TamperEvent, WatchMode, Watchdog, WatchdogError};
 
 /// Identifies which kind of hook a [`DetourError::CommitFailed`] refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

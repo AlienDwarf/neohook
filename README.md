@@ -55,6 +55,8 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 
 - **Symbol-Based Resolution** - Resolve a target by name through the Debug Help library (`dbghelp`): `resolve_symbol("ntdll.dll", "LdrpInitializeProcess")`. With a PDB available (next to the binary or via a symbol server / `_NT_SYMBOL_PATH`) this reaches **non-exported** internal routines that export-table and signature lookups cannot; without a PDB it still resolves export names.
 
+- **Anti-Tamper / Re-Hook Watchdog** - A background `Watchdog` snapshots a hook's patched bytes and, on tamper, either **re-applies** them (`WatchMode::Restore`) or just **reports** the event (`WatchMode::DetectOnly`) via an `on_tamper` callback - defeating or surfacing periodic integrity checks (anti-cheat, DRM) that restore the original prologue to tear a hook out. Works at the byte level, so it guards inline jumps, the INT3 `0xCC`, or any patch.
+
 - **Pattern / Signature Scanning** - Resolve unexported, statically-linked, or stripped functions by a byte signature (IDA / x64dbg `48 8B ?? E8` syntax, or code+mask). Scans only committed, executable regions of a module - safely skipping guard pages and holes - and feeds the match straight into a hook via `attach_pattern`.
 
 - **Hook-by-Export-Name** - `attach_export("user32.dll", "MessageBoxW", detour)` resolves a named export (loading the module if needed) and queues an inline hook on the function body in a single call - no manual `GetModuleHandle` / `GetProcAddress` dance.
@@ -132,6 +134,7 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 | v0.9.0  |    ✅ Done | Control-flow redirect from a `MidHook` handler         |
 | v0.10.0 |    ✅ Done | Call-the-original gateway for VEH / INT3 hooks          |
 | v0.10.0 |    ✅ Done | Symbol-based resolution via `dbghelp` (`resolve_symbol`)|
+| v0.10.0 |    ✅ Done | Anti-tamper / re-hook watchdog (`Watchdog`)            |
 | v0.10.0 |    Planned | ARM64 inline hooking                                   |
 
 --
@@ -894,6 +897,57 @@ contract) is serialized through one process-wide lock. The C ABI exposes
 
 ---
 
+### Anti-Tamper / Re-Hook Watchdog
+
+Some targets fight back: an anti-cheat, a DRM shell, or a periodic integrity
+check scans its own code and **restores the original bytes**, silently tearing
+out a hook some time after it was installed. A `Watchdog` is the countermeasure -
+it snapshots the bytes a hook left at the target and watches a background thread
+for tampering. What it does next is **your choice**: re-apply the patch
+(`WatchMode::Restore`, the default) or just report it (`WatchMode::DetectOnly`).
+An optional `on_tamper` callback fires once per tamper episode either way.
+
+```rust
+use neohook::{DetourTransaction, Hook, Watchdog, WatchMode};
+use std::time::Duration;
+
+let mut tx = DetourTransaction::begin();
+tx.update_all_threads();
+tx.attach(target as *mut u8, detour as *const u8).unwrap();
+let hooks = tx.commit().unwrap();
+
+// Snapshot the patched prologue and guard it.
+let (addr, len) = match &hooks[0] {
+    Hook::Inline(h) => (h.target as *const u8, h.orig_bytes.len()),
+    _ => unreachable!(),
+};
+let wd = Watchdog::with_interval(Duration::from_millis(50));
+
+// Get notified on tamper (runs on the watchdog thread).
+wd.on_tamper(|e| eprintln!("tamper at {:p}, restored={}", e.target, e.restored));
+
+// Default re-applies the patch; switch to "detect, do not re-patch" with:
+// wd.set_mode(WatchMode::DetectOnly);
+
+let id = unsafe { wd.guard(addr, len) }.unwrap();
+// wd.restorations() counts how many times Restore mode stepped in.
+
+wd.unguard(id); // stop guarding *before* you unhook
+```
+
+It works at the byte level, so it is agnostic to *how* the patch was made: it
+guards inline-hook jumps, the single `0xCC` of an INT3 hook, or any run of bytes
+you point it at. In `Restore` mode, guard a region **after** the hook is
+installed and **unguard it before** you unhook - otherwise the watchdog would
+faithfully re-install the very patch you are trying to remove. The C ABI exposes
+`detours_watchdog_create`, `detours_watchdog_guard`, `detours_watchdog_unguard`,
+`detours_watchdog_set_mode`, `detours_watchdog_set_on_tamper`,
+`detours_watchdog_restorations`, and `detours_watchdog_destroy`. See
+[`examples/watchdog.rs`](examples/watchdog.rs).
+
+---
+
+
 ## How It Works - Under the Hood
 
 ### The Problem with Naive Patching
@@ -1027,6 +1081,7 @@ neohook/
 │   ├── symbols.rs      - Symbol-based resolution via dbghelp (resolve_symbol)
 │   ├── delay.rs        - DelayHook: on-load hooks via an ntdll!LdrLoadDll detour
 │   ├── registry.rs     - Process-wide named hook registry (+ unhook_all)
+│   ├── watchdog.rs     - Watchdog: anti-tamper / re-hook byte-region guard
 │   ├── introspect.rs   - Module / PE introspection (modules, exports, imports)
 │   ├── mem.rs          - Memory helpers: VirtualProtect wrapper, atomic write
 │   ├── module.rs       - Module utilities: find_function, get_module_handle

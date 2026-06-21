@@ -1664,6 +1664,178 @@ pub unsafe extern "C" fn detours_delay_unhook(hook: *mut crate::delay::DelayHook
     1
 }
 
+// ----------------- FFI Entry Points: anti-tamper watchdog --------------------
+
+/// Creates an anti-tamper watchdog whose background thread re-applies tampered
+/// byte patches every `interval_ms` milliseconds.
+///
+/// Returns an opaque watchdog pointer (non-null), which must later be released
+/// with `detours_watchdog_destroy`. An `interval_ms` of `0` is treated as 1 ms.
+#[unsafe(no_mangle)]
+pub extern "C" fn detours_watchdog_create(interval_ms: u32) -> *mut crate::watchdog::Watchdog {
+    let interval = std::time::Duration::from_millis(interval_ms.max(1) as u64);
+    Box::into_raw(Box::new(crate::watchdog::Watchdog::with_interval(interval)))
+}
+
+/// Snapshots `len` bytes at `target` and guards them, returning a non-zero guard
+/// id usable with `detours_watchdog_unguard`.
+///
+/// Install the hook first: the bytes are read now and become the image the
+/// watchdog re-applies. Returns `0` if `wd`/`target` is null or `len` is zero.
+///
+/// # Safety
+/// `wd` must be a valid watchdog pointer from `detours_watchdog_create`, and
+/// `target` must point at `len` readable bytes for the lifetime of the guard.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_watchdog_guard(
+    wd: *mut crate::watchdog::Watchdog,
+    target: *const u8,
+    len: usize,
+) -> u64 {
+    if wd.is_null() {
+        return 0;
+    }
+    let wd = unsafe { &*wd };
+    match unsafe { wd.guard(target, len) } {
+        Ok(id) => id.raw(),
+        Err(_) => 0,
+    }
+}
+
+/// Stops guarding the region identified by `id`.
+///
+/// Returns `1` if a matching region was being guarded, `0` otherwise (including
+/// when `wd` is null). Call this before unhooking the target.
+///
+/// # Safety
+/// `wd` must be a valid watchdog pointer from `detours_watchdog_create`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_watchdog_unguard(
+    wd: *mut crate::watchdog::Watchdog,
+    id: u64,
+) -> i32 {
+    if wd.is_null() {
+        return 0;
+    }
+    let wd = unsafe { &*wd };
+    wd.unguard(crate::watchdog::GuardId::from_raw(id)) as i32
+}
+
+/// Returns how many times the watchdog has rewritten a tampered region since it
+/// was created, or `0` if `wd` is null.
+///
+/// # Safety
+/// `wd` must be a valid watchdog pointer from `detours_watchdog_create`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_watchdog_restorations(
+    wd: *const crate::watchdog::Watchdog,
+) -> u64 {
+    if wd.is_null() {
+        return 0;
+    }
+    unsafe { &*wd }.restorations()
+}
+
+/// Sets the watchdog's reaction to tampering: re-apply the patch
+/// (`detect_only == 0`, the default) or only report it (`detect_only != 0`).
+///
+/// Returns `1` on success, or `0` if `wd` is null.
+///
+/// # Safety
+/// `wd` must be a valid watchdog pointer from `detours_watchdog_create`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_watchdog_set_mode(
+    wd: *const crate::watchdog::Watchdog,
+    detect_only: i32,
+) -> i32 {
+    if wd.is_null() {
+        return 0;
+    }
+    let mode = if detect_only != 0 {
+        crate::watchdog::WatchMode::DetectOnly
+    } else {
+        crate::watchdog::WatchMode::Restore
+    };
+    unsafe { &*wd }.set_mode(mode);
+    1
+}
+
+/// Callback invoked once per tamper episode by a watchdog. `restored` is `1` if
+/// the watchdog rewrote the canonical bytes this sweep, `0` otherwise. The
+/// `expected`/`found` buffers are each `len` bytes and valid only for the
+/// duration of the call. `user` is the opaque pointer passed to
+/// `detours_watchdog_set_on_tamper`.
+pub type DetoursTamperCallback = unsafe extern "C" fn(
+    guard_id: u64,
+    target: *const u8,
+    expected: *const u8,
+    found: *const u8,
+    len: usize,
+    restored: i32,
+    user: *mut c_void,
+);
+
+/// Installs (`cb != NULL`) or clears (`cb == NULL`) the tamper callback. The
+/// callback runs on the watchdog's background thread.
+///
+/// Returns `1` on success, or `0` if `wd` is null.
+///
+/// # Safety
+/// `wd` must be a valid watchdog pointer from `detours_watchdog_create`. `cb`,
+/// when non-null, must be callable for the watchdog's lifetime, and `user` is
+/// passed through unchanged on every invocation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_watchdog_set_on_tamper(
+    wd: *const crate::watchdog::Watchdog,
+    cb: Option<DetoursTamperCallback>,
+    user: *mut c_void,
+) -> i32 {
+    if wd.is_null() {
+        return 0;
+    }
+    let wd = unsafe { &*wd };
+    match cb {
+        None => wd.clear_on_tamper(),
+        Some(cb) => {
+            // Carry `user` as an integer so the closure stays `Send + Sync`.
+            let user = user as usize;
+            wd.on_tamper(move |ev: &crate::watchdog::TamperEvent| {
+                // SAFETY: `cb` is a valid C function pointer and `user` is opaque
+                // to NeoHook; the byte slices are valid for this call.
+                unsafe {
+                    cb(
+                        ev.guard_id.raw(),
+                        ev.target,
+                        ev.expected.as_ptr(),
+                        ev.found.as_ptr(),
+                        ev.expected.len(),
+                        ev.restored as i32,
+                        user as *mut c_void,
+                    );
+                }
+            });
+        }
+    }
+    1
+}
+
+/// Stops the watchdog's background thread and frees it.
+///
+/// Returns `1` if the watchdog was accepted for destruction, or `0` if null.
+///
+/// # Safety
+/// `wd` must be a valid watchdog pointer previously returned by
+/// `detours_watchdog_create` and must not be used afterwards.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_watchdog_destroy(wd: *mut crate::watchdog::Watchdog) -> i32 {
+    if wd.is_null() {
+        return 0;
+    }
+    // Dropping the box stops and joins the background thread via RAII.
+    drop(unsafe { Box::from_raw(wd) });
+    1
+}
+
 #[cfg(test)]
 mod attach_export_tests {
     use super::*;
