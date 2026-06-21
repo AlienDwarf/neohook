@@ -29,6 +29,7 @@ mod reentrancy;
 pub mod registry;
 mod resolve;
 mod scan;
+mod symbols;
 mod threads;
 pub(crate) mod transaction;
 mod veh;
@@ -56,6 +57,7 @@ pub use crate::scan::{
     Pattern, PatternError, scan, scan_all, scan_module, scan_module_all, scan_module_by_name,
     scan_range, scan_range_all,
 };
+pub use crate::symbols::resolve_symbol;
 pub use crate::transaction::{
     EatHook, Hook, IatHook, InlineHook, JumpType, TransactionCore, VtableHook, VtableInstanceHook,
 };

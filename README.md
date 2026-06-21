@@ -53,6 +53,8 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 
 - **Call-the-Original Gateway (VEH / INT3)** - Breakpoint-style hooks normally *replace* the target with no way back to it. `install_with_original` builds a small gateway holding the relocated prologue plus a jump into the body, so the detour can forward to the original (use its return value, conditionally fall through) without re-triggering the breakpoint or recursing.
 
+- **Symbol-Based Resolution** - Resolve a target by name through the Debug Help library (`dbghelp`): `resolve_symbol("ntdll.dll", "LdrpInitializeProcess")`. With a PDB available (next to the binary or via a symbol server / `_NT_SYMBOL_PATH`) this reaches **non-exported** internal routines that export-table and signature lookups cannot; without a PDB it still resolves export names.
+
 - **Pattern / Signature Scanning** - Resolve unexported, statically-linked, or stripped functions by a byte signature (IDA / x64dbg `48 8B ?? E8` syntax, or code+mask). Scans only committed, executable regions of a module - safely skipping guard pages and holes - and feeds the match straight into a hook via `attach_pattern`.
 
 - **Hook-by-Export-Name** - `attach_export("user32.dll", "MessageBoxW", detour)` resolves a named export (loading the module if needed) and queues an inline hook on the function body in a single call - no manual `GetModuleHandle` / `GetProcAddress` dance.
@@ -129,6 +131,7 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 | v0.9.0  |    ✅ Done | XMM / MXCSR context capture in `MidHook`               |
 | v0.9.0  |    ✅ Done | Control-flow redirect from a `MidHook` handler         |
 | v0.10.0 |    ✅ Done | Call-the-original gateway for VEH / INT3 hooks          |
+| v0.10.0 |    ✅ Done | Symbol-based resolution via `dbghelp` (`resolve_symbol`)|
 | v0.10.0 |    Planned | ARM64 inline hooking                                   |
 
 --
@@ -863,6 +866,34 @@ and `detours_find_function` / `detours_find_function_by_ordinal`. The C++ wrappe
 
 ---
 
+### Symbol-Based Resolution (`dbghelp`)
+
+Direct pointers, export names, and [signatures](#pattern--signature-scanning)
+all fail on a function that is **not exported** - an internal routine, a `static`
+helper, a private `ntdll` chokepoint. When a PDB is available (next to the
+binary, or via a symbol server / `_NT_SYMBOL_PATH`), the Debug Help library can
+map such a name straight to an address. `resolve_symbol` wraps that lookup.
+
+```rust
+use neohook::resolve_symbol;
+
+// With ntdll symbols available, resolve a private, unexported routine by name.
+if let Some(addr) = resolve_symbol("ntdll.dll", "LdrpInitializeProcess") {
+    // feed `addr` straight into DetourTransaction::attach
+    println!("resolved at {addr:p}");
+}
+
+// Even without a PDB, dbghelp synthesizes symbols from the export table, so a
+// well-known export resolves to the same address find_function would return.
+let get_proc = resolve_symbol("kernel32.dll", "GetProcAddress").unwrap();
+```
+
+The module is loaded if necessary, and `dbghelp` (which is single-threaded by
+contract) is serialized through one process-wide lock. The C ABI exposes
+`detours_resolve_symbol(module, symbol)`.
+
+---
+
 ## How It Works - Under the Hood
 
 ### The Problem with Naive Patching
@@ -993,6 +1024,7 @@ neohook/
 │   ├── pe.rs           - Shared bounds-checked PE parsing primitives
 │   ├── scan.rs         - Pattern: signature parsing + memory/module scanning
 │   ├── resolve.rs      - Resolve relative refs (call/jmp/rip) into absolute addresses
+│   ├── symbols.rs      - Symbol-based resolution via dbghelp (resolve_symbol)
 │   ├── delay.rs        - DelayHook: on-load hooks via an ntdll!LdrLoadDll detour
 │   ├── registry.rs     - Process-wide named hook registry (+ unhook_all)
 │   ├── introspect.rs   - Module / PE introspection (modules, exports, imports)

@@ -1135,6 +1135,32 @@ pub unsafe extern "C" fn detours_find_function(
     crate::find_function(module, func).unwrap_or(std::ptr::null())
 }
 
+/// Resolves `symbol` within `module` to its absolute address using `dbghelp`,
+/// covering PDB symbols (when symbols are available) as well as exports - so
+/// non-exported functions can be located by name.
+///
+/// Returns null if either argument is null or not valid UTF-8, `dbghelp` cannot
+/// initialize, the module cannot be found, or the symbol is unknown.
+///
+/// # Safety
+/// `module` and `symbol` must be valid NUL-terminated C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_resolve_symbol(
+    module: *const c_char,
+    symbol: *const c_char,
+) -> *const u8 {
+    if module.is_null() || symbol.is_null() {
+        return std::ptr::null();
+    }
+    let Ok(module) = (unsafe { CStr::from_ptr(module) }).to_str() else {
+        return std::ptr::null();
+    };
+    let Ok(symbol) = (unsafe { CStr::from_ptr(symbol) }).to_str() else {
+        return std::ptr::null();
+    };
+    crate::resolve_symbol(module, symbol).unwrap_or(std::ptr::null())
+}
+
 /// Resolves an exported function by ordinal within a module, loading the module
 /// if it is not already present.
 ///

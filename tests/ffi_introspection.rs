@@ -309,6 +309,33 @@ fn ffi_find_function_by_ordinal_resolves_and_guards() {
     }
 }
 
+// --- resolve_symbol (dbghelp) ------------------------------------------------
+
+#[test]
+fn ffi_resolve_symbol_resolves_export_and_guards() {
+    let module = CString::new("kernel32.dll").unwrap();
+    let symbol = CString::new("GetProcAddress").unwrap();
+    unsafe {
+        // Even without a PDB, dbghelp synthesizes export symbols, so this must
+        // resolve to the same address as the export resolver.
+        let via_sym = detours_resolve_symbol(module.as_ptr(), symbol.as_ptr());
+        let via_export = detours_find_function(module.as_ptr(), symbol.as_ptr());
+        assert!(
+            !via_sym.is_null(),
+            "a known export must resolve via dbghelp"
+        );
+        assert_eq!(via_sym, via_export, "symbol must match the export address");
+
+        // Null / invalid-UTF-8 / unknown guards.
+        assert!(detours_resolve_symbol(ptr::null(), symbol.as_ptr()).is_null());
+        assert!(detours_resolve_symbol(module.as_ptr(), ptr::null()).is_null());
+        assert!(detours_resolve_symbol(invalid_utf8_cstr().as_ptr(), symbol.as_ptr()).is_null());
+        assert!(detours_resolve_symbol(module.as_ptr(), invalid_utf8_cstr().as_ptr()).is_null());
+        let missing = CString::new("NotASymbol_zzz").unwrap();
+        assert!(detours_resolve_symbol(module.as_ptr(), missing.as_ptr()).is_null());
+    }
+}
+
 // --- scanning ----------------------------------------------------------------
 
 #[test]
