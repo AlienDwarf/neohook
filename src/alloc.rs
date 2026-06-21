@@ -274,11 +274,15 @@ impl TrampolineAlloc {
 
 impl Drop for Trampoline {
     fn drop(&mut self) {
-        unsafe {
-            if !self.ptr.is_null() {
-                let _ = VirtualFree(self.ptr as _, 0, MEM_RELEASE);
-            }
+        if self.ptr.is_null() {
+            return;
         }
+        // Do not free immediately: another thread may still be executing inside
+        // this stub (its instruction pointer here, or a return address into it on
+        // the stack). Retire it for quiescence-checked release instead, which only
+        // appends to a quarantine and never suspends a thread or takes the
+        // transaction lock - safe even from a `Drop` during a commit/rollback.
+        crate::reclaim::retire(self.ptr, self.size);
     }
 }
 
@@ -394,6 +398,11 @@ mod tests {
 
             let tramp_ptr = tramp.ptr;
             drop(tramp);
+
+            // Dropping retires the stub into the reclamation quarantine rather than
+            // freeing it immediately (a thread could still be inside it). A reclaim
+            // pass releases it, since nothing is executing in this region.
+            crate::reclaim::reclaim();
 
             let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
             let query = VirtualQuery(

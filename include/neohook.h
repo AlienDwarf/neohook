@@ -1106,6 +1106,16 @@ void detours_cfg_set_enforcement(int32_t mode);
  */
 int32_t detours_cfg_register_valid_target(const uint8_t *entry);
 
+/**
+ * Releases executable stubs (trampolines, gateways, export stubs) retired by
+ * earlier unhooks, once no thread is executing inside them.
+ *
+ * NeoHook does this automatically at the start of every transaction; call it
+ * directly from code that only ever unhooks and never installs again, to bound
+ * the memory held by the reclamation quarantine. See [`crate::reclaim`].
+ */
+void detours_reclaim(void);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus

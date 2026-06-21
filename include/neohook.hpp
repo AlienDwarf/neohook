@@ -252,6 +252,18 @@ namespace neohook
     } // namespace cfg
 
     /**
+     * @brief Releases executable stubs retired by earlier unhooks, once no thread
+     *        is executing inside them.
+     *
+     * Done automatically at the start of every transaction; call it directly from
+     * code that only ever unhooks and never installs again.
+     */
+    inline void reclaim()
+    {
+        detours_reclaim();
+    }
+
+    /**
      * @brief Manages the lifetime of installed hooks.
      *
      * When this object is destroyed, all hooks referenced by the underlying

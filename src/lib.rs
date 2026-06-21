@@ -26,6 +26,7 @@ mod mem;
 mod midhook;
 mod module;
 mod pe;
+mod reclaim;
 mod reentrancy;
 pub mod registry;
 mod resolve;
@@ -54,6 +55,7 @@ pub use crate::module::{
     find_function, find_function_by_ordinal, get_module_handle, get_module_size,
 };
 pub use crate::pe::PeError;
+pub use crate::reclaim::reclaim;
 pub use crate::reentrancy::ReentrancyGuard;
 pub use crate::resolve::{resolve_call_target, resolve_relative, resolve_rip_relative};
 pub use crate::scan::{

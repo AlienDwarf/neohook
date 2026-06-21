@@ -1897,6 +1897,20 @@ fn lock_transaction() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Tries to take the process-wide transaction lock without blocking.
+///
+/// Returns `None` if a transaction currently holds it - including this thread
+/// mid-commit/rollback, where the lock is not reentrant. Used by deferred stub
+/// reclamation ([`crate::reclaim`]) so it can suspend threads only when it is safe
+/// to do so, and otherwise leave the work for a later pass.
+pub(crate) fn try_lock_transaction() -> Option<std::sync::MutexGuard<'static, ()>> {
+    match TRANSACTION_LOCK.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+    }
+}
+
 fn detach_targets_equal(left: DetachTarget, right: DetachTarget) -> bool {
     match (left, right) {
         (DetachTarget::HookPtr(a), DetachTarget::HookPtr(b)) => a == b,

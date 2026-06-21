@@ -94,6 +94,8 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 
 - **RAII Ownership** - The `Vec<Hook>` returned by `commit()` unhooks and restores original memory automatically when dropped.
 
+- **Quiescence-Checked Teardown** - Freeing a trampoline the instant a hook drops would be unsound if another thread were still executing inside it. Instead a dropped stub is *retired* and released only once a thread scan (instruction pointers plus stack return addresses) shows no thread is inside it - otherwise it stays quarantined for a later pass. Reclamation runs automatically at the start of every transaction (a no-op when nothing is pending) and is also exposed as `neohook::reclaim()` for unhook-only workloads.
+
 - **Zero-Boilerplate Macros** - `detour_inline!` and `detour_helper!` install a complete hook with a single expression.
 
 - **C FFI** - Exposes a C ABI with auto-generated headers (`cbindgen`), usable from C, C++, Python (`ctypes`), or any FFI-capable language.
@@ -195,7 +197,7 @@ Add the crate to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-neohook = "0.8.0"
+neohook = "0.10.0"
 ```
 
 ---

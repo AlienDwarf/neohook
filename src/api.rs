@@ -6,6 +6,22 @@ use crate::transaction::{Hook, TransactionCore};
 use std::ffi::{CStr, CString, c_char, c_void};
 use windows_sys::Win32::Foundation::HMODULE;
 
+/// Runs an FFI body, returning `on_panic` instead of letting a panic cross the C
+/// ABI boundary.
+///
+/// A panic unwinding out of an `extern "C"` function aborts the whole host
+/// process. Most of NeoHook's internals return `Result` rather than panicking
+/// (and the relocation engine already contains its own panics), but a deep,
+/// unexpected panic in an engine path - commit, attach, install, teardown - would
+/// otherwise take the host down. Wrapping those entry points converts it into the
+/// function's normal failure value (a null pointer or `0`) instead.
+fn ffi_guard<T>(on_panic: T, body: impl FnOnce() -> T) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(value) => value,
+        Err(_) => on_panic,
+    }
+}
+
 /// High-level wrapper around [`TransactionCore`].
 ///
 /// This type provides an ergonomic transaction-based interface for installing
@@ -30,6 +46,10 @@ impl DetourTransaction {
     /// The returned transaction can be used to register inline or IAT hooks and
     /// then apply them atomically with [`Self::commit`].
     pub fn begin() -> Self {
+        // Opportunistically release stubs retired by earlier teardowns now that
+        // we are on a thread that holds no transaction lock. Cheap no-op when the
+        // quarantine is empty (the common case).
+        crate::reclaim::reclaim();
         Self {
             inner: Some(TransactionCore::begin()),
         }
@@ -371,14 +391,16 @@ pub unsafe extern "C" fn detours_transaction_attach(
     target: *mut u8,
     detour: *const u8,
 ) -> *mut u8 {
-    if tx.is_null() {
-        return std::ptr::null_mut();
-    }
-    let tx_ref = unsafe { &mut *tx };
+    ffi_guard(std::ptr::null_mut(), || {
+        if tx.is_null() {
+            return std::ptr::null_mut();
+        }
+        let tx_ref = unsafe { &mut *tx };
 
-    tx_ref
-        .attach(target, detour)
-        .unwrap_or(std::ptr::null_mut())
+        tx_ref
+            .attach(target, detour)
+            .unwrap_or(std::ptr::null_mut())
+    })
 }
 
 /// Queues a single hook from an opaque hook handle to be detached when the
@@ -400,18 +422,20 @@ pub unsafe extern "C" fn detours_transaction_detach(
     handle: *mut c_void,
     idx: usize,
 ) -> i32 {
-    if tx.is_null() || handle.is_null() {
-        return 0;
-    }
+    ffi_guard(0, || {
+        if tx.is_null() || handle.is_null() {
+            return 0;
+        }
 
-    let tx_ref = unsafe { &mut *tx };
-    tx_ref
-        .inner
-        .as_mut()
-        .ok_or(DetourError::NotStarted)
-        .and_then(|inner| unsafe { inner.detach_handle_index(handle, idx) })
-        .map(|_| 1)
-        .unwrap_or(0)
+        let tx_ref = unsafe { &mut *tx };
+        tx_ref
+            .inner
+            .as_mut()
+            .ok_or(DetourError::NotStarted)
+            .and_then(|inner| unsafe { inner.detach_handle_index(handle, idx) })
+            .map(|_| 1)
+            .unwrap_or(0)
+    })
 }
 
 /// Commits a detour transaction and returns an opaque handle to the installed
@@ -429,14 +453,16 @@ pub unsafe extern "C" fn detours_transaction_detach(
 /// function, regardless of success or failure.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn detours_transaction_commit(tx: *mut DetourTransaction) -> *mut c_void {
-    if tx.is_null() {
-        return std::ptr::null_mut();
-    }
-    let tx_box = unsafe { Box::from_raw(tx) };
-    match tx_box.commit() {
-        Ok(v) => Box::into_raw(Box::new(v)) as *mut c_void,
-        Err(_) => std::ptr::null_mut(),
-    }
+    ffi_guard(std::ptr::null_mut(), || {
+        if tx.is_null() {
+            return std::ptr::null_mut();
+        }
+        let tx_box = unsafe { Box::from_raw(tx) };
+        match tx_box.commit() {
+            Ok(v) => Box::into_raw(Box::new(v)) as *mut c_void,
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
 }
 
 /// Returns the number of installed hooks stored in an opaque hook handle.
@@ -543,12 +569,14 @@ pub unsafe extern "C" fn detours_handle_is_enabled(handle: *mut c_void, idx: usi
 /// `detours_transaction_commit()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn detours_handle_unhook_and_free(handle: *mut c_void) -> i32 {
-    if handle.is_null() {
-        return 0;
-    }
-    let _vec_box = unsafe { Box::from_raw(handle as *mut Vec<Hook>) };
-    // Dropping the vector drops all hooks, which triggers unhooking via RAII.
-    1
+    ffi_guard(0, || {
+        if handle.is_null() {
+            return 0;
+        }
+        let _vec_box = unsafe { Box::from_raw(handle as *mut Vec<Hook>) };
+        // Dropping the vector drops all hooks, which triggers unhooking via RAII.
+        1
+    })
 }
 
 /// Attaches an IAT detour to the given transaction.
@@ -566,31 +594,33 @@ pub unsafe extern "C" fn detours_transaction_attach_iat(
     target_func: *const std::ffi::c_char,
     detour: *const u8,
 ) -> i32 {
-    if tx.is_null() || target_dll.is_null() || target_func.is_null() || detour.is_null() {
-        return 0;
-    }
+    ffi_guard(0, || {
+        if tx.is_null() || target_dll.is_null() || target_func.is_null() || detour.is_null() {
+            return 0;
+        }
 
-    let tx_ref = unsafe { &mut *tx };
+        let tx_ref = unsafe { &mut *tx };
 
-    let target_dll = match unsafe { std::ffi::CStr::from_ptr(target_dll) }.to_str() {
-        Ok(s) => s,
-        Err(_) => return 0,
-    };
+        let target_dll = match unsafe { std::ffi::CStr::from_ptr(target_dll) }.to_str() {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
 
-    let target_func = match unsafe { std::ffi::CStr::from_ptr(target_func) }.to_str() {
-        Ok(s) => s,
-        Err(_) => return 0,
-    };
+        let target_func = match unsafe { std::ffi::CStr::from_ptr(target_func) }.to_str() {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
 
-    tx_ref
-        .attach_iat(
-            h_module as windows_sys::Win32::Foundation::HMODULE,
-            target_dll,
-            target_func,
-            detour,
-        )
-        .map(|_| 1)
-        .unwrap_or(0)
+        tx_ref
+            .attach_iat(
+                h_module as windows_sys::Win32::Foundation::HMODULE,
+                target_dll,
+                target_func,
+                detour,
+            )
+            .map(|_| 1)
+            .unwrap_or(0)
+    })
 }
 
 /// Attaches an EAT detour to the given transaction.
@@ -609,25 +639,27 @@ pub unsafe extern "C" fn detours_transaction_attach_eat(
     target_func: *const std::ffi::c_char,
     detour: *const u8,
 ) -> i32 {
-    if tx.is_null() || target_func.is_null() || detour.is_null() {
-        return 0;
-    }
+    ffi_guard(0, || {
+        if tx.is_null() || target_func.is_null() || detour.is_null() {
+            return 0;
+        }
 
-    let tx_ref = unsafe { &mut *tx };
+        let tx_ref = unsafe { &mut *tx };
 
-    let target_func = match unsafe { std::ffi::CStr::from_ptr(target_func) }.to_str() {
-        Ok(s) => s,
-        Err(_) => return 0,
-    };
+        let target_func = match unsafe { std::ffi::CStr::from_ptr(target_func) }.to_str() {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
 
-    tx_ref
-        .attach_eat(
-            h_module as windows_sys::Win32::Foundation::HMODULE,
-            target_func,
-            detour,
-        )
-        .map(|_| 1)
-        .unwrap_or(0)
+        tx_ref
+            .attach_eat(
+                h_module as windows_sys::Win32::Foundation::HMODULE,
+                target_func,
+                detour,
+            )
+            .map(|_| 1)
+            .unwrap_or(0)
+    })
 }
 
 /// Attaches a VTable detour to the given transaction.
@@ -647,15 +679,17 @@ pub unsafe extern "C" fn detours_transaction_attach_vtable(
     index: usize,
     detour: *const u8,
 ) -> *mut u8 {
-    if tx.is_null() || vtable.is_null() || detour.is_null() {
-        return std::ptr::null_mut();
-    }
+    ffi_guard(std::ptr::null_mut(), || {
+        if tx.is_null() || vtable.is_null() || detour.is_null() {
+            return std::ptr::null_mut();
+        }
 
-    let tx_ref = unsafe { &mut *tx };
+        let tx_ref = unsafe { &mut *tx };
 
-    tx_ref
-        .attach_vtable(vtable, index, detour)
-        .unwrap_or(std::ptr::null_mut())
+        tx_ref
+            .attach_vtable(vtable, index, detour)
+            .unwrap_or(std::ptr::null_mut())
+    })
 }
 
 /// Attaches a per-instance VTable detour to the given transaction.
@@ -675,15 +709,17 @@ pub unsafe extern "C" fn detours_transaction_attach_vtable_instance(
     vtable_len: usize,
     detour: *const u8,
 ) -> *mut u8 {
-    if tx.is_null() || object_vptr.is_null() || detour.is_null() {
-        return std::ptr::null_mut();
-    }
+    ffi_guard(std::ptr::null_mut(), || {
+        if tx.is_null() || object_vptr.is_null() || detour.is_null() {
+            return std::ptr::null_mut();
+        }
 
-    let tx_ref = unsafe { &mut *tx };
+        let tx_ref = unsafe { &mut *tx };
 
-    tx_ref
-        .attach_vtable_instance(object_vptr, index, vtable_len, detour)
-        .unwrap_or(std::ptr::null_mut())
+        tx_ref
+            .attach_vtable_instance(object_vptr, index, vtable_len, detour)
+            .unwrap_or(std::ptr::null_mut())
+    })
 }
 
 /// Suspends all threads in the current process except the calling thread and
@@ -1289,20 +1325,22 @@ pub unsafe extern "C" fn detours_transaction_attach_pattern(
     pattern: *const c_char,
     detour: *const u8,
 ) -> *mut u8 {
-    if tx.is_null() || module.is_null() || pattern.is_null() {
-        return std::ptr::null_mut();
-    }
-    let Ok(module) = (unsafe { CStr::from_ptr(module) }).to_str() else {
-        return std::ptr::null_mut();
-    };
-    let Ok(pattern) = (unsafe { CStr::from_ptr(pattern) }).to_str() else {
-        return std::ptr::null_mut();
-    };
+    ffi_guard(std::ptr::null_mut(), || {
+        if tx.is_null() || module.is_null() || pattern.is_null() {
+            return std::ptr::null_mut();
+        }
+        let Ok(module) = (unsafe { CStr::from_ptr(module) }).to_str() else {
+            return std::ptr::null_mut();
+        };
+        let Ok(pattern) = (unsafe { CStr::from_ptr(pattern) }).to_str() else {
+            return std::ptr::null_mut();
+        };
 
-    let tx_ref = unsafe { &mut *tx };
-    tx_ref
-        .attach_pattern(module, pattern, detour)
-        .unwrap_or(std::ptr::null_mut())
+        let tx_ref = unsafe { &mut *tx };
+        tx_ref
+            .attach_pattern(module, pattern, detour)
+            .unwrap_or(std::ptr::null_mut())
+    })
 }
 
 /// Resolves an exported function by name and queues an inline hook on it.
@@ -1326,20 +1364,22 @@ pub unsafe extern "C" fn detours_transaction_attach_export(
     func: *const c_char,
     detour: *const u8,
 ) -> *mut u8 {
-    if tx.is_null() || module.is_null() || func.is_null() {
-        return std::ptr::null_mut();
-    }
-    let Ok(module) = (unsafe { CStr::from_ptr(module) }).to_str() else {
-        return std::ptr::null_mut();
-    };
-    let Ok(func) = (unsafe { CStr::from_ptr(func) }).to_str() else {
-        return std::ptr::null_mut();
-    };
+    ffi_guard(std::ptr::null_mut(), || {
+        if tx.is_null() || module.is_null() || func.is_null() {
+            return std::ptr::null_mut();
+        }
+        let Ok(module) = (unsafe { CStr::from_ptr(module) }).to_str() else {
+            return std::ptr::null_mut();
+        };
+        let Ok(func) = (unsafe { CStr::from_ptr(func) }).to_str() else {
+            return std::ptr::null_mut();
+        };
 
-    let tx_ref = unsafe { &mut *tx };
-    tx_ref
-        .attach_export(module, func, detour)
-        .unwrap_or(std::ptr::null_mut())
+        let tx_ref = unsafe { &mut *tx };
+        tx_ref
+            .attach_export(module, func, detour)
+            .unwrap_or(std::ptr::null_mut())
+    })
 }
 
 // ----------------- FFI Entry Points: VEH (hardware breakpoint) hooking -------
@@ -1359,10 +1399,12 @@ pub unsafe extern "C" fn detours_veh_install(
     target: *const u8,
     detour: *const u8,
 ) -> *mut crate::veh::VehHook {
-    match unsafe { crate::veh::VehHook::install(target, detour) } {
-        Ok(hook) => Box::into_raw(Box::new(hook)),
-        Err(_) => std::ptr::null_mut(),
-    }
+    ffi_guard(std::ptr::null_mut(), || {
+        match unsafe { crate::veh::VehHook::install(target, detour) } {
+            Ok(hook) => Box::into_raw(Box::new(hook)),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
 }
 
 /// Installs a VEH hook that also exposes a callable gateway to the original
@@ -1382,10 +1424,12 @@ pub unsafe extern "C" fn detours_veh_install_with_original(
     target: *const u8,
     detour: *const u8,
 ) -> *mut crate::veh::VehHook {
-    match unsafe { crate::veh::VehHook::install_with_original(target, detour) } {
-        Ok(hook) => Box::into_raw(Box::new(hook)),
-        Err(_) => std::ptr::null_mut(),
-    }
+    ffi_guard(std::ptr::null_mut(), || {
+        match unsafe { crate::veh::VehHook::install_with_original(target, detour) } {
+            Ok(hook) => Box::into_raw(Box::new(hook)),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
 }
 
 /// Returns the callable original-function pointer for a VEH hook installed with
@@ -1443,13 +1487,15 @@ pub unsafe extern "C" fn detours_midhook_install(
     target: *const u8,
     handler: crate::midhook::MidHookHandler,
 ) -> *mut crate::midhook::MidHook {
-    if target.is_null() {
-        return std::ptr::null_mut();
-    }
-    match unsafe { crate::midhook::MidHook::install(target, handler) } {
-        Ok(hook) => Box::into_raw(Box::new(hook)),
-        Err(_) => std::ptr::null_mut(),
-    }
+    ffi_guard(std::ptr::null_mut(), || {
+        if target.is_null() {
+            return std::ptr::null_mut();
+        }
+        match unsafe { crate::midhook::MidHook::install(target, handler) } {
+            Ok(hook) => Box::into_raw(Box::new(hook)),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
 }
 
 /// Removes a mid-function detour installed by `detours_midhook_install` and
@@ -1493,10 +1539,12 @@ pub unsafe extern "C" fn detours_int3_install(
     target: *const u8,
     detour: *const u8,
 ) -> *mut crate::int3::Int3Hook {
-    match unsafe { crate::int3::Int3Hook::install(target, detour) } {
-        Ok(hook) => Box::into_raw(Box::new(hook)),
-        Err(_) => std::ptr::null_mut(),
-    }
+    ffi_guard(std::ptr::null_mut(), || {
+        match unsafe { crate::int3::Int3Hook::install(target, detour) } {
+            Ok(hook) => Box::into_raw(Box::new(hook)),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
 }
 
 /// Installs an INT3 hook that also exposes a callable gateway to the original
@@ -1516,10 +1564,12 @@ pub unsafe extern "C" fn detours_int3_install_with_original(
     target: *const u8,
     detour: *const u8,
 ) -> *mut crate::int3::Int3Hook {
-    match unsafe { crate::int3::Int3Hook::install_with_original(target, detour) } {
-        Ok(hook) => Box::into_raw(Box::new(hook)),
-        Err(_) => std::ptr::null_mut(),
-    }
+    ffi_guard(std::ptr::null_mut(), || {
+        match unsafe { crate::int3::Int3Hook::install_with_original(target, detour) } {
+            Ok(hook) => Box::into_raw(Box::new(hook)),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
 }
 
 /// Returns the callable original-function pointer for an INT3 hook installed
@@ -1673,8 +1723,10 @@ pub unsafe extern "C" fn detours_delay_unhook(hook: *mut crate::delay::DelayHook
 /// with `detours_watchdog_destroy`. An `interval_ms` of `0` is treated as 1 ms.
 #[unsafe(no_mangle)]
 pub extern "C" fn detours_watchdog_create(interval_ms: u32) -> *mut crate::watchdog::Watchdog {
-    let interval = std::time::Duration::from_millis(interval_ms.max(1) as u64);
-    Box::into_raw(Box::new(crate::watchdog::Watchdog::with_interval(interval)))
+    ffi_guard(std::ptr::null_mut(), || {
+        let interval = std::time::Duration::from_millis(interval_ms.max(1) as u64);
+        Box::into_raw(Box::new(crate::watchdog::Watchdog::with_interval(interval)))
+    })
 }
 
 /// Snapshots `len` bytes at `target` and guards them, returning a non-zero guard
@@ -1873,6 +1925,21 @@ pub extern "C" fn detours_cfg_set_enforcement(mode: i32) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn detours_cfg_register_valid_target(entry: *const u8) -> i32 {
     crate::cfg::register_valid_target(entry) as i32
+}
+
+// ---------------------------------------------------------------------------
+// Deferred stub reclamation
+// ---------------------------------------------------------------------------
+
+/// Releases executable stubs (trampolines, gateways, export stubs) retired by
+/// earlier unhooks, once no thread is executing inside them.
+///
+/// NeoHook does this automatically at the start of every transaction; call it
+/// directly from code that only ever unhooks and never installs again, to bound
+/// the memory held by the reclamation quarantine. See [`crate::reclaim`].
+#[unsafe(no_mangle)]
+pub extern "C" fn detours_reclaim() {
+    crate::reclaim::reclaim();
 }
 
 #[cfg(test)]
