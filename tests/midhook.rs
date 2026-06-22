@@ -211,11 +211,11 @@ unsafe extern "system" fn redirect_handler(ctx: *mut HookContext) {
     let ctx = unsafe { &mut *ctx };
     #[cfg(target_arch = "x86_64")]
     {
-        ctx.redirect_rip = redir_replacement as usize as u64;
+        ctx.redirect_rip = redir_replacement as *const () as usize as u64;
     }
     #[cfg(target_arch = "x86")]
     {
-        ctx.redirect_eip = redir_replacement as usize as u32;
+        ctx.redirect_eip = redir_replacement as *const () as usize as u32;
     }
 }
 
