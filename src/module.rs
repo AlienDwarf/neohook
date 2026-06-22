@@ -74,6 +74,44 @@ pub fn find_function(module_name: &str, function_name: &str) -> Option<*const u8
     func_address.map(|addr| addr as *const u8)
 }
 
+/// Resolves an exported function by its ordinal rather than its name.
+///
+/// Loads the module if it is not already present (mirroring [`find_function`]),
+/// then resolves the export through `GetProcAddress` using the
+/// `MAKEINTRESOURCE` convention: when the high word of the name pointer is zero,
+/// the low word is treated as the ordinal.
+///
+/// # Parameters
+/// - `module_name`: The module (DLL) file name, e.g. `"kernel32.dll"`.
+/// - `ordinal`: The export ordinal to resolve.
+/// # Returns
+/// `Some(*const u8)` pointing at the function, or `None` if the module could
+/// not be found/loaded or the ordinal is not exported.
+pub fn find_function_by_ordinal(module_name: &str, ordinal: u16) -> Option<*const u8> {
+    let module_name_wide: Vec<u16> = module_name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let h_module = unsafe {
+        let mut h = GetModuleHandleW(module_name_wide.as_ptr());
+        if h.is_null() {
+            h = LoadLibraryW(module_name_wide.as_ptr());
+        }
+        h
+    };
+
+    if h_module.is_null() {
+        return None;
+    }
+
+    // GetProcAddress accepts an ordinal when the pointer's high word is zero
+    // (the MAKEINTRESOURCE convention). The low word carries the ordinal value.
+    let func_address = unsafe { GetProcAddress(h_module, ordinal as usize as *const u8) };
+
+    func_address.map(|addr| addr as *const u8)
+}
+
 /// Gets a (pseudo) handle to a loaded module by its name. This is a simple wrapper around `GetModuleHandleW` that returns an Option type for better error handling.
 /// # Parameters
 /// - `module_name`: The name of the module (DLL) to get the handle for. This should be the filename of the module, e.g., "kernel32.dll".
@@ -156,6 +194,18 @@ mod tests {
     fn get_module_handle_returns_none_for_missing_module() {
         let handle = module::get_module_handle("fantasy_dll_999.dll");
         assert!(handle.is_none(), "missing DLL should return None");
+    }
+
+    #[test]
+    fn find_function_by_ordinal_returns_none_for_missing_module() {
+        let addr = module::find_function_by_ordinal("fantasy_dll_999.dll", 1);
+        assert!(addr.is_none(), "missing DLL should return None");
+    }
+
+    #[test]
+    fn find_function_by_ordinal_returns_none_for_absurd_ordinal() {
+        let addr = module::find_function_by_ordinal("kernel32.dll", u16::MAX);
+        assert!(addr.is_none(), "an out-of-range ordinal should not resolve");
     }
 
     #[test]

@@ -57,6 +57,7 @@ pub unsafe fn virtual_protect_same_execute(
 ///
 /// # Safety
 /// The caller must ensure that `target` and `src` are valid pointers
+/// Atomicity is only guaranteed if len is 1 byte
 pub unsafe fn write_memory_atomic(target: *mut u8, src: *const u8, len: usize) -> Option<Vec<u8>> {
     if target.is_null() || src.is_null() || len == 0 {
         return None;

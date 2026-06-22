@@ -99,6 +99,11 @@ impl VTableHook {
             return Err(map_err(InternalVTableHookError::NullDetour));
         }
 
+        // The slot is dispatched through a CFG-guarded indirect call; mark the
+        // detour as a valid call target so dispatch holds under strict CFG /
+        // export suppression. No-op otherwise and when CFG is not enforced.
+        crate::cfg::register_valid_target(detour);
+
         let slot = unsafe { vtable.add(index) };
         let slot_size = std::mem::size_of::<*mut u8>();
 
@@ -182,6 +187,14 @@ impl VTableHook {
 
     fn perform_unhook(&self) -> Result<(), DetourError> {
         Self::write_slot(self.slot, self.original_ptr)
+    }
+
+    pub(crate) fn detach_finalize(&mut self) {
+        if self.enabled {
+            let _ = self.disable();
+        }
+        self.active = false;
+        self.enabled = false;
     }
 
     /// Writes `value` into `slot`, flipping page protection around the write.
@@ -285,6 +298,11 @@ impl VTableInstanceHook {
         if index >= vtable_len {
             return Err(map_err(InternalVTableHookError::IndexOutOfRange));
         }
+
+        // The cloned slot is dispatched through a CFG-guarded indirect call; mark
+        // the detour as a valid call target so dispatch holds under strict CFG /
+        // export suppression. No-op otherwise and when CFG is not enforced.
+        crate::cfg::register_valid_target(detour);
 
         let original_vtable = unsafe { *object_vptr };
         if original_vtable.is_null() {
@@ -477,6 +495,14 @@ impl VTableInstanceHook {
         self.cloned_vtable = std::ptr::null_mut();
 
         Ok(())
+    }
+
+    pub(crate) fn detach_finalize(&mut self) {
+        if self.active {
+            let _ = self.perform_unhook();
+        }
+        self.active = false;
+        self.enabled = false;
     }
 }
 

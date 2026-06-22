@@ -89,6 +89,11 @@ pub enum PendingHook {
         target_func: String,
         detour: *const u8,
     },
+    Eat {
+        module: HMODULE,
+        target_func: String,
+        detour: *const u8,
+    },
     Vtable {
         vtable: *mut *mut u8,
         index: usize,
@@ -100,6 +105,22 @@ pub enum PendingHook {
         index: usize,
         detour: *const u8,
     },
+    Detach(DetachTarget),
+}
+
+#[derive(Clone, Copy)]
+pub enum DetachTarget {
+    HookPtr(*mut Hook),
+    HandleIndex {
+        handle: *mut core::ffi::c_void,
+        index: usize,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct AppliedDetach {
+    target: DetachTarget,
+    was_enabled: bool,
 }
 
 /// Represents an installed detour managed by NeoHook.
@@ -110,6 +131,7 @@ pub enum PendingHook {
 pub enum Hook {
     Inline(InlineHook),
     Iat(IatHook),
+    Eat(EatHook),
     Vtable(VtableHook),
     VtableInstance(VtableInstanceHook),
 }
@@ -124,6 +146,7 @@ impl Hook {
         match self {
             Hook::Inline(h) => h.original_ptr(),
             Hook::Iat(h) => h.original_ptr,
+            Hook::Eat(h) => h.original_ptr(),
             Hook::Vtable(h) => h.original_ptr(),
             Hook::VtableInstance(h) => h.original_ptr(),
         }
@@ -134,6 +157,7 @@ impl Hook {
         match self {
             Hook::Inline(h) => h.unhook(),
             Hook::Iat(h) => h.unhook(),
+            Hook::Eat(h) => h.unhook(),
             Hook::Vtable(h) => h.unhook(),
             Hook::VtableInstance(h) => h.unhook(),
         }
@@ -144,6 +168,7 @@ impl Hook {
         match self {
             Hook::Inline(h) => h.is_enabled(),
             Hook::Iat(h) => h.is_enabled(),
+            Hook::Eat(h) => h.is_enabled(),
             Hook::Vtable(h) => h.is_enabled(),
             Hook::VtableInstance(h) => h.is_enabled(),
         }
@@ -155,6 +180,7 @@ impl Hook {
         match self {
             Hook::Inline(h) => h.enable(),
             Hook::Iat(h) => h.enable(),
+            Hook::Eat(h) => h.enable(),
             Hook::Vtable(h) => h.enable(),
             Hook::VtableInstance(h) => h.enable(),
         }
@@ -166,8 +192,34 @@ impl Hook {
         match self {
             Hook::Inline(h) => h.disable(),
             Hook::Iat(h) => h.disable(),
+            Hook::Eat(h) => h.disable(),
             Hook::Vtable(h) => h.disable(),
             Hook::VtableInstance(h) => h.disable(),
+        }
+    }
+
+    pub(crate) fn detach_prepare(&mut self) -> Result<bool, DetourError> {
+        let was_enabled = self.is_enabled();
+        if was_enabled {
+            self.disable()?;
+        }
+        Ok(was_enabled)
+    }
+
+    pub(crate) fn detach_rollback(&mut self, was_enabled: bool) -> Result<(), DetourError> {
+        if was_enabled {
+            self.enable()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn detach_finalize(&mut self) {
+        match self {
+            Hook::Inline(h) => h.detach_finalize(),
+            Hook::Iat(h) => h.detach_finalize(),
+            Hook::Eat(h) => h.detach_finalize(),
+            Hook::Vtable(h) => h.detach_finalize(),
+            Hook::VtableInstance(h) => h.detach_finalize(),
         }
     }
 }
@@ -300,6 +352,15 @@ impl InlineHook {
         }
         Ok(())
     }
+
+    fn detach_finalize(&mut self) {
+        if self.enabled {
+            let _ = self.disable();
+        }
+        unregister_managed_gateway(self.trampoline.ptr);
+        self.active = false;
+        self.enabled = false;
+    }
 }
 
 impl Drop for InlineHook {
@@ -384,6 +445,14 @@ impl IatHook {
             Ok(())
         }
     }
+
+    fn detach_finalize(&mut self) {
+        if self.enabled {
+            let _ = self.disable();
+        }
+        self.active = false;
+        self.enabled = false;
+    }
 }
 
 impl Drop for IatHook {
@@ -392,6 +461,97 @@ impl Drop for IatHook {
             // auto unhook when dropped, best effort, ignore errors
             let _ = self.perform_unhook();
         }
+    }
+}
+
+/// Installed Export Address Table (EAT) hook.
+///
+/// Patches a single export slot in a module's EAT so consumers that resolve the
+/// export *after* installation (e.g. via `GetProcAddress`) are redirected to the
+/// detour. Like [`IatHook`], it changes a lookup table rather than the function
+/// body, so code that already cached the resolved address is unaffected.
+///
+/// On x86_64 an out-of-range detour is reached through a small owned jump stub,
+/// which is released when the hook is dropped or unhooked.
+#[derive(Debug)]
+pub struct EatHook {
+    pub module: HMODULE,
+    pub func_name: String,
+    slot_ptr: *mut u32,
+    original_rva: u32,
+    detour_rva: u32,
+    original_ptr: *mut u8,
+    /// Jump stub keeping an out-of-range detour reachable. Only held so its
+    /// `Drop` releases the allocation when the hook goes away.
+    #[allow(dead_code)]
+    stub: Option<crate::alloc::Trampoline>,
+    active: bool,
+    /// Whether the export slot currently points at the detour.
+    enabled: bool,
+}
+
+impl EatHook {
+    /// Returns the resolved address of the original export.
+    pub fn original_ptr(&self) -> *const u8 {
+        self.original_ptr
+    }
+
+    /// Returns whether the export slot currently points at the detour.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Restores the original export RVA without releasing the stub, so the hook
+    /// can be re-enabled later.
+    pub fn disable(&mut self) -> Result<(), DetourError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        unsafe { crate::eat::EatHook::write_export_rva(self.slot_ptr, self.original_rva)? };
+        self.enabled = false;
+        Ok(())
+    }
+
+    /// Re-points the export slot at the detour after a [`Self::disable`].
+    pub fn enable(&mut self) -> Result<(), DetourError> {
+        if self.enabled {
+            return Ok(());
+        }
+        unsafe { crate::eat::EatHook::write_export_rva(self.slot_ptr, self.detour_rva)? };
+        self.enabled = true;
+        Ok(())
+    }
+
+    /// Unhooks this EAT hook by restoring the original export RVA. The jump stub
+    /// (if any) is released when the guard is dropped.
+    pub fn unhook(mut self) -> Result<(), DetourError> {
+        self.perform_unhook()?;
+        self.active = false;
+        Ok(())
+    }
+
+    fn perform_unhook(&self) -> Result<(), DetourError> {
+        unsafe { crate::eat::EatHook::write_export_rva(self.slot_ptr, self.original_rva)? };
+        Ok(())
+    }
+
+    fn detach_finalize(&mut self) {
+        if self.enabled {
+            let _ = self.disable();
+        }
+        self.active = false;
+        self.enabled = false;
+    }
+}
+
+impl Drop for EatHook {
+    fn drop(&mut self) {
+        if self.active {
+            // auto unhook when dropped, best effort, ignore errors
+            let _ = self.perform_unhook();
+        }
+        // `stub` is released here via its own Drop, after the slot no longer
+        // points at it.
     }
 }
 
@@ -537,6 +697,32 @@ impl TransactionCore {
     /// The caller must ensure that `target` and `detour` are valid pointers. NeoHook performs basic validation but does not guarantee that the pointers are valid or that the memory they point to is properly aligned or accessible. Invalid pointers may cause undefined behavior, including crashes.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn attach(&mut self, target: *mut u8, detour: *const u8) -> Result<*mut u8, DetourError> {
+        self.attach_inner(target, detour, true)
+    }
+
+    /// Queues an inline hook at the **exact** `target` address, without first
+    /// resolving leading jump stubs / import thunks.
+    ///
+    /// Entry-point hooking ([`Self::attach`]) follows thunks so a stub address
+    /// resolves to the real function body. Mid-function / arbitrary-address
+    /// detours must instead patch precisely where the caller asked, even if the
+    /// bytes there happen to look like a jump. Used by [`crate::midhook`].
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub(crate) fn attach_exact(
+        &mut self,
+        target: *mut u8,
+        detour: *const u8,
+    ) -> Result<*mut u8, DetourError> {
+        self.attach_inner(target, detour, false)
+    }
+
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    fn attach_inner(
+        &mut self,
+        mut target: *mut u8,
+        detour: *const u8,
+        follow_thunks: bool,
+    ) -> Result<*mut u8, DetourError> {
         if !self.is_pending {
             return Err(DetourError::NotStarted);
         }
@@ -547,7 +733,7 @@ impl TransactionCore {
 
         // If the target function is a managed gateway, we use a special hooking method that does not require disassembly or stolen bytes, as the gateway is designed to be overwritten with a jump to the trampoline. This allows us to hook methods that would otherwise be difficult or impossible to hook.
         // The trampoline will contain a stub that jumps to the original target after executing the detour, allowing for proper chaining of hooks
-        if is_managed_gateway(target) {
+        if follow_thunks && is_managed_gateway(target) {
             let previous_target = unsafe {
                 read_managed_gateway_target(target as *const u8)
                     .ok_or(DetourError::InvalidParameter)?
@@ -598,6 +784,15 @@ impl TransactionCore {
 
             self.pending_hooks.push(PendingHook::Inline(data));
             return Ok(gateway);
+        }
+
+        // Entry-point hooks resolve leading jump stubs to the real function;
+        // exact (mid-function) hooks must patch precisely where requested.
+        if follow_thunks {
+            target = unsafe { crate::detour_code_from_pointer(target.cast_const()) };
+            if target.is_null() {
+                return Err(DetourError::InvalidParameter);
+            }
         }
 
         // --- architecture ---
@@ -753,6 +948,77 @@ impl TransactionCore {
         Ok(())
     }
 
+    /// Registers an EAT (Export Address Table) hook to be installed when the
+    /// transaction is committed.
+    ///
+    /// Redirects the named export of `h_module` to `detour`. Unlike an IAT hook,
+    /// which only affects one caller module, this redirects every consumer that
+    /// resolves the export *after* commit (e.g. through `GetProcAddress`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(DetourError::NotStarted)` if the transaction is no longer
+    /// pending.
+    ///
+    /// Returns an error if the module is invalid, the export cannot be found, or
+    /// the export is a forwarder (which has no code slot to redirect).
+    ///
+    /// # Safety
+    /// The caller must ensure that `h_module` is a valid module handle, that
+    /// `target_func` names an export of that module, and that `detour` is a
+    /// valid function pointer with an ABI/signature compatible with the export.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn attach_eat(
+        &mut self,
+        h_module: HMODULE,
+        target_func: &str,
+        detour: *const u8,
+    ) -> Result<(), DetourError> {
+        if !self.is_pending {
+            return Err(DetourError::NotStarted);
+        }
+
+        if h_module.is_null() || detour.is_null() {
+            return Err(DetourError::InvalidParameter);
+        }
+
+        // Pointer validity check (mirrors attach_iat): the module base must be
+        // readable before we attempt to parse its headers.
+        unsafe {
+            let mut mbi: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION =
+                std::mem::zeroed();
+            let res = windows_sys::Win32::System::Memory::VirtualQuery(
+                h_module as *const _,
+                &mut mbi,
+                std::mem::size_of::<windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION>(),
+            );
+
+            if res == 0
+                || (mbi.Protect
+                    & (windows_sys::Win32::System::Memory::PAGE_READONLY
+                        | windows_sys::Win32::System::Memory::PAGE_READWRITE
+                        | windows_sys::Win32::System::Memory::PAGE_EXECUTE_READ
+                        | windows_sys::Win32::System::Memory::PAGE_EXECUTE_READWRITE))
+                    == 0
+            {
+                return Err(DetourError::InvalidParameter);
+            }
+        }
+
+        // Validate up front that the export exists and is hookable (not a
+        // forwarder), so we fail before any thread is suspended.
+        unsafe {
+            crate::eat::EatHook::find_export_address(h_module, target_func)?;
+        }
+
+        self.pending_hooks.push(PendingHook::Eat {
+            module: h_module,
+            target_func: target_func.to_string(),
+            detour,
+        });
+        Ok(())
+    }
+
     /// Queues a VTable hook for a specific slot.
     ///
     /// The slot is validated and patched during commit. The previous slot value
@@ -868,6 +1134,63 @@ impl TransactionCore {
         Ok(original_ptr)
     }
 
+    /// Queues an installed hook to be detached when the transaction commits.
+    ///
+    /// The hook is only disabled during the commit phase. If a later operation
+    /// in the same transaction fails, the hook is re-enabled before the error is
+    /// returned. On successful commit the hook guard is made inert, so dropping
+    /// it afterwards is a no-op.
+    pub fn detach(&mut self, hook: &mut Hook) -> Result<(), DetourError> {
+        if !self.is_pending {
+            return Err(DetourError::NotStarted);
+        }
+
+        let hook_ptr = hook as *mut Hook;
+        if hook_ptr.is_null() || self.pending_detach_exists(DetachTarget::HookPtr(hook_ptr)) {
+            return Err(DetourError::InvalidParameter);
+        }
+
+        self.pending_hooks
+            .push(PendingHook::Detach(DetachTarget::HookPtr(hook_ptr)));
+        Ok(())
+    }
+
+    /// Queues a hook stored inside an FFI handle to be detached on commit.
+    ///
+    /// The handle remains valid. On success, the selected hook is removed from
+    /// the handle's hook list and all remaining hooks keep their relative order.
+    ///
+    /// # Safety
+    ///
+    /// `handle` must be a valid handle previously returned by
+    /// `detours_transaction_commit()`.
+    pub unsafe fn detach_handle_index(
+        &mut self,
+        handle: *mut core::ffi::c_void,
+        index: usize,
+    ) -> Result<(), DetourError> {
+        if !self.is_pending {
+            return Err(DetourError::NotStarted);
+        }
+        if handle.is_null()
+            || self.pending_detach_exists(DetachTarget::HandleIndex { handle, index })
+        {
+            return Err(DetourError::InvalidParameter);
+        }
+
+        let hooks = unsafe { &*(handle as *mut Vec<Hook>) };
+        if index >= hooks.len() {
+            return Err(DetourError::InvalidParameter);
+        }
+
+        self.pending_hooks
+            .push(PendingHook::Detach(DetachTarget::HandleIndex {
+                handle,
+                index,
+            }));
+        Ok(())
+    }
+
     // Commits the current detour transaction and returns the installed hooks.
     ///
     /// Pending inline hooks are installed after tracked threads have been checked
@@ -902,6 +1225,7 @@ impl TransactionCore {
 
         let pending = std::mem::take(&mut self.pending_hooks);
         let mut installed: Vec<Hook> = Vec::new();
+        let mut detached: Vec<AppliedDetach> = Vec::new();
 
         // Apply hooks
         for (hook_index, hook) in pending.into_iter().enumerate() {
@@ -912,6 +1236,7 @@ impl TransactionCore {
                     // check if any thread is executing in the range of the original bytes, and if so, redirect them to the trampoline before we overwrite the code
                     for h_thread in thread_handles {
                         if let Err(e) = self.redirect_rip_relative_threads(h_thread, &data) {
+                            rollback_detaches(&mut detached);
                             self.rollback(&mut installed);
                             self.cleanup_threads();
                             return Err(DetourError::CommitFailed {
@@ -925,6 +1250,7 @@ impl TransactionCore {
                     match self.apply_inline_hook(data) {
                         Ok(inst) => installed.push(Hook::Inline(inst)),
                         Err(e) => {
+                            rollback_detaches(&mut detached);
                             self.rollback(&mut installed);
                             self.cleanup_threads();
                             return Err(DetourError::CommitFailed {
@@ -959,11 +1285,43 @@ impl TransactionCore {
                             }));
                         }
                         Err(err) => {
+                            rollback_detaches(&mut detached);
                             self.rollback(&mut installed);
                             self.cleanup_threads();
                             return Err(DetourError::CommitFailed {
                                 index: hook_index,
                                 kind: HookKind::Iat,
+                                source: Box::new(err.into()),
+                            });
+                        }
+                    }
+                },
+                PendingHook::Eat {
+                    module,
+                    target_func,
+                    detour,
+                } => unsafe {
+                    match crate::eat::EatHook::hook_export(module, &target_func, detour) {
+                        Ok(inst) => {
+                            installed.push(Hook::Eat(EatHook {
+                                module,
+                                func_name: target_func,
+                                slot_ptr: inst.slot_ptr,
+                                original_rva: inst.original_rva,
+                                detour_rva: inst.detour_rva,
+                                original_ptr: inst.original_ptr,
+                                stub: inst.stub,
+                                active: true,
+                                enabled: true,
+                            }));
+                        }
+                        Err(err) => {
+                            rollback_detaches(&mut detached);
+                            self.rollback(&mut installed);
+                            self.cleanup_threads();
+                            return Err(DetourError::CommitFailed {
+                                index: hook_index,
+                                kind: HookKind::Eat,
                                 source: Box::new(err.into()),
                             });
                         }
@@ -980,6 +1338,7 @@ impl TransactionCore {
                             installed.push(Hook::Vtable(inst));
                         }
                         Err(err) => {
+                            rollback_detaches(&mut detached);
                             self.rollback(&mut installed);
                             self.cleanup_threads();
                             return Err(DetourError::CommitFailed {
@@ -1006,6 +1365,7 @@ impl TransactionCore {
                             installed.push(Hook::VtableInstance(inst));
                         }
                         Err(err) => {
+                            rollback_detaches(&mut detached);
                             self.rollback(&mut installed);
                             self.cleanup_threads();
                             return Err(DetourError::CommitFailed {
@@ -1014,6 +1374,23 @@ impl TransactionCore {
                                 source: Box::new(err.into()),
                             });
                         }
+                    }
+                },
+                PendingHook::Detach(target) => match unsafe { prepare_detach(target) } {
+                    Ok(was_enabled) => detached.push(AppliedDetach {
+                        target,
+                        was_enabled,
+                    }),
+                    Err(e) => {
+                        rollback_detaches(&mut detached);
+                        rollback_detaches(&mut detached);
+                        self.rollback(&mut installed);
+                        self.cleanup_threads();
+                        return Err(DetourError::CommitFailed {
+                            index: hook_index,
+                            kind: HookKind::Detach,
+                            source: Box::new(e),
+                        });
                     }
                 },
             }
@@ -1036,6 +1413,7 @@ impl TransactionCore {
 
         // resume threads
         self.cleanup_threads();
+        finalize_detaches(&mut detached);
         self.is_pending = false;
         Ok(installed)
     }
@@ -1264,6 +1642,9 @@ impl TransactionCore {
                 Hook::Iat(hook) => {
                     let _ = hook.unhook();
                 }
+                Hook::Eat(hook) => {
+                    let _ = hook.unhook();
+                }
                 Hook::Vtable(hook) => {
                     let _ = hook.unhook();
                 }
@@ -1396,6 +1777,9 @@ impl TransactionCore {
                 } => {
                     println!("  [{}] IAT: {}!{}", i, target_dll, target_func);
                 }
+                PendingHook::Eat { target_func, .. } => {
+                    println!("  [{}] EAT: {}", i, target_func);
+                }
                 PendingHook::Vtable { vtable, index, .. } => {
                     println!("  [{}] VTABLE: {:p}[{}]", i, vtable, index);
                 }
@@ -1409,6 +1793,9 @@ impl TransactionCore {
                         "  [{}] VTABLE-INSTANCE: {:p} len={} slot={}",
                         i, object_vptr, vtable_len, index
                     );
+                }
+                PendingHook::Detach(_) => {
+                    println!("  [{}] DETACH", i);
                 }
             }
         }
@@ -1466,6 +1853,16 @@ impl TransactionCore {
             }
         }
     }
+
+    fn pending_detach_exists(&self, needle: DetachTarget) -> bool {
+        self.pending_hooks.iter().any(|hook| {
+            let PendingHook::Detach(existing) = hook else {
+                return false;
+            };
+
+            detach_targets_equal(*existing, needle)
+        })
+    }
 }
 
 impl Drop for TransactionCore {
@@ -1498,6 +1895,115 @@ fn lock_transaction() -> std::sync::MutexGuard<'static, ()> {
     TRANSACTION_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Tries to take the process-wide transaction lock without blocking.
+///
+/// Returns `None` if a transaction currently holds it - including this thread
+/// mid-commit/rollback, where the lock is not reentrant. Used by deferred stub
+/// reclamation ([`crate::reclaim`]) so it can suspend threads only when it is safe
+/// to do so, and otherwise leave the work for a later pass.
+pub(crate) fn try_lock_transaction() -> Option<std::sync::MutexGuard<'static, ()>> {
+    match TRANSACTION_LOCK.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+    }
+}
+
+fn detach_targets_equal(left: DetachTarget, right: DetachTarget) -> bool {
+    match (left, right) {
+        (DetachTarget::HookPtr(a), DetachTarget::HookPtr(b)) => a == b,
+        (
+            DetachTarget::HandleIndex {
+                handle: a_handle,
+                index: a_index,
+            },
+            DetachTarget::HandleIndex {
+                handle: b_handle,
+                index: b_index,
+            },
+        ) => a_handle == b_handle && a_index == b_index,
+        _ => false,
+    }
+}
+
+unsafe fn prepare_detach(target: DetachTarget) -> Result<bool, DetourError> {
+    let hook = unsafe { hook_from_detach_target_mut(target)? };
+    hook.detach_prepare()
+}
+
+unsafe fn hook_from_detach_target_mut<'a>(
+    target: DetachTarget,
+) -> Result<&'a mut Hook, DetourError> {
+    match target {
+        DetachTarget::HookPtr(hook) => {
+            if hook.is_null() {
+                Err(DetourError::InvalidParameter)
+            } else {
+                Ok(unsafe { &mut *hook })
+            }
+        }
+        DetachTarget::HandleIndex { handle, index } => {
+            if handle.is_null() {
+                return Err(DetourError::InvalidParameter);
+            }
+
+            let hooks = unsafe { &mut *(handle as *mut Vec<Hook>) };
+            hooks.get_mut(index).ok_or(DetourError::InvalidParameter)
+        }
+    }
+}
+
+fn rollback_detaches(detached: &mut Vec<AppliedDetach>) {
+    for detach in detached.iter().rev() {
+        let Ok(hook) = (unsafe { hook_from_detach_target_mut(detach.target) }) else {
+            continue;
+        };
+        let _ = hook.detach_rollback(detach.was_enabled);
+    }
+    detached.clear();
+}
+
+fn finalize_detaches(detached: &mut Vec<AppliedDetach>) {
+    let mut handle_detaches = Vec::new();
+
+    for detach in detached.iter() {
+        match detach.target {
+            DetachTarget::HookPtr(hook) => {
+                if !hook.is_null() {
+                    unsafe {
+                        (*hook).detach_finalize();
+                    }
+                }
+            }
+            DetachTarget::HandleIndex { handle, index } => {
+                handle_detaches.push((handle, index));
+            }
+        }
+    }
+
+    handle_detaches.sort_by(|(left_handle, left_index), (right_handle, right_index)| {
+        left_handle
+            .cmp(right_handle)
+            .then_with(|| right_index.cmp(left_index))
+    });
+
+    for (handle, index) in handle_detaches {
+        if handle.is_null() {
+            continue;
+        }
+
+        let hooks = unsafe { &mut *(handle as *mut Vec<Hook>) };
+        if index >= hooks.len() {
+            continue;
+        }
+
+        let mut hook = hooks.remove(index);
+        hook.detach_finalize();
+    }
+
+    detached.clear();
 }
 
 fn managed_gateways() -> &'static Mutex<HashSet<usize>> {

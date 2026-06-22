@@ -154,11 +154,24 @@ impl Trampoline {
     }
 
     /// Change protection to RX (PAGE_EXECUTE_READ). Returns true on success.
+    ///
+    /// On success the stub's entry (its page-aligned base) is registered as a
+    /// valid Control Flow Guard call target, so code reached through this stub's
+    /// address - most importantly the trampoline/gateway handed back as the
+    /// original function - survives a guarded indirect call under strict CFG,
+    /// where private executable memory is no longer exempt. Default CFG already
+    /// permits such memory, and the call is a no-op when CFG is not enforced
+    /// (see [`crate::cfg`]).
     pub fn make_rx(&self) -> bool {
         unsafe {
             let mut old = 0u32;
             let res = VirtualProtect(self.ptr as _, self.size, PAGE_EXECUTE_READ, &mut old);
-            res != 0
+            if res != 0 {
+                crate::cfg::register_valid_target(self.ptr as *const u8);
+                true
+            } else {
+                false
+            }
         }
     }
 }
@@ -178,13 +191,98 @@ impl TrampolineAlloc {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+impl TrampolineAlloc {
+    /// Allocates `size` bytes at an address `A` with `base <= A` and
+    /// `A + size - base <= u32::MAX`, so the region is expressible as a 32-bit
+    /// RVA from `base`.
+    ///
+    /// This is used by EAT (export) hooking, whose table slots store 32-bit
+    /// RVAs resolved as `base + rva`. The detour usually lives far outside that
+    /// 4 GB window, so a jump stub is placed *above* the module base instead.
+    /// The search scans free regions upward from `base`.
+    ///
+    /// # Safety
+    /// `base` must be the base address of a loaded module.
+    pub unsafe fn alloc_export_stub(base: usize, size: usize) -> Option<Trampoline> {
+        use windows_sys::Win32::System::SystemInformation::SYSTEM_INFO;
+
+        if size == 0 {
+            return None;
+        }
+
+        let mut si: SYSTEM_INFO = unsafe { std::mem::zeroed() };
+        unsafe { GetSystemInfo(&mut si) };
+        let alloc_granularity = si.dwAllocationGranularity as usize;
+
+        // The stub must end within base + 4 GB so its RVA fits in a u32.
+        let max_addr = base.checked_add(u32::MAX as usize)?.saturating_sub(size);
+
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let mut current_addr = base;
+
+        while current_addr <= max_addr {
+            let query_result = unsafe {
+                VirtualQuery(
+                    current_addr as _,
+                    &mut mbi,
+                    std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                )
+            };
+            if query_result == 0 {
+                break;
+            }
+
+            if mbi.State == MEM_FREE && mbi.RegionSize >= size {
+                let region_start = mbi.BaseAddress as usize;
+                let region_end = region_start.saturating_add(mbi.RegionSize);
+                let search_start = region_start.max(current_addr).max(base);
+                let candidate = align_up(search_start, alloc_granularity);
+
+                if candidate >= base
+                    && candidate.saturating_add(size) <= region_end
+                    && candidate.saturating_add(size).saturating_sub(base) <= u32::MAX as usize
+                {
+                    let allocated = unsafe {
+                        VirtualAlloc(
+                            candidate as _,
+                            size,
+                            MEM_COMMIT | MEM_RESERVE,
+                            PAGE_EXECUTE_READWRITE,
+                        )
+                    };
+                    if !allocated.is_null() {
+                        return Some(Trampoline {
+                            ptr: allocated as *mut u8,
+                            size,
+                        });
+                    }
+                }
+            }
+
+            let next = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+            // Prevent looping forever on a zero-size / non-advancing region.
+            if next <= current_addr {
+                break;
+            }
+            current_addr = next;
+        }
+
+        None
+    }
+}
+
 impl Drop for Trampoline {
     fn drop(&mut self) {
-        unsafe {
-            if !self.ptr.is_null() {
-                let _ = VirtualFree(self.ptr as _, 0, MEM_RELEASE);
-            }
+        if self.ptr.is_null() {
+            return;
         }
+        // Do not free immediately: another thread may still be executing inside
+        // this stub (its instruction pointer here, or a return address into it on
+        // the stack). Retire it for quiescence-checked release instead, which only
+        // appends to a quarantine and never suspends a thread or takes the
+        // transaction lock - safe even from a `Drop` during a commit/rollback.
+        crate::reclaim::retire(self.ptr, self.size);
     }
 }
 
@@ -300,6 +398,11 @@ mod tests {
 
             let tramp_ptr = tramp.ptr;
             drop(tramp);
+
+            // Dropping retires the stub into the reclamation quarantine rather than
+            // freeing it immediately (a thread could still be inside it). A reclaim
+            // pass releases it, since nothing is executing in this region.
+            crate::reclaim::reclaim();
 
             let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
             let query = VirtualQuery(

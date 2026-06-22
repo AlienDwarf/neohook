@@ -7,23 +7,17 @@ use windows_sys::Win32::System::Diagnostics::Debug::*;
 use windows_sys::Win32::System::Memory::*;
 use windows_sys::Win32::System::SystemServices::*;
 
+use crate::pe::{self, ModuleImage as PeImage, PeError};
+
 // --- Architecture-specific imports ---
 
 // If we're on 32-bit (x86):
 #[cfg(target_arch = "x86")]
-use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS32 as IMAGE_NT_HEADERS;
-#[cfg(target_arch = "x86")]
 use windows_sys::Win32::System::WindowsProgramming::IMAGE_THUNK_DATA32 as IMAGE_THUNK_DATA;
-#[cfg(target_arch = "x86")]
-const IMAGE_OPTIONAL_MAGIC: u16 = IMAGE_NT_OPTIONAL_HDR32_MAGIC;
 
 // If we're on 64-bit (x64):
 #[cfg(target_arch = "x86_64")]
-use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64 as IMAGE_NT_HEADERS;
-#[cfg(target_arch = "x86_64")]
 use windows_sys::Win32::System::WindowsProgramming::IMAGE_THUNK_DATA64 as IMAGE_THUNK_DATA;
-#[cfg(target_arch = "x86_64")]
-const IMAGE_OPTIONAL_MAGIC: u16 = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
 
 #[derive(Debug)]
 enum InternalIatHookError {
@@ -63,6 +57,18 @@ impl fmt::Display for IatHookError {
     }
 }
 
+impl From<PeError> for InternalIatHookError {
+    fn from(err: PeError) -> Self {
+        match err {
+            PeError::NullModule => Self::NullModule,
+            PeError::InvalidDosHeader => Self::InvalidDosHeader,
+            PeError::InvalidNtHeader => Self::InvalidNtHeader,
+            PeError::InvalidNtSignature => Self::InvalidNtSignature,
+            PeError::InvalidOptionalHeader => Self::InvalidOptionalHeader,
+        }
+    }
+}
+
 impl From<InternalIatHookError> for IatHookError {
     fn from(err: InternalIatHookError) -> Self {
         match err {
@@ -86,8 +92,8 @@ impl From<InternalIatHookError> for IatHookError {
 
 #[derive(Copy, Clone, Debug)]
 struct ModuleImage {
-    base_address: usize,
-    size: usize,
+    /// Validated base/size view, shared with the generic PE helpers.
+    image: PeImage,
     import_dir_rva: usize,
     import_dir_size: usize,
 }
@@ -123,6 +129,12 @@ impl IatHook {
         if detour_function.is_null() {
             return Err(map_err(InternalIatHookError::NullDetour));
         }
+
+        // The import slot is reached through a CFG-guarded indirect call. Mark
+        // the detour as a valid call target so the redirect holds under strict
+        // CFG / export suppression. No-op in the common case and when the process
+        // does not enforce CFG (see crate::cfg).
+        crate::cfg::register_valid_target(detour_function);
 
         // Parse the PE headers and find the target import thunk
         let image = unsafe { parse_loaded_module(h_module)? };
@@ -186,84 +198,19 @@ impl IatHook {
 }
 
 unsafe fn parse_loaded_module(h_module: HMODULE) -> Result<ModuleImage, InternalIatHookError> {
-    // Validate the module handle
-    if h_module.is_null() {
-        return Err(InternalIatHookError::NullModule);
-    }
+    // Validate the DOS/NT/Optional headers via the shared PE parser. This
+    // already bounds the data directory lookup below to the image size.
+    let image = pe::parse_module_image(h_module)?;
 
-    // Parse the PE headers of the loaded module to find the import directory
-    let base_address = h_module as usize;
-    let dos = base_address as *const IMAGE_DOS_HEADER;
-
-    // 11.03.26 (03-11-26) - Check the DOS signature
-    // Should be "MZ" (0x5A4D) when valid
-    if unsafe { (*dos).e_magic } != IMAGE_DOS_SIGNATURE {
-        return Err(InternalIatHookError::InvalidDosHeader);
-    }
-
-    // Calculate the address of the NT headers using the e_lfanew offset from the DOS header
-    let e_lfanew = unsafe { (*dos).e_lfanew };
-    if e_lfanew <= 0 {
-        return Err(InternalIatHookError::InvalidNtHeader);
-    }
-
-    let nt_addr = base_address
-        .checked_add(e_lfanew as usize)
-        .ok_or(InternalIatHookError::InvalidNtHeader)?;
-    let nt = nt_addr as *const IMAGE_NT_HEADERS;
-
-    // 11.03.26 (03-11-26) - Check the NT signature
-    /* https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#signature-image-only
-    Should be "PE\0\0" (0x4550) when valid
-    Fail mean no valid PE file
-    Prevents from certain types malformed or non PE files that could cause a crash
-     */
-    if unsafe { (*nt).Signature } != IMAGE_NT_SIGNATURE {
-        return Err(InternalIatHookError::InvalidNtSignature);
-    }
-
-    // Check the Optional Header magic to ensure it's a valid PE32 or PE32+ file
-    if unsafe { (*nt).OptionalHeader.Magic } != IMAGE_OPTIONAL_MAGIC {
-        return Err(InternalIatHookError::InvalidOptionalHeader);
-    }
-
-    let size_of_image = unsafe { (*nt).OptionalHeader.SizeOfImage as usize };
-    if size_of_image == 0 {
-        return Err(InternalIatHookError::InvalidOptionalHeader);
-    }
-
-    let number_of_dirs = unsafe { (*nt).OptionalHeader.NumberOfRvaAndSizes as usize };
-    if number_of_dirs <= IMAGE_DIRECTORY_ENTRY_IMPORT as usize {
-        return Err(InternalIatHookError::NoImportDirectory);
-    }
-
-    // Get the Import Directory entry from the Data Directory
-    let import_dir =
-        unsafe { (*nt).OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT as usize] };
-
-    // Validate the Import Directory entry
-    if import_dir.VirtualAddress == 0 || import_dir.Size == 0 {
-        return Err(InternalIatHookError::NoImportDirectory);
-    }
-
-    // rva = virtual address relative to the module base, we need to check that it points within the image
-    let import_dir_rva = import_dir.VirtualAddress as usize;
-    let import_dir_size = import_dir.Size as usize;
-
-    // Check that the Import Directory fits within the image bounds
-    let import_dir_end = import_dir_rva
-        .checked_add(import_dir_size)
-        // We check that the end of the import directory does not exceed the size of the image, to prevent out-of-bounds access when we later read the import descriptors.
-        .ok_or(InternalIatHookError::MalformedImportDirectory)?;
-
-    // crucial to prevent crashes or security issues when dealing with malformed or malicious PE files that could have an import directory that extends beyond the actual image size.
-    if import_dir_end > size_of_image {
-        return Err(InternalIatHookError::MalformedImportDirectory);
-    }
+    // Get the Import Directory entry from the Data Directory. `data_directory`
+    // returns `None` when the directory is absent, empty, or extends beyond the
+    // image bounds, all of which mean there is no usable import table.
+    let (import_dir_rva, import_dir_size) =
+        pe::data_directory(&image, IMAGE_DIRECTORY_ENTRY_IMPORT as usize)
+            .ok_or(InternalIatHookError::NoImportDirectory)?;
 
     Ok(ModuleImage {
-        base_address,
-        size: size_of_image,
+        image,
         import_dir_rva,
         import_dir_size,
     })
@@ -290,10 +237,8 @@ unsafe fn find_import_thunk(
         <= desc_end
     {
         // Get a pointer to the current IMAGE_IMPORT_DESCRIPTOR
-        let import_desc = unsafe {
-            rva_to_ptr::<IMAGE_IMPORT_DESCRIPTOR>(image, desc_rva)
-                .ok_or(InternalIatHookError::MalformedImportDirectory)?
-        };
+        let import_desc = pe::rva_to_ptr::<IMAGE_IMPORT_DESCRIPTOR>(&image.image, desc_rva)
+            .ok_or(InternalIatHookError::MalformedImportDirectory)?;
 
         // desc = the current IMAGE_IMPORT_DESCRIPTOR
         let desc = unsafe { *import_desc };
@@ -306,7 +251,7 @@ unsafe fn find_import_thunk(
         }
 
         // Read the DLL name from the Name RVA
-        let dll_name = read_c_string_from_rva(image, desc.Name as usize)
+        let dll_name = pe::read_c_string_from_rva(&image.image, desc.Name as usize)
             .ok_or(InternalIatHookError::MalformedImportDirectory)?;
 
         // Compare the DLL name with the target DLL name (case-insensitive)
@@ -330,14 +275,11 @@ unsafe fn find_import_thunk(
 
             // Loop through the thunks to find the target function
             loop {
-                let thunk = unsafe {
-                    rva_to_mut_ptr::<IMAGE_THUNK_DATA>(image, thunk_rva)
-                        .ok_or(InternalIatHookError::MalformedImportDirectory)?
-                };
-                let original_thunk = unsafe {
-                    rva_to_ptr::<IMAGE_THUNK_DATA>(image, original_thunk_rva)
-                        .ok_or(InternalIatHookError::MalformedImportDirectory)?
-                };
+                let thunk = pe::rva_to_mut_ptr::<IMAGE_THUNK_DATA>(&image.image, thunk_rva)
+                    .ok_or(InternalIatHookError::MalformedImportDirectory)?;
+                let original_thunk =
+                    pe::rva_to_ptr::<IMAGE_THUNK_DATA>(&image.image, original_thunk_rva)
+                        .ok_or(InternalIatHookError::MalformedImportDirectory)?;
 
                 // Our loop termination when we reach the end of the tunks
                 let lookup = unsafe { thunk_address_of_data(original_thunk) };
@@ -347,7 +289,7 @@ unsafe fn find_import_thunk(
 
                 // Check if the import is by ordinal or by name. If it's by ordinal, we can't resolve the name, so we skip it.
                 if !unsafe { thunk_is_ordinal(original_thunk) } {
-                    let func_name = read_import_name(image, lookup)
+                    let func_name = read_import_name(&image.image, lookup)
                         .ok_or(InternalIatHookError::MalformedImportDirectory)?;
 
                     // If the name matches we retourn the pointer to the IAT slot
@@ -377,62 +319,10 @@ unsafe fn find_import_thunk(
     Err(InternalIatHookError::MalformedImportDirectory)
 }
 
-unsafe fn rva_to_ptr<T>(image: &ModuleImage, rva: usize) -> Option<*const T> {
-    let size = std::mem::size_of::<T>();
-    if rva == 0 || size == 0 {
-        return None;
-    }
-
-    let end = rva.checked_add(size)?;
-    if end > image.size {
-        return None;
-    }
-
-    let addr = image.base_address.checked_add(rva)?;
-    Some(addr as *const T)
-}
-
-unsafe fn rva_to_mut_ptr<T>(image: &ModuleImage, rva: usize) -> Option<*mut T> {
-    let size = std::mem::size_of::<T>();
-    if rva == 0 || size == 0 {
-        return None;
-    }
-
-    let end = rva.checked_add(size)?;
-    if end > image.size {
-        return None;
-    }
-
-    let addr = image.base_address.checked_add(rva)?;
-    Some(addr as *mut T)
-}
-
-fn read_c_string_from_rva(image: &ModuleImage, rva: usize) -> Option<String> {
-    if rva == 0 || rva >= image.size {
-        return None;
-    }
-
-    let start = image.base_address.checked_add(rva)?;
-    let end = image.base_address.checked_add(image.size)?;
-
-    let mut cur = start;
-    while cur < end {
-        let byte = unsafe { *(cur as *const u8) };
-        if byte == 0 {
-            let len = cur.checked_sub(start)?;
-            let bytes = unsafe { std::slice::from_raw_parts(start as *const u8, len) };
-            return String::from_utf8(bytes.to_vec()).ok();
-        }
-        cur = cur.checked_add(1)?;
-    }
-
-    None
-}
-
-fn read_import_name(image: &ModuleImage, import_by_name_rva: usize) -> Option<String> {
+fn read_import_name(image: &PeImage, import_by_name_rva: usize) -> Option<String> {
     // IMAGE_IMPORT_BY_NAME = WORD Hint; BYTE Name[];
     let name_rva = import_by_name_rva.checked_add(std::mem::size_of::<u16>())?;
-    read_c_string_from_rva(image, name_rva)
+    pe::read_c_string_from_rva(image, name_rva)
 }
 
 #[cfg(target_arch = "x86")]

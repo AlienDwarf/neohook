@@ -1,6 +1,6 @@
 [package]
 name = "neohook"
-version = "0.3.0"
+version = "0.10.0"
 edition = "2024"
 description = "A powerful, transactional, thread-safe function hooking library for Windows (x86/x64), written in Rust."
 license = "MIT OR Apache-2.0"
@@ -49,12 +49,15 @@ iced-x86 = { version = "1.21.0", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-# Extra windows-sys surface used only by examples (windowing / message loop).
+# Extra windows-sys surface used only by examples (windowing / message loop /
+# OpenGL context setup). Direct3D 11 / 9 are not in windows-sys, so those
+# examples load them at runtime and read the COM vtable by hand.
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_OpenGL",
     "Win32_System_LibraryLoader",
 ] }
 
