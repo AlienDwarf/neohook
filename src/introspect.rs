@@ -220,10 +220,7 @@ pub unsafe fn enumerate_imports(h_module: HMODULE) -> Result<Vec<ImportInfo>, Pe
     let thunk_size = std::mem::size_of::<usize>();
     let mut desc_rva = import_rva;
 
-    loop {
-        let Some(desc_ptr) = pe::rva_to_ptr::<IMAGE_IMPORT_DESCRIPTOR>(&image, desc_rva) else {
-            break;
-        };
+    while let Some(desc_ptr) = pe::rva_to_ptr::<IMAGE_IMPORT_DESCRIPTOR>(&image, desc_rva) {
         let desc = unsafe { *desc_ptr };
 
         // The descriptor array is terminated by an all-zero entry.
