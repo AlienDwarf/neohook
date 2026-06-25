@@ -282,6 +282,17 @@ fn main() {
 }
 ```
 
+> **Thunk following & deduplication:** `attach` follows leading jump thunks to the
+> real function body (like MS Detours), so distinct entry points that forward to the
+> same implementation - for example a CRT function and its `_o_*` alias - resolve to
+> one address. Queueing the same resolved target twice in a transaction does **not**
+> patch it twice: an identical hook (same target *and* same detour) is deduplicated
+> and returns the same gateway, while the same target with a *different* detour is
+> rejected with `DetourError::InvalidParameter` - stack several detours on one
+> function by chaining onto the returned gateway instead. Because duplicates
+> collapse, the `Vec<Hook>` returned by `commit()` can be **shorter** than the number
+> of `attach` calls.
+
 ---
 
 ### IAT Hooking
