@@ -795,6 +795,37 @@ impl TransactionCore {
             }
         }
 
+        // Collision handling against hooks already queued in this transaction.
+        //
+        // Following jump thunks (above) can collapse several distinct entry
+        // points onto one implementation - e.g. a CRT function and its `_o_*`
+        // forwarder both resolve to the same body. Patching that one site twice
+        // in a single commit overwrites the live code a second time and corrupts
+        // it, so a duplicate must be caught here rather than queued.
+        //
+        // - Same resolved target *and* same detour: the second request is
+        //   redundant. Return the existing gateway and skip the duplicate, so the
+        //   site is patched exactly once. The caller still gets a usable
+        //   original/gateway pointer and `commit` simply yields one hook for the
+        //   pair (the returned `Vec` can therefore be shorter than the number of
+        //   `attach` calls).
+        // - Same target but a *different* detour: ambiguous within one
+        //   transaction. Reject it - stacking several detours on one function is
+        //   done by chaining onto the returned gateway, not by re-attaching the
+        //   same target.
+        for pending in &self.pending_hooks {
+            let PendingHook::Inline(existing) = pending else {
+                continue;
+            };
+            if existing.target != target {
+                continue;
+            }
+            if existing.detour == detour {
+                return Ok(existing.trampoline.ptr);
+            }
+            return Err(DetourError::InvalidParameter);
+        }
+
         // --- architecture ---
 
         // case A: 64-Bit (x86_64)
