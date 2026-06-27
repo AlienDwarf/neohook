@@ -145,6 +145,33 @@ fn first_bytes(code: *const u8, len: usize) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(code, n).to_vec() }
 }
 
+/// Outcome of one panic-guarded `relocate` attempt.
+enum RelocResult {
+    Ok {
+        written_len: usize,
+    },
+    /// A graceful, environmental refusal (too-far operand, short-only branch).
+    Refused(String),
+    /// A broken encoder invariant - a real bug, hard-failed by the caller.
+    Internal(String),
+    Panic,
+}
+
+/// Relocates `stolen_len` bytes of `code` into `tramp`, catching panics and
+/// classifying the error.
+fn try_relocate(code: *const u8, tramp: *mut u8, stolen_len: usize) -> RelocResult {
+    match catch_unwind(AssertUnwindSafe(|| unsafe {
+        Disassembler::relocate(code, tramp, stolen_len)
+    })) {
+        Ok(Ok(mapping)) => RelocResult::Ok {
+            written_len: mapping.written_len,
+        },
+        Ok(Err(err)) if err.contains("Internal relocation error") => RelocResult::Internal(err),
+        Ok(Err(err)) => RelocResult::Refused(err),
+        Err(_) => RelocResult::Panic,
+    }
+}
+
 fn sweep_module(name: &str, tramp: *mut u8, stats: &mut Stats) {
     let Some(handle) = ensure_loaded(name) else {
         eprintln!("  [skip] {name}: not present / could not be loaded");
@@ -209,45 +236,49 @@ fn sweep_module(name: &str, tramp: *mut u8, stats: &mut Stats) {
 
         stats.swept += 1;
 
-        // Stage 2: relocate the stolen prologue into the nearby trampoline,
-        // the same call the real inline hook makes.
-        let outcome = catch_unwind(AssertUnwindSafe(|| unsafe {
-            Disassembler::relocate(code, tramp, stolen_len)
-        }));
+        // Stage 2: relocate the stolen prologue into the shared per-module
+        // trampoline, the same call the real inline hook makes.
+        let mut result = try_relocate(code, tramp, stolen_len);
 
-        match outcome {
-            Ok(Ok(mapping)) => {
-                if mapping.written_len == 0 || mapping.written_len > TRAMPOLINE_CAP {
+        // The shared trampoline sits near the module base, which can be farther
+        // from a given export than a real hook's per-target trampoline would be.
+        // A graceful refusal there may just be that distance, not a genuine
+        // limit, so retry with a trampoline allocated right next to THIS
+        // function - exactly what the production hook path does - and trust that
+        // outcome instead. Keeps the sweep's numbers about real limits, not the
+        // test's per-module placement shortcut.
+        if let RelocResult::Refused(_) = result
+            && let Some(retry_tramp) =
+                unsafe { TrampolineAlloc::alloc_nearby_trampoline(code, TRAMPOLINE_CAP) }
+        {
+            result = try_relocate(code, retry_tramp.as_ptr(), stolen_len);
+            // `retry_tramp` retires here.
+        }
+
+        match result {
+            RelocResult::Ok { written_len } => {
+                if written_len == 0 || written_len > TRAMPOLINE_CAP {
                     stats.crashes.push(format!(
-                        "{}: relocate reported written_len={} (cap {}) stolen={} at {:p}",
+                        "{}: relocate reported written_len={written_len} (cap {TRAMPOLINE_CAP}) \
+                         stolen={stolen_len} at {code:p}",
                         label(),
-                        mapping.written_len,
-                        TRAMPOLINE_CAP,
-                        stolen_len,
-                        code
                     ));
                     continue;
                 }
-                if mapping.written_len > REAL_BUDGET {
+                if written_len > REAL_BUDGET {
                     stats.exceeds_real_budget += 1;
                 }
                 stats.relocated += 1;
             }
-            Ok(Err(err)) => {
-                // "Internal relocation error: ..." signals a broken offset map
-                // or encoder invariant - a real bug, not an environmental
-                // limitation like a too-far RIP operand or an unencodable
-                // short-only branch. Treat it as a hard failure.
-                if err.contains("Internal relocation error") {
-                    stats.crashes.push(format!(
-                        "{}: internal relocator invariant violated: {} (stolen={}, bytes={:02X?})",
-                        label(),
-                        err,
-                        stolen_len,
-                        first_bytes(code, stolen_len)
-                    ));
-                    continue;
-                }
+            RelocResult::Internal(err) => {
+                stats.crashes.push(format!(
+                    "{}: internal relocator invariant violated: {err} (stolen={stolen_len}, \
+                     bytes={:02X?})",
+                    label(),
+                    first_bytes(code, stolen_len)
+                ));
+            }
+            RelocResult::Refused(err) => {
                 stats.refused += 1;
                 if err.contains("too far away") {
                     stats.refused_too_far += 1;
@@ -258,20 +289,16 @@ fn sweep_module(name: &str, tramp: *mut u8, stats: &mut Stats) {
                 }
                 if stats.refusal_samples.len() < 20 {
                     stats.refusal_samples.push(format!(
-                        "{}: {} (stolen={}, bytes={:02X?})",
+                        "{}: {err} (stolen={stolen_len}, bytes={:02X?})",
                         label(),
-                        err,
-                        stolen_len,
                         first_bytes(code, stolen_len)
                     ));
                 }
             }
-            Err(_) => {
+            RelocResult::Panic => {
                 stats.crashes.push(format!(
-                    "{}: relocate PANICKED at {:p} stolen={} bytes={:02X?}",
+                    "{}: relocate PANICKED at {code:p} stolen={stolen_len} bytes={:02X?}",
                     label(),
-                    code,
-                    stolen_len,
                     first_bytes(code, stolen_len)
                 ));
             }
@@ -289,10 +316,11 @@ fn relocation_sweep_over_system_exports() {
             continue;
         };
 
-        // One trampoline page near the module's base. Every export lives within
-        // a few MB of the base, well inside the +/-2GB window, so relocating
-        // RIP-relative and relative-branch operands against this address is
-        // representable exactly as it would be for a real nearby trampoline.
+        // One shared trampoline page near the module's base, reused across the
+        // module's exports to keep the common path cheap. It is close enough for
+        // the vast majority of prologues; the few whose operands reach far
+        // enough to care are retried against a real per-target trampoline in
+        // `sweep_module`, so the placement shortcut never inflates the refusals.
         let Some(trampoline) = (unsafe {
             TrampolineAlloc::alloc_nearby_trampoline(handle as *const u8, TRAMPOLINE_CAP)
         }) else {
