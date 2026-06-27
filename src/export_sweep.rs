@@ -54,6 +54,18 @@ const SWEEP_MODULES: &[&str] = &[
     "shlwapi.dll",
     "ws2_32.dll",
     "msvcrt.dll",
+    "d3d9.dll",
+    "d3d10.dll",
+    "d3d11.dll",
+    "d3d12.dll",
+    "dxgi.dll",
+    "d2d1.dll",
+    "d3dcompiler_47.dll",
+    "ddraw.dll",
+    "dinput8.dll",
+    "dsound.dll",
+    "dwmapi.dll",
+    "opengl32.dll",
 ];
 
 /// Minimum prologue size an inline hook needs for the common near-jump path
@@ -77,6 +89,14 @@ struct Stats {
     skipped_not_code: usize,
     skipped_undecodable: usize,
     refused: usize,
+    /// Refusal because a RIP-relative operand's target ended up >2GB from the
+    /// trampoline. This is the category the near-allocator placement affects.
+    refused_too_far: usize,
+    /// Refusal because a short-only branch (`jrcxz`/`jcxz`/`loop`) could not be
+    /// re-encoded in range. An inherent encoding limit, allocator-independent.
+    refused_short_branch: usize,
+    /// Any other graceful refusal.
+    refused_other: usize,
     exceeds_real_budget: usize,
     /// Hard failures: panics or buffer-budget violations. Each entry is a
     /// human-readable diagnostic. The test fails if this is non-empty.
@@ -229,6 +249,13 @@ fn sweep_module(name: &str, tramp: *mut u8, stats: &mut Stats) {
                     continue;
                 }
                 stats.refused += 1;
+                if err.contains("too far away") {
+                    stats.refused_too_far += 1;
+                } else if err.contains("short-only branch") {
+                    stats.refused_short_branch += 1;
+                } else {
+                    stats.refused_other += 1;
+                }
                 if stats.refusal_samples.len() < 20 {
                     stats.refusal_samples.push(format!(
                         "{}: {} (stolen={}, bytes={:02X?})",
@@ -281,7 +308,10 @@ fn relocation_sweep_over_system_exports() {
         "\nexport relocation sweep:\n  \
          swept (decodable executable prologues): {}\n  \
          relocated cleanly: {}\n  \
-         gracefully refused: {}\n  \
+         gracefully refused: {}\n    \
+           - RIP operand too far (allocator-affected): {}\n    \
+           - short-only branch out of range (encoding limit): {}\n    \
+           - other: {}\n  \
          relocations exceeding real {REAL_BUDGET}B budget: {}\n  \
          skipped (not code / data export): {}\n  \
          skipped (not decodable as code): {}\n  \
@@ -289,6 +319,9 @@ fn relocation_sweep_over_system_exports() {
         stats.swept,
         stats.relocated,
         stats.refused,
+        stats.refused_too_far,
+        stats.refused_short_branch,
+        stats.refused_other,
         stats.exceeds_real_budget,
         stats.skipped_not_code,
         stats.skipped_undecodable,
