@@ -187,7 +187,7 @@ this as a feature comparison rather than a maturity one.
 | v0.10.0 |    ✅ Done | Anti-tamper / re-hook watchdog (`Watchdog`)            |
 | v0.10.0 |    ✅ Done | Tracing / logging detour generator (`detour_trace!`)   |
 | v0.10.0 |    ✅ Done | Control Flow Guard (CFG) awareness (`cfg`)             |
-| v0.x0 |    Planned | ARM64 inline hooking                                   |
+| v0.x   |    Planned | ARM64 inline hooking                                   |
 
 --
 
