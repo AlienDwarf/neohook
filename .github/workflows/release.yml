@@ -6,11 +6,75 @@ on:
     tags:
       - 'v*'
 
+permissions: read-all
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  # fail fast if tag does not match the version in Cargo.toml.
+  verify-version:
+    name: Verify tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag against Cargo.toml version
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          echo "Tag version:  $tag"
+          echo "Cargo.toml:   $crate"
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::Pushed tag v$tag does not match Cargo.toml version $crate"
+            exit 1
+          fi
+
+  test:
+    name: Test (${{ matrix.target }})
+    needs: verify-version
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        target: [x86_64-pc-windows-msvc, i686-pc-windows-msvc]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSVC developer command prompt
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add ${{ matrix.target }}
+
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Linting
+        run: cargo clippy --target ${{ matrix.target }} --all-targets --all-features --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --target ${{ matrix.target }} --all-features --locked -- --test-threads=1
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }} --locked
+
   publish:
     name: Publish Library
+    needs: [verify-version, test]
     runs-on: windows-latest
-    
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -19,4 +83,4 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cargo Publish
-        run: cargo publish --token ${{ secrets.CRATES_TOKEN }}
+        run: cargo publish --locked --token ${{ secrets.CRATES_TOKEN }}
