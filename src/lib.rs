@@ -39,6 +39,9 @@ mod veh;
 mod vtable;
 mod watchdog;
 
+#[cfg(test)]
+mod export_sweep;
+
 // Re-exports for public API
 pub use crate::api::DetourTransaction;
 pub use crate::code::detour_code_from_pointer;

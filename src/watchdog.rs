@@ -554,7 +554,13 @@ mod tests {
 
         let ok = wait_until(Duration::from_secs(5), || page.read(5) == patched);
         assert!(ok, "Restore mode should re-apply the patched bytes");
-        assert!(wd.restorations() >= 1, "a restoration should be counted");
+        // The worker writes the restored bytes before bumping the counter, so
+        // observing the restored bytes above does not guarantee the increment is
+        // visible yet. Wait for the count instead of racing it.
+        assert!(
+            wait_until(Duration::from_secs(3), || wd.restorations() >= 1),
+            "a restoration should be counted"
+        );
         assert!(
             wait_until(Duration::from_secs(3), || FIRED.load(Ordering::SeqCst) >= 1),
             "the tamper callback should have fired"
@@ -679,6 +685,11 @@ mod tests {
             restored,
             "watchdog must keep restoring despite a panicking callback"
         );
-        assert!(wd.restorations() >= 1);
+        // As above: the restored bytes become visible before the counter bump,
+        // so wait for the count rather than reading it immediately.
+        assert!(
+            wait_until(Duration::from_secs(3), || wd.restorations() >= 1),
+            "a restoration should be counted despite the panicking callback"
+        );
     }
 }

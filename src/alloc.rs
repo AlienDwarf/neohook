@@ -58,14 +58,25 @@ impl TrampolineAlloc {
             let min_addr = (target as usize).saturating_sub(range);
             let max_addr = (target as usize).saturating_add(range);
 
-            let mut current_addr = min_addr;
-
             // Get System Info to know the allocation granularity
             let mut si: SYSTEM_INFO = unsafe { std::mem::zeroed() };
             unsafe { GetSystemInfo(&mut si) };
             let alloc_granularity = si.dwAllocationGranularity as usize;
 
-            // We scan block by block to find free regions that are at least `size` bytes
+            // Walk every free region in the ±2GB window and remember the aligned
+            // start *closest to the target* in each. A trampoline placed as near
+            // as possible to the target keeps relocated RIP-relative and
+            // relative-branch displacements small, which is what lets those
+            // instructions be re-encoded into the trampoline at all.
+            //
+            // The previous strategy returned the first viable region from the
+            // bottom of the window, which parked trampolines ~2GB below the
+            // target and pushed forward RIP-relative operands out of i32 range
+            // (the dominant real-world relocation refusal). Scanning the whole
+            // window costs a few extra `VirtualQuery` calls per hook install
+            // (sub-millisecond, once per hook) in exchange for optimal placement.
+            let mut candidates: Vec<usize> = Vec::new();
+            let mut current_addr = min_addr;
             while current_addr < max_addr {
                 let query_result = unsafe {
                     VirtualQuery(
@@ -81,39 +92,45 @@ impl TrampolineAlloc {
 
                 // Is this region free and large enough for our trampoline?
                 if mbi.State == MEM_FREE && mbi.RegionSize >= size {
-                    // Try to allocate here
-                    // We have to ensure it's 64KB aligned (Allocation Granularity)
                     let region_start = mbi.BaseAddress as usize;
                     let region_end = region_start.saturating_add(mbi.RegionSize);
-                    let search_start = region_start.max(current_addr);
-                    let alloc_candidate = align_up(search_start, alloc_granularity);
-
-                    // Now a more robust check to ensure the candidate is within 2GB
-                    if alloc_candidate.saturating_add(size) <= region_end
-                        && alloc_candidate >= min_addr
-                        && alloc_candidate.saturating_add(size) <= max_addr
-                    {
-                        let allocated = unsafe {
-                            VirtualAlloc(
-                                alloc_candidate as _,
-                                size,
-                                MEM_COMMIT | MEM_RESERVE,
-                                PAGE_EXECUTE_READWRITE,
-                            )
-                        };
-                        if !allocated.is_null() {
-                            return Some(allocated as *mut u8);
-                        }
+                    if let Some(candidate) = nearest_aligned_candidate(
+                        region_start,
+                        region_end,
+                        target as usize,
+                        size,
+                        min_addr,
+                        max_addr,
+                        alloc_granularity,
+                    ) {
+                        candidates.push(candidate);
                     }
                 }
 
-                // We used to jump 2MB
-                // However now we jump to the next region because it's more efficient
-                current_addr = (mbi.BaseAddress as usize) + mbi.RegionSize;
-
-                // Prevent overflow so we don't loop indefinitely
-                if current_addr <= (mbi.BaseAddress as usize) {
+                // Advance to the next region.
+                let next = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+                if next <= current_addr {
+                    // Prevent overflow / non-progress so we don't loop forever.
                     break;
+                }
+                current_addr = next;
+            }
+
+            // Closest to the target first, so the best placement wins and we only
+            // fall back to a farther region if a nearer candidate loses a race to
+            // another allocator between the query and the commit.
+            candidates.sort_by_key(|candidate| candidate.abs_diff(target as usize));
+            for candidate in candidates {
+                let allocated = unsafe {
+                    VirtualAlloc(
+                        candidate as _,
+                        size,
+                        MEM_COMMIT | MEM_RESERVE,
+                        PAGE_EXECUTE_READWRITE,
+                    )
+                };
+                if !allocated.is_null() {
+                    return Some(allocated as *mut u8);
                 }
             }
 
@@ -131,6 +148,61 @@ impl TrampolineAlloc {
 #[cfg(target_arch = "x86_64")]
 fn align_up(addr: usize, align: usize) -> usize {
     (addr + align - 1) & !(align - 1)
+}
+
+// Helper function to align an address down to the nearest multiple of `align`
+#[cfg(target_arch = "x86_64")]
+fn align_down(addr: usize, align: usize) -> usize {
+    addr & !(align - 1)
+}
+
+/// Returns the `align`-aligned allocation start inside `[region_start,
+/// region_end)` that is closest to `target`, while leaving room for `size`
+/// bytes and staying inside the `[min_addr, max_addr]` reachability window.
+///
+/// Returns `None` if the region cannot host the trampoline within range.
+#[cfg(target_arch = "x86_64")]
+fn nearest_aligned_candidate(
+    region_start: usize,
+    region_end: usize,
+    target: usize,
+    size: usize,
+    min_addr: usize,
+    max_addr: usize,
+    align: usize,
+) -> Option<usize> {
+    // Highest start that still fits `size` bytes in the region and the window.
+    let region_hi = region_end.checked_sub(size)?;
+    let window_hi = max_addr.checked_sub(size)?;
+    let lo = region_start.max(min_addr);
+    let hi = region_hi.min(window_hi);
+    if lo > hi {
+        return None;
+    }
+
+    // Snap the target onto the alignment grid on either side and keep whichever
+    // valid candidate lands closest to the target.
+    let ideal = target.clamp(lo, hi);
+    let mut best: Option<usize> = None;
+    for cand in [align_down(ideal, align), align_up(ideal, align)] {
+        if cand >= lo && cand <= hi {
+            best = Some(match best {
+                Some(b) if b.abs_diff(target) <= cand.abs_diff(target) => b,
+                _ => cand,
+            });
+        }
+    }
+
+    // Range narrower than one alignment step: take the lowest aligned point that
+    // still fits, if any.
+    if best.is_none() {
+        let snapped = align_up(lo, align);
+        if snapped <= hi {
+            best = Some(snapped);
+        }
+    }
+
+    best
 }
 
 /// Lightweight Trampoline handle for convenience.
