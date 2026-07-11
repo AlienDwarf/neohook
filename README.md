@@ -821,7 +821,7 @@ in a window becomes `'a'`), see [`examples/force_keystroke_to_a.rs`](examples/fo
 
 The flagship use case for VTable and inline hooks is intercepting a graphics
 API's frame-present call - the anchor point for overlays, ESPs, and frame
-counters. NeoHook ships three **self-contained, runnable** examples that set up
+counters. NeoHook ships four **self-contained, runnable** examples that set up
 their own rendering context (no game required) and confirm the hook fires. They
 use the software rasterizer / software GL, so they run **without a GPU** (and in
 CI):
@@ -829,6 +829,7 @@ CI):
 | Example | Target | Technique |
 | :------ | :----- | :-------- |
 | [`examples/d3d11_present.rs`](examples/d3d11_present.rs) | `IDXGISwapChain::Present` (vtable slot 8) | VTable hook on a WARP swapchain |
+| [`examples/dxgi_present1.rs`](examples/dxgi_present1.rs) | `IDXGISwapChain1::Present1` (vtable slot 22) | VTable hook on a flip-model WARP swapchain |
 | [`examples/d3d9_endscene.rs`](examples/d3d9_endscene.rs) | `IDirect3DDevice9::EndScene` (vtable slot 42) | VTable hook on a NULLREF device |
 | [`examples/opengl_swapbuffers.rs`](examples/opengl_swapbuffers.rs) | `opengl32!wglSwapBuffers` | Inline hook via `attach_export` |
 
