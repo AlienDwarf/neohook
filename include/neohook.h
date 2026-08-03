@@ -207,6 +207,9 @@ typedef struct HookContext {
  * registers and `MXCSR` snapshotted and restored around it, so it may freely
  * clobber registers and modify the context block in place. It must not block
  * indefinitely or unwind across the FFI boundary.
+ *
+ * The handler uses the C calling convention (`__cdecl` on x86), like the rest
+ * of the C ABI.
  */
 typedef void (*MidHookHandler)(struct HookContext *context);
 

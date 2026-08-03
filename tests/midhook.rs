@@ -46,7 +46,7 @@ static HANDLER_RAN: AtomicBool = AtomicBool::new(false);
 #[cfg(target_arch = "x86_64")]
 static OBSERVED_ARG: AtomicU64 = AtomicU64::new(0);
 
-unsafe extern "system" fn observe_handler(ctx: *mut HookContext) {
+unsafe extern "C" fn observe_handler(ctx: *mut HookContext) {
     HANDLER_RAN.store(true, Ordering::SeqCst);
     let ctx = unsafe { &*ctx };
     #[cfg(target_arch = "x86_64")]
@@ -56,7 +56,7 @@ unsafe extern "system" fn observe_handler(ctx: *mut HookContext) {
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe extern "system" fn add_to_arg_handler(ctx: *mut HookContext) {
+unsafe extern "C" fn add_to_arg_handler(ctx: *mut HookContext) {
     // Rewrite the first argument (RCX) in flight: x -> x + 10.
     let ctx = unsafe { &mut *ctx };
     ctx.rcx = ctx.rcx.wrapping_add(10);
@@ -80,13 +80,13 @@ extern "system" fn add_half(x: f64) -> f64 {
 static OBSERVED_XMM: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_arch = "x86_64")]
-unsafe extern "system" fn observe_xmm_handler(ctx: *mut HookContext) {
+unsafe extern "C" fn observe_xmm_handler(ctx: *mut HookContext) {
     let ctx = unsafe { &*ctx };
     OBSERVED_XMM.store(ctx.xmm[0].low, Ordering::SeqCst); // low 64 bits = the f64
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe extern "system" fn bump_xmm0_handler(ctx: *mut HookContext) {
+unsafe extern "C" fn bump_xmm0_handler(ctx: *mut HookContext) {
     // Rewrite the first floating-point argument (XMM0) in flight: x -> x + 100.
     let ctx = unsafe { &mut *ctx };
     let v = f64::from_bits(ctx.xmm[0].low);
@@ -207,7 +207,7 @@ extern "system" fn redir_replacement(x: u64) -> u64 {
     std::hint::black_box(x).wrapping_add(1000)
 }
 
-unsafe extern "system" fn redirect_handler(ctx: *mut HookContext) {
+unsafe extern "C" fn redirect_handler(ctx: *mut HookContext) {
     let ctx = unsafe { &mut *ctx };
     #[cfg(target_arch = "x86_64")]
     {

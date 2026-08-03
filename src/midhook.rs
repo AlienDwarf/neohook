@@ -197,7 +197,14 @@ pub struct HookContext {
 /// registers and `MXCSR` snapshotted and restored around it, so it may freely
 /// clobber registers and modify the context block in place. It must not block
 /// indefinitely or unwind across the FFI boundary.
-pub type MidHookHandler = unsafe extern "system" fn(context: *mut HookContext);
+///
+/// The handler uses the C calling convention (`__cdecl` on x86), like the rest
+/// of the C ABI.
+// The convention has to stay `extern "C"`: cbindgen emits the typedef without a
+// convention annotation, which MSVC reads as `__cdecl`. An `extern "system"`
+// handler would make every x86 handler written in C or C++ unbalance the stack,
+// and the x86 stub pops the argument itself to match.
+pub type MidHookHandler = unsafe extern "C" fn(context: *mut HookContext);
 
 /// An installed mid-function detour.
 ///
@@ -503,7 +510,8 @@ fn build_stub(stub_addr: *mut u8, handler: *const u8, gateway: *mut u8) -> Vec<u
     c.push(0x50); // push eax        (arg)
     c.push(0xB8); // mov eax, imm32
     c.extend_from_slice(&(handler as u32).to_le_bytes());
-    c.extend_from_slice(&[0xFF, 0xD0]); // call eax  (stdcall: callee pops the arg)
+    c.extend_from_slice(&[0xFF, 0xD0]); // call eax
+    c.extend_from_slice(&[0x83, 0xC4, 0x04]); // add esp, 4  (cdecl: the caller pops the arg)
 
     // --- pick the jump target: redirect_eip if the handler set it, else gateway ---
     // esp == context base here; redirect_eip is at offset 168. eax/ecx are

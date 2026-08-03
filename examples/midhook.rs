@@ -19,7 +19,7 @@ extern "system" fn price_for(quantity: u64) -> u64 {
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe extern "system" fn discount_handler(ctx: *mut HookContext) {
+unsafe extern "C" fn discount_handler(ctx: *mut HookContext) {
     // Win64 passes the first integer argument in RCX. Give every order +5 units
     // for free by bumping the quantity before the multiplication runs.
     let ctx = unsafe { &mut *ctx };
@@ -28,7 +28,7 @@ unsafe extern "system" fn discount_handler(ctx: *mut HookContext) {
 }
 
 #[cfg(target_arch = "x86")]
-unsafe extern "system" fn discount_handler(ctx: *mut HookContext) {
+unsafe extern "C" fn discount_handler(ctx: *mut HookContext) {
     // On x86 `extern "system"` arguments arrive on the stack, so this handler
     // just observes a register instead of rewriting the argument.
     let ctx = unsafe { &*ctx };

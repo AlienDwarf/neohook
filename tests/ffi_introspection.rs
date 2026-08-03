@@ -52,7 +52,7 @@ extern "system" fn mid_target(x: u64) -> u64 {
 
 static MID_RAN: AtomicBool = AtomicBool::new(false);
 
-unsafe extern "system" fn mid_handler(_ctx: *mut HookContext) {
+unsafe extern "C" fn mid_handler(_ctx: *mut HookContext) {
     MID_RAN.store(true, Ordering::SeqCst);
 }
 
