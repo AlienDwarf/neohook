@@ -51,6 +51,24 @@ jobs:
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Verify the generated C header is up to date
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: |
+          cargo build --features generate-headers
+          git diff --exit-code -- include/neohook.h
+
+      # The C ABI is only really exercised once a C/C++ compiler consumes
+      # include/neohook.h and include/neohook.hpp, so the native examples are
+      # built with /W4 /WX and run for both architectures.
+      - name: Setup MSVC for the native examples
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.target == 'i686-pc-windows-msvc' && 'x86' || 'x64' }}
+
+      - name: Build and run the C / C++ examples
+        shell: pwsh
+        run: .\examples\build.ps1 -Target ${{ matrix.target }} -Run
+
       - name: Build docs
         run: cargo doc --no-deps --target ${{ matrix.target }}
 
