@@ -197,7 +197,7 @@ Add the crate to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-neohook = "0.12.0"
+neohook = "0.13.0"
 ```
 
 ---
