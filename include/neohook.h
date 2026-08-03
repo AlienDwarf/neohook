@@ -55,8 +55,6 @@ typedef struct Int3Hook Int3Hook;
  */
 typedef struct MidHook MidHook;
 
-typedef struct Option_DetoursTamperCallback Option_DetoursTamperCallback;
-
 /**
  * An installed VEH (hardware-breakpoint) hook.
  *
@@ -209,8 +207,28 @@ typedef struct HookContext {
  * registers and `MXCSR` snapshotted and restored around it, so it may freely
  * clobber registers and modify the context block in place. It must not block
  * indefinitely or unwind across the FFI boundary.
+ *
+ * The handler uses the C calling convention (`__cdecl` on x86), like the rest
+ * of the C ABI.
  */
 typedef void (*MidHookHandler)(struct HookContext *context);
+
+/**
+ * Callback invoked once per tamper episode by a watchdog. `restored` is `1` if
+ * the watchdog rewrote the canonical bytes this sweep, `0` otherwise. The
+ * `expected`/`found` buffers are each `len` bytes and valid only for the
+ * duration of the call. `user` is the opaque pointer passed to
+ * `detours_watchdog_set_on_tamper`.
+ *
+ * Pass `NULL` to clear an installed callback.
+ */
+typedef void (*DetoursTamperCallback)(uint64_t guard_id,
+                                      const uint8_t *target,
+                                      const uint8_t *expected,
+                                      const uint8_t *found,
+                                      uintptr_t len,
+                                      int32_t restored,
+                                      void *user);
 
 #ifdef __cplusplus
 extern "C" {
@@ -1065,7 +1083,7 @@ int32_t detours_watchdog_set_mode(const struct Watchdog *wd, int32_t detect_only
  * passed through unchanged on every invocation.
  */
 int32_t detours_watchdog_set_on_tamper(const struct Watchdog *wd,
-                                       struct Option_DetoursTamperCallback cb,
+                                       DetoursTamperCallback cb,
                                        void *user);
 
 /**

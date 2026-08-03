@@ -151,6 +151,18 @@ namespace neohook
         return const_cast<uint8_t *>(detours_find_function_by_ordinal(module.c_str(), ordinal));
     }
 
+    /**
+     * @brief Resolves a symbol inside a module via dbghelp, covering PDB symbols
+     *        as well as exports - so non-exported functions can be found by name.
+     *
+     * Returns nullptr if dbghelp cannot initialize, the module is not loaded, or
+     * the symbol is unknown.
+     */
+    inline void *resolve_symbol(const std::string &module, const std::string &symbol)
+    {
+        return const_cast<uint8_t *>(detours_resolve_symbol(module.c_str(), symbol.c_str()));
+    }
+
     // ----------------- Pattern / signature scanning -----------------
 
     /**
@@ -634,6 +646,34 @@ namespace neohook
                 throw std::runtime_error("NeoHook: Failed to install VEH hook");
         }
 
+        /**
+         * @brief Installs a VEH hook that also builds a callable gateway to the
+         *        original function, retrievable with original().
+         *
+         * Lets the detour forward to the original - e.g. to use its return value -
+         * without re-triggering the breakpoint.
+         */
+        static VehHook with_original(const void *target, const void *detour)
+        {
+            ::VehHook *h = detours_veh_install_with_original(
+                static_cast<const uint8_t *>(target),
+                static_cast<const uint8_t *>(detour));
+            if (!h)
+                throw std::runtime_error("NeoHook: Failed to install VEH hook with original");
+            return VehHook(h);
+        }
+
+        /**
+         * @brief Returns the callable original-function pointer, cast to T.
+         *
+         * Null unless the hook was created with with_original().
+         */
+        template <typename T>
+        T original() const
+        {
+            return reinterpret_cast<T>(const_cast<uint8_t *>(detours_veh_original(hook_)));
+        }
+
         ~VehHook()
         {
             if (hook_)
@@ -671,6 +711,8 @@ namespace neohook
         }
 
     private:
+        explicit VehHook(::VehHook *hook) : hook_(hook) {}
+
         ::VehHook *hook_ = nullptr;
     };
 
@@ -760,6 +802,34 @@ namespace neohook
                 throw std::runtime_error("NeoHook: Failed to install INT3 hook");
         }
 
+        /**
+         * @brief Installs an INT3 hook that also builds a callable gateway to the
+         *        original function, retrievable with original().
+         *
+         * Lets the detour forward to the original without re-triggering the
+         * breakpoint.
+         */
+        static Int3Hook with_original(const void *target, const void *detour)
+        {
+            ::Int3Hook *h = detours_int3_install_with_original(
+                static_cast<const uint8_t *>(target),
+                static_cast<const uint8_t *>(detour));
+            if (!h)
+                throw std::runtime_error("NeoHook: Failed to install INT3 hook with original");
+            return Int3Hook(h);
+        }
+
+        /**
+         * @brief Returns the callable original-function pointer, cast to T.
+         *
+         * Null unless the hook was created with with_original().
+         */
+        template <typename T>
+        T original() const
+        {
+            return reinterpret_cast<T>(const_cast<uint8_t *>(detours_int3_original(hook_)));
+        }
+
         ~Int3Hook()
         {
             if (hook_)
@@ -797,6 +867,8 @@ namespace neohook
         }
 
     private:
+        explicit Int3Hook(::Int3Hook *hook) : hook_(hook) {}
+
         ::Int3Hook *hook_ = nullptr;
     };
 
@@ -864,5 +936,120 @@ namespace neohook
 
     private:
         ::DelayHook *hook_ = nullptr;
+    };
+
+    /**
+     * @brief RAII guard for the anti-tamper watchdog.
+     *
+     * Spawns a background thread that wakes every @p interval_ms, compares each
+     * guarded region against the snapshot taken by guard(), and - depending on
+     * set_detect_only() - either rewrites the region or only reports it through
+     * the on_tamper() callback. The thread is stopped and joined on destruction.
+     *
+     * Install the hook *before* guarding its bytes: guard() snapshots what is
+     * there at that moment, and that image is what the watchdog restores. Call
+     * unguard() before unhooking the target.
+     */
+    class Watchdog
+    {
+    public:
+        /** @brief Signature of the tamper callback. Runs on the watchdog thread. */
+        typedef DetoursTamperCallback TamperCallback;
+
+        explicit Watchdog(uint32_t interval_ms)
+        {
+            wd_ = detours_watchdog_create(interval_ms);
+            if (!wd_)
+                throw std::runtime_error("NeoHook: Failed to create watchdog");
+        }
+
+        ~Watchdog()
+        {
+            if (wd_)
+                detours_watchdog_destroy(wd_);
+        }
+
+        Watchdog(const Watchdog &) = delete;
+        Watchdog &operator=(const Watchdog &) = delete;
+
+        Watchdog(Watchdog &&other) noexcept : wd_(other.wd_)
+        {
+            other.wd_ = nullptr;
+        }
+
+        Watchdog &operator=(Watchdog &&other) noexcept
+        {
+            if (this != &other)
+            {
+                if (wd_)
+                    detours_watchdog_destroy(wd_);
+                wd_ = other.wd_;
+                other.wd_ = nullptr;
+            }
+            return *this;
+        }
+
+        /**
+         * @brief Snapshots @p len bytes at @p target and starts guarding them.
+         *
+         * @return A non-zero guard id for unguard(), or 0 on failure.
+         */
+        uint64_t guard(const void *target, size_t len)
+        {
+            return wd_ ? detours_watchdog_guard(wd_, static_cast<const uint8_t *>(target),
+                                                static_cast<uintptr_t>(len))
+                       : 0;
+        }
+
+        /** @brief Stops guarding the region identified by @p id. */
+        bool unguard(uint64_t id)
+        {
+            return wd_ && detours_watchdog_unguard(wd_, id) != 0;
+        }
+
+        /** @brief How many times a tampered region has been rewritten so far. */
+        uint64_t restorations() const
+        {
+            return wd_ ? detours_watchdog_restorations(wd_) : 0;
+        }
+
+        /**
+         * @brief Selects the reaction to tampering: re-apply the patch (false,
+         *        the default) or only report it (true).
+         */
+        bool set_detect_only(bool detect_only)
+        {
+            return wd_ && detours_watchdog_set_mode(wd_, detect_only ? 1 : 0) != 0;
+        }
+
+        /**
+         * @brief Installs the tamper callback, invoked once per tamper episode.
+         *
+         * @p user is passed back unchanged on every invocation and must outlive
+         * the watchdog.
+         */
+        bool on_tamper(TamperCallback cb, void *user = nullptr)
+        {
+            return wd_ && detours_watchdog_set_on_tamper(wd_, cb, user) != 0;
+        }
+
+        /** @brief Clears a previously installed tamper callback. */
+        bool clear_on_tamper()
+        {
+            return wd_ && detours_watchdog_set_on_tamper(wd_, nullptr, nullptr) != 0;
+        }
+
+        /** @brief Stops the background thread early. Idempotent. */
+        void destroy()
+        {
+            if (wd_)
+            {
+                detours_watchdog_destroy(wd_);
+                wd_ = nullptr;
+            }
+        }
+
+    private:
+        ::Watchdog *wd_ = nullptr;
     };
 }

@@ -197,7 +197,7 @@ Add the crate to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-neohook = "0.12.0"
+neohook = "0.13.0"
 ```
 
 ---
@@ -458,7 +458,8 @@ extern "system" fn price_for(quantity: u64) -> u64 {
 }
 
 // Reached with the live CPU state; Win64 holds the first argument in RCX.
-unsafe extern "system" fn handler(ctx: *mut HookContext) {
+// Handlers use the C calling convention, matching `MidHookHandler` in neohook.h.
+unsafe extern "C" fn handler(ctx: *mut HookContext) {
     let ctx = &mut *ctx;
     ctx.rcx = ctx.rcx.wrapping_add(5); // rewrite the argument in flight
 }

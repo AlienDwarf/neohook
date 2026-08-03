@@ -1817,15 +1817,22 @@ pub unsafe extern "C" fn detours_watchdog_set_mode(
 /// `expected`/`found` buffers are each `len` bytes and valid only for the
 /// duration of the call. `user` is the opaque pointer passed to
 /// `detours_watchdog_set_on_tamper`.
-pub type DetoursTamperCallback = unsafe extern "C" fn(
-    guard_id: u64,
-    target: *const u8,
-    expected: *const u8,
-    found: *const u8,
-    len: usize,
-    restored: i32,
-    user: *mut c_void,
-);
+///
+/// Pass `NULL` to clear an installed callback.
+// The `Option` belongs in the alias, not at the call site: cbindgen renders
+// `Option<FnPtr>` as a plain nullable function pointer, but cannot see through
+// `Option<SomeAlias>` and would emit an opaque, uncallable struct instead.
+pub type DetoursTamperCallback = Option<
+    unsafe extern "C" fn(
+        guard_id: u64,
+        target: *const u8,
+        expected: *const u8,
+        found: *const u8,
+        len: usize,
+        restored: i32,
+        user: *mut c_void,
+    ),
+>;
 
 /// Installs (`cb != NULL`) or clears (`cb == NULL`) the tamper callback. The
 /// callback runs on the watchdog's background thread.
@@ -1839,7 +1846,7 @@ pub type DetoursTamperCallback = unsafe extern "C" fn(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn detours_watchdog_set_on_tamper(
     wd: *const crate::watchdog::Watchdog,
-    cb: Option<DetoursTamperCallback>,
+    cb: DetoursTamperCallback,
     user: *mut c_void,
 ) -> i32 {
     if wd.is_null() {

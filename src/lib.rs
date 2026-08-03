@@ -484,7 +484,7 @@ macro_rules! trace_raw {
     ($target:expr, args = $n:expr $(,)?) => {{
         // A fresh handler per expansion: macro hygiene gives each its own item,
         // so each hardcodes its own target name via `stringify!`.
-        unsafe extern "system" fn __neohook_raw_handler(__ctx: *mut $crate::HookContext) {
+        unsafe extern "C" fn __neohook_raw_handler(__ctx: *mut $crate::HookContext) {
             // SAFETY: the MidHook stub passes a valid pointer to the captured
             // context for the duration of this call.
             let __ctx = unsafe { &*__ctx };
