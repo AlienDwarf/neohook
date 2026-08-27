@@ -1775,8 +1775,9 @@ impl TransactionCore {
     }
 
     /// Prints a human-readable snapshot of this transaction to standard output:
-    /// its status, the threads it has suspended, every pending hook, and any
-    /// thread redirections recorded so far.
+    /// its status, the threads it has suspended, every pending hook, the thread
+    /// and stack redirections recorded so far, and whether the process-wide
+    /// transaction lock is held.
     ///
     /// Writes to the host process's stdout, so call it only from a process you
     /// control - and never while threads are suspended, where taking the stdout
@@ -1831,19 +1832,41 @@ impl TransactionCore {
                         i, object_vptr, vtable_len, index
                     );
                 }
-                PendingHook::Detach(_) => {
-                    println!("  [{}] DETACH", i);
-                }
+                PendingHook::Detach(target) => match target {
+                    DetachTarget::HookPtr(hook) => {
+                        println!("  [{}] DETACH: Hook {:p}", i, hook);
+                    }
+                    DetachTarget::HandleIndex { handle, index } => {
+                        println!("  [{}] DETACH: Handle {:p}[{}]", i, handle, index);
+                    }
+                },
             }
         }
 
-        if !self.redirected_threads.is_empty() {
-            println!("RIP-Redirections: {}", self.redirected_threads.len());
+        println!("RIP-Redirections: {}", self.redirected_threads.len());
+        for (h, original_rip) in &self.redirected_threads {
+            println!(
+                "  [Thread] Handle: {:?} original IP: 0x{:X}",
+                h, original_rip
+            );
         }
 
-        if !self.redirected_stacks.is_empty() {
-            println!("Stack-Redirections: {}", self.redirected_stacks.len());
+        println!("Stack-Redirections: {}", self.redirected_stacks.len());
+        for (h, stack_addr, original_value) in &self.redirected_stacks {
+            println!(
+                "  [Thread] Handle: {:?} slot 0x{:X} original: 0x{:X}",
+                h, stack_addr, original_value
+            );
         }
+
+        println!(
+            "Global lock: {}",
+            if self.global_lock.is_some() {
+                "HELD"
+            } else {
+                "not held"
+            }
+        );
 
         println!("----------------------------------\n");
     }
