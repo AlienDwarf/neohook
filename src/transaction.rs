@@ -1247,7 +1247,7 @@ impl TransactionCore {
         // suspended earlier this is a no-op, since the lock is already held.
         self.acquire_global_lock();
 
-        #[cfg(debug_assertions)]
+        #[cfg(feature = "debug-log")]
         println!(
             "[Commit] Starting transaction with {} Hooks and {} threads...",
             self.pending_hooks.len(),
@@ -1436,7 +1436,7 @@ impl TransactionCore {
             );
         }
 
-        #[cfg(debug_assertions)]
+        #[cfg(feature = "debug-log")]
         println!(
             "[Commit] transaction successfully committed with {} hooks installed.",
             installed.len()
@@ -1502,13 +1502,13 @@ impl TransactionCore {
 
             // fill context struct with current thread
             if GetThreadContext(h_thread, context) == 0 {
-                #[cfg(debug_assertions)]
+                #[cfg(feature = "debug-log")]
                 eprintln!("[Debug] Couldn't read context for thread {:?}", h_thread);
                 // Skip if we can't get the context
                 return Ok(());
             }
 
-            #[cfg(debug_assertions)]
+            #[cfg(feature = "debug-log")]
             let tid = windows_sys::Win32::System::Threading::GetThreadId(h_thread);
 
             #[cfg(target_arch = "x86_64")]
@@ -1521,7 +1521,7 @@ impl TransactionCore {
 
             // 1. RIP Redirection
             if original_rip >= target_start && original_rip < target_end {
-                #[cfg(debug_assertions)]
+                #[cfg(feature = "debug-log")]
                 println!(
                     "[DEBUG] Thread {} Instruction Pointer has been redirected",
                     tid
@@ -1534,7 +1534,7 @@ impl TransactionCore {
 
                 #[cfg(target_arch = "x86_64")]
                 {
-                    #[cfg(debug_assertions)]
+                    #[cfg(feature = "debug-log")]
                     println!(
                         "RIP: 0x{:X} -> 0x{:X} (Trampoline + {})",
                         original_rip, data.trampoline.ptr as usize, redirected_ip
@@ -1544,7 +1544,7 @@ impl TransactionCore {
 
                 #[cfg(target_arch = "x86")]
                 {
-                    #[cfg(debug_assertions)]
+                    #[cfg(feature = "debug-log")]
                     println!(
                         "EIP: 0x{:X} -> 0x{:X} (Trampoline + {})",
                         original_rip, data.trampoline.ptr as u32, redirected_ip
@@ -1589,12 +1589,12 @@ impl TransactionCore {
                     if let Some(new_return_addr) =
                         Self::map_redirect_address_exact(data, stack_value)?
                     {
-                        #[cfg(debug_assertions)]
+                        #[cfg(feature = "debug-log")]
                         println!(
                             "[Stack] Thread {} return address found on stack at 0x{:X}:",
                             tid, current_stack_addr
                         );
-                        #[cfg(debug_assertions)]
+                        #[cfg(feature = "debug-log")]
                         println!("        0x{:X} -> 0x{:X}", stack_value, new_return_addr);
 
                         self.redirected_stacks
@@ -1649,7 +1649,7 @@ impl TransactionCore {
 
                     SetThreadContext(h_thread, context);
 
-                    #[cfg(debug_assertions)]
+                    #[cfg(feature = "debug-log")]
                     println!(
                         "[Rollback] Thread restored to Original-IP 0x{:X}",
                         original_rip
@@ -1774,7 +1774,13 @@ impl TransactionCore {
         }
     }
 
-    #[cfg(debug_assertions)]
+    /// Prints a human-readable snapshot of this transaction to standard output:
+    /// its status, the threads it has suspended, every pending hook, and any
+    /// thread redirections recorded so far.
+    ///
+    /// Writes to the host process's stdout, so call it only from a process you
+    /// control - and never while threads are suspended, where taking the stdout
+    /// lock can deadlock against a suspended holder.
     pub fn dump_state(&self) {
         println!("\n--- [DETOUR TRANSACTION DEBUG] ---");
         println!(

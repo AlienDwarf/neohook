@@ -307,7 +307,15 @@ impl DetourTransaction {
         }
     }
 
-    #[cfg(debug_assertions)]
+    /// Prints a human-readable snapshot of the transaction to standard output.
+    ///
+    /// A debugging aid for inspecting what a transaction is about to do: its
+    /// status, the threads it has suspended, and every pending hook. Does
+    /// nothing once the transaction has been committed or aborted.
+    ///
+    /// This writes to the host process's stdout, so call it only from a process
+    /// you control - and never between suspending threads and resuming them,
+    /// where taking the stdout lock can deadlock against a suspended holder.
     pub fn dump_state(&self) {
         if let Some(inner) = &self.inner {
             inner.dump_state();

@@ -23,6 +23,10 @@ doctest = false
 
 [features]
 generate-headers = ["dep:cbindgen"]
+# Opt-in diagnostic messenger. Off by default. *Can*
+# deadlock against a suspended thread. Enable only when debugging neohook
+# itself, in a process you control.
+debug-log = []
 
 [dependencies]
 windows-sys = { version = "0.61.2", features = [
