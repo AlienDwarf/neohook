@@ -23,10 +23,7 @@ doctest = false
 
 [features]
 generate-headers = ["dep:cbindgen"]
-# Opt-in diagnostics from the commit path. Off by default, because a library
-# has no business writing to its host's stderr uninvited. Events recorded while
-# threads are suspended are buffered and only written once they are resumed, so
-# enabling this does not risk a deadlock against a suspended thread.
+# Opt-in diagnostics from the commit path. Off by default
 debug-log = []
 
 [dependencies]
