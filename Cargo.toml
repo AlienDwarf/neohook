@@ -23,6 +23,8 @@ doctest = false
 
 [features]
 generate-headers = ["dep:cbindgen"]
+# Opt-in diagnostics from the commit path. Off by default
+debug-log = []
 
 [dependencies]
 windows-sys = { version = "0.61.2", features = [

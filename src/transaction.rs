@@ -560,6 +560,55 @@ pub type VtableHook = crate::vtable::VTableHook;
 /// Installed per-instance VTable hook type used by transaction commits.
 pub type VtableInstanceHook = crate::vtable::VTableInstanceHook;
 
+/// A diagnostic event recorded while the transaction may hold threads suspended.
+///
+/// The commit path cannot log as it goes: between the first `SuspendThread` and
+/// the matching `ResumeThread`, taking the stdout lock can deadlock against a
+/// suspended holder, and *formatting* is no safer - `format!` allocates, so it
+/// can block on the heap lock or re-enter a hook the caller placed on the
+/// allocator itself.
+///
+/// So the window records plain `Copy` data into a buffer whose capacity is
+/// reserved before any thread is suspended, and [`TransactionCore::flush_debug_events`]
+/// does the formatting and writing once every thread is running again.
+#[cfg(feature = "debug-log")]
+#[derive(Clone, Copy)]
+enum DebugEvent {
+    CommitStart {
+        hooks: usize,
+        threads: usize,
+    },
+    ContextReadFailed {
+        thread: HANDLE,
+    },
+    IpRedirected {
+        tid: u32,
+        from: usize,
+        to: usize,
+    },
+    StackRedirected {
+        tid: u32,
+        slot: usize,
+        from: usize,
+        to: usize,
+    },
+    RollbackIp {
+        thread: HANDLE,
+        to: u64,
+    },
+    CommitDone {
+        hooks: usize,
+    },
+}
+
+/// Events buffered per transaction before recording starts dropping them.
+///
+/// Sized for a redirect-heavy commit (one instruction-pointer event per thread
+/// plus a handful of stack slots each); past that the count is reported instead,
+/// because growing the buffer would allocate inside the suspend window.
+#[cfg(feature = "debug-log")]
+const DEBUG_EVENT_CAPACITY: usize = 512;
+
 pub struct TransactionCore {
     threads: Vec<HANDLE>,
     pending_hooks: Vec<PendingHook>,
@@ -571,6 +620,12 @@ pub struct TransactionCore {
     // transactions on different threads cannot suspend each other or patch
     // code concurrently. `None` while the transaction holds no lock.
     global_lock: Option<std::sync::MutexGuard<'static, ()>>,
+    // Diagnostics captured while threads may be suspended, flushed once they are
+    // resumed. See `DebugEvent` for why nothing is formatted in the window.
+    #[cfg(feature = "debug-log")]
+    debug_events: Vec<DebugEvent>,
+    #[cfg(feature = "debug-log")]
+    debug_events_dropped: usize,
 }
 
 impl TransactionCore {
@@ -589,6 +644,12 @@ impl TransactionCore {
             redirected_threads: Vec::new(),
             redirected_stacks: Vec::new(),
             global_lock: None,
+            // Reserved here, before the first suspension, so recording an event
+            // later never has to allocate.
+            #[cfg(feature = "debug-log")]
+            debug_events: Vec::with_capacity(DEBUG_EVENT_CAPACITY),
+            #[cfg(feature = "debug-log")]
+            debug_events_dropped: 0,
         }
     }
 
@@ -1247,12 +1308,11 @@ impl TransactionCore {
         // suspended earlier this is a no-op, since the lock is already held.
         self.acquire_global_lock();
 
-        #[cfg(debug_assertions)]
-        println!(
-            "[Commit] Starting transaction with {} Hooks and {} threads...",
-            self.pending_hooks.len(),
-            self.threads.len()
-        );
+        #[cfg(feature = "debug-log")]
+        self.record_debug(DebugEvent::CommitStart {
+            hooks: self.pending_hooks.len(),
+            threads: self.threads.len(),
+        });
 
         let pending = std::mem::take(&mut self.pending_hooks);
         let mut installed: Vec<Hook> = Vec::new();
@@ -1436,11 +1496,10 @@ impl TransactionCore {
             );
         }
 
-        #[cfg(debug_assertions)]
-        println!(
-            "[Commit] transaction successfully committed with {} hooks installed.",
-            installed.len()
-        );
+        #[cfg(feature = "debug-log")]
+        self.record_debug(DebugEvent::CommitDone {
+            hooks: installed.len(),
+        });
 
         // resume threads
         self.cleanup_threads();
@@ -1502,13 +1561,13 @@ impl TransactionCore {
 
             // fill context struct with current thread
             if GetThreadContext(h_thread, context) == 0 {
-                #[cfg(debug_assertions)]
-                eprintln!("[Debug] Couldn't read context for thread {:?}", h_thread);
+                #[cfg(feature = "debug-log")]
+                self.record_debug(DebugEvent::ContextReadFailed { thread: h_thread });
                 // Skip if we can't get the context
                 return Ok(());
             }
 
-            #[cfg(debug_assertions)]
+            #[cfg(feature = "debug-log")]
             let tid = windows_sys::Win32::System::Threading::GetThreadId(h_thread);
 
             #[cfg(target_arch = "x86_64")]
@@ -1521,34 +1580,26 @@ impl TransactionCore {
 
             // 1. RIP Redirection
             if original_rip >= target_start && original_rip < target_end {
-                #[cfg(debug_assertions)]
-                println!(
-                    "[DEBUG] Thread {} Instruction Pointer has been redirected",
-                    tid
-                );
                 let redirected_ip = Self::map_redirect_address_exact(data, original_rip)?
                     .ok_or(DetourError::RelocationFailed)?;
 
                 self.redirected_threads
                     .push((h_thread, original_rip as u64));
 
+                #[cfg(feature = "debug-log")]
+                self.record_debug(DebugEvent::IpRedirected {
+                    tid,
+                    from: original_rip,
+                    to: redirected_ip,
+                });
+
                 #[cfg(target_arch = "x86_64")]
                 {
-                    #[cfg(debug_assertions)]
-                    println!(
-                        "RIP: 0x{:X} -> 0x{:X} (Trampoline + {})",
-                        original_rip, data.trampoline.ptr as usize, redirected_ip
-                    );
                     context.Rip = redirected_ip as u64;
                 }
 
                 #[cfg(target_arch = "x86")]
                 {
-                    #[cfg(debug_assertions)]
-                    println!(
-                        "EIP: 0x{:X} -> 0x{:X} (Trampoline + {})",
-                        original_rip, data.trampoline.ptr as u32, redirected_ip
-                    );
                     context.Eip = redirected_ip as u32;
                 }
 
@@ -1589,13 +1640,13 @@ impl TransactionCore {
                     if let Some(new_return_addr) =
                         Self::map_redirect_address_exact(data, stack_value)?
                     {
-                        #[cfg(debug_assertions)]
-                        println!(
-                            "[Stack] Thread {} return address found on stack at 0x{:X}:",
-                            tid, current_stack_addr
-                        );
-                        #[cfg(debug_assertions)]
-                        println!("        0x{:X} -> 0x{:X}", stack_value, new_return_addr);
+                        #[cfg(feature = "debug-log")]
+                        self.record_debug(DebugEvent::StackRedirected {
+                            tid,
+                            slot: current_stack_addr,
+                            from: stack_value,
+                            to: new_return_addr,
+                        });
 
                         self.redirected_stacks
                             .push((h_thread, current_stack_addr, stack_value));
@@ -1627,8 +1678,16 @@ impl TransactionCore {
 
     /// Rollback function to undo all installed hooks in case of an error during commit. It takes a mutable reference to the list of installed hooks and unhooks each one.
     fn rollback(&mut self, installed: &mut Vec<Hook>) {
-        // restore threads first before unhook
-        for (h_thread, original_rip) in self.redirected_threads.drain(..) {
+        // restore threads first before unhook.
+        //
+        // Indexed rather than `drain(..)`/`mem::take`: draining would keep
+        // `self` borrowed for the whole body, so recording a diagnostic event
+        // inside it would not compile, and `mem::take` would drop the old
+        // buffer here - a `free()` inside the suspend window, the very hazard
+        // the deferred logging exists to avoid. The entries are `Copy`, so
+        // indexing them out and clearing afterwards keeps the allocation.
+        for idx in 0..self.redirected_threads.len() {
+            let (h_thread, original_rip) = self.redirected_threads[idx];
             unsafe {
                 #[repr(align(16))]
                 struct AlignedContext(CONTEXT);
@@ -1649,14 +1708,15 @@ impl TransactionCore {
 
                     SetThreadContext(h_thread, context);
 
-                    #[cfg(debug_assertions)]
-                    println!(
-                        "[Rollback] Thread restored to Original-IP 0x{:X}",
-                        original_rip
-                    );
+                    #[cfg(feature = "debug-log")]
+                    self.record_debug(DebugEvent::RollbackIp {
+                        thread: h_thread,
+                        to: original_rip,
+                    });
                 }
             }
         }
+        self.redirected_threads.clear();
 
         for (_h_thread, stack_addr, original_value) in self.redirected_stacks.drain(..) {
             unsafe {
@@ -1686,6 +1746,83 @@ impl TransactionCore {
         }
     }
 
+    /// Records a diagnostic event for later output.
+    ///
+    /// Safe to call with threads suspended: it only copies plain data into the
+    /// buffer reserved by [`Self::begin`]. Once that buffer is full the event is
+    /// counted rather than stored, since pushing past the reserved capacity
+    /// would reallocate - an allocation inside the suspend window is exactly
+    /// what this whole mechanism exists to avoid.
+    #[cfg(feature = "debug-log")]
+    fn record_debug(&mut self, event: DebugEvent) {
+        if self.debug_events.len() < self.debug_events.capacity() {
+            self.debug_events.push(event);
+        } else {
+            self.debug_events_dropped += 1;
+        }
+    }
+
+    /// Formats and writes every buffered event, then empties the buffer.
+    ///
+    /// Called from [`Self::cleanup_threads`] once every thread has been resumed,
+    /// so formatting and locking the output stream are safe again. Draining
+    /// makes repeat calls harmless.
+    ///
+    /// Writes to stderr with a fallible `writeln!` rather than `println!`, for
+    /// the same reason [`crate::trace`] does: diagnostics must never panic the
+    /// host process over a failed write.
+    #[cfg(feature = "debug-log")]
+    fn flush_debug_events(&mut self) {
+        use std::io::Write;
+
+        if self.debug_events.is_empty() && self.debug_events_dropped == 0 {
+            return;
+        }
+
+        let mut err = std::io::stderr().lock();
+        for event in self.debug_events.drain(..) {
+            let _ = match event {
+                DebugEvent::CommitStart { hooks, threads } => writeln!(
+                    err,
+                    "[Commit] Starting transaction with {hooks} Hooks and {threads} threads..."
+                ),
+                DebugEvent::ContextReadFailed { thread } => {
+                    writeln!(err, "[Debug] Couldn't read context for thread {thread:?}")
+                }
+                DebugEvent::IpRedirected { tid, from, to } => writeln!(
+                    err,
+                    "[Redirect] Thread {tid} instruction pointer 0x{from:X} -> 0x{to:X}"
+                ),
+                DebugEvent::StackRedirected {
+                    tid,
+                    slot,
+                    from,
+                    to,
+                } => writeln!(
+                    err,
+                    "[Stack] Thread {tid} return address at 0x{slot:X}: 0x{from:X} -> 0x{to:X}"
+                ),
+                DebugEvent::RollbackIp { thread, to } => writeln!(
+                    err,
+                    "[Rollback] Thread {thread:?} restored to original IP 0x{to:X}"
+                ),
+                DebugEvent::CommitDone { hooks } => writeln!(
+                    err,
+                    "[Commit] transaction successfully committed with {hooks} hooks installed."
+                ),
+            };
+        }
+
+        if self.debug_events_dropped > 0 {
+            let _ = writeln!(
+                err,
+                "[Debug] {} further event(s) dropped: buffer full",
+                self.debug_events_dropped
+            );
+            self.debug_events_dropped = 0;
+        }
+    }
+
     fn cleanup_threads(&mut self) {
         for &h in &self.threads {
             unsafe {
@@ -1697,6 +1834,11 @@ impl TransactionCore {
         // All threads have been resumed; release the process-wide transaction
         // lock (if this transaction holds it) so another transaction can run.
         self.global_lock = None;
+
+        // Only now is it safe to format and write: nothing is suspended, so the
+        // stdout and heap locks cannot be held by a frozen thread.
+        #[cfg(feature = "debug-log")]
+        self.flush_debug_events();
     }
 
     // Apply an inline hook, returning an InstalledHook on success.
@@ -1774,7 +1916,14 @@ impl TransactionCore {
         }
     }
 
-    #[cfg(debug_assertions)]
+    /// Prints a human-readable snapshot of this transaction to standard output:
+    /// its status, the threads it has suspended, every pending hook, the thread
+    /// and stack redirections recorded so far, and whether the process-wide
+    /// transaction lock is held.
+    ///
+    /// Writes to the host process's stdout, so call it only from a process you
+    /// control - and never while threads are suspended, where taking the stdout
+    /// lock can deadlock against a suspended holder.
     pub fn dump_state(&self) {
         println!("\n--- [DETOUR TRANSACTION DEBUG] ---");
         println!(
@@ -1825,19 +1974,41 @@ impl TransactionCore {
                         i, object_vptr, vtable_len, index
                     );
                 }
-                PendingHook::Detach(_) => {
-                    println!("  [{}] DETACH", i);
-                }
+                PendingHook::Detach(target) => match target {
+                    DetachTarget::HookPtr(hook) => {
+                        println!("  [{}] DETACH: Hook {:p}", i, hook);
+                    }
+                    DetachTarget::HandleIndex { handle, index } => {
+                        println!("  [{}] DETACH: Handle {:p}[{}]", i, handle, index);
+                    }
+                },
             }
         }
 
-        if !self.redirected_threads.is_empty() {
-            println!("RIP-Redirections: {}", self.redirected_threads.len());
+        println!("RIP-Redirections: {}", self.redirected_threads.len());
+        for (h, original_rip) in &self.redirected_threads {
+            println!(
+                "  [Thread] Handle: {:?} original IP: 0x{:X}",
+                h, original_rip
+            );
         }
 
-        if !self.redirected_stacks.is_empty() {
-            println!("Stack-Redirections: {}", self.redirected_stacks.len());
+        println!("Stack-Redirections: {}", self.redirected_stacks.len());
+        for (h, stack_addr, original_value) in &self.redirected_stacks {
+            println!(
+                "  [Thread] Handle: {:?} slot 0x{:X} original: 0x{:X}",
+                h, stack_addr, original_value
+            );
         }
+
+        println!(
+            "Global lock: {}",
+            if self.global_lock.is_some() {
+                "HELD"
+            } else {
+                "not held"
+            }
+        );
 
         println!("----------------------------------\n");
     }
@@ -1902,6 +2073,12 @@ impl Drop for TransactionCore {
         if self.is_pending {
             self.abort();
         }
+
+        // Backstop: a transaction that recorded events without ever suspending a
+        // thread never reaches `cleanup_threads`. Draining makes this a no-op
+        // when the flush already happened.
+        #[cfg(feature = "debug-log")]
+        self.flush_debug_events();
     }
 }
 
@@ -2114,5 +2291,81 @@ unsafe fn read_managed_gateway_target(src: *const u8) -> Option<*const u8> {
         std::ptr::copy_nonoverlapping(src.add(1), rel.as_mut_ptr(), 4);
         let rel = i32::from_le_bytes(rel) as isize;
         Some(src.offset(5 + rel))
+    }
+}
+
+#[cfg(all(test, feature = "debug-log"))]
+mod debug_log_tests {
+    use super::{DEBUG_EVENT_CAPACITY, DebugEvent, TransactionCore};
+
+    /// The buffer must be usable without allocating, because events are recorded
+    /// while other threads are suspended - where the heap lock may be held by a
+    /// frozen thread, or hooked by the caller.
+    #[test]
+    fn recording_never_reallocates() {
+        let mut tx = TransactionCore::begin();
+        let capacity = tx.debug_events.capacity();
+        let buffer_start = tx.debug_events.as_ptr();
+
+        assert!(
+            capacity >= DEBUG_EVENT_CAPACITY,
+            "begin() must reserve the buffer up front"
+        );
+
+        // Fill it exactly, then push well past the end.
+        for i in 0..capacity + 64 {
+            tx.record_debug(DebugEvent::CommitDone { hooks: i });
+        }
+
+        assert_eq!(
+            tx.debug_events.as_ptr(),
+            buffer_start,
+            "buffer moved: recording reallocated inside the suspend window"
+        );
+        assert_eq!(tx.debug_events.len(), capacity);
+        assert_eq!(
+            tx.debug_events_dropped, 64,
+            "overflow must be counted, not stored"
+        );
+
+        tx.abort();
+    }
+
+    /// Flushing empties the buffer, so the backstop call in `Drop` cannot print
+    /// the same events a second time.
+    #[test]
+    fn flushing_drains_the_buffer() {
+        let mut tx = TransactionCore::begin();
+        tx.record_debug(DebugEvent::CommitStart {
+            hooks: 1,
+            threads: 2,
+        });
+        tx.record_debug(DebugEvent::CommitDone { hooks: 1 });
+        assert_eq!(tx.debug_events.len(), 2);
+
+        tx.flush_debug_events();
+        assert!(tx.debug_events.is_empty());
+        assert_eq!(tx.debug_events_dropped, 0);
+
+        // Second flush is a no-op rather than a repeat.
+        tx.flush_debug_events();
+        assert!(tx.debug_events.is_empty());
+
+        tx.abort();
+    }
+
+    /// `cleanup_threads` is the single point every commit and abort path passes
+    /// through, so it is what guarantees a flush happens after threads resume.
+    #[test]
+    fn abort_flushes_through_cleanup_threads() {
+        let mut tx = TransactionCore::begin();
+        tx.record_debug(DebugEvent::CommitDone { hooks: 7 });
+
+        tx.abort();
+
+        assert!(
+            tx.debug_events.is_empty(),
+            "abort() must flush via cleanup_threads()"
+        );
     }
 }
