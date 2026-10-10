@@ -4,6 +4,7 @@ use crate::DetourError;
 use crate::introspect;
 use crate::transaction::{Hook, TransactionCore};
 use std::ffi::{CStr, CString, c_char, c_void};
+use std::marker::PhantomData;
 use windows_sys::Win32::Foundation::HMODULE;
 
 /// Runs an FFI body, returning `on_panic` instead of letting a panic cross the C
@@ -30,17 +31,22 @@ fn ffi_guard<T>(on_panic: T, body: impl FnOnce() -> T) -> T {
 ///
 /// Any resources tracked by the transaction are cleaned up automatically when
 /// the transaction is dropped.
+///
+/// The lifetime ties the transaction to the hooks queued with
+/// [`Self::detach`]: they stay borrowed until the transaction is committed,
+/// aborted or dropped.
 #[repr(C)]
-pub struct DetourTransaction {
+pub struct DetourTransaction<'a> {
     /// Internal transaction state.
     ///
     /// This is wrapped in an `Option` so the transaction can be safely moved
     /// out during [`Self::commit`] or [`Self::abort`], preventing accidental
     /// reuse after completion.
     pub(crate) inner: Option<TransactionCore>,
+    pub(crate) detached: PhantomData<&'a mut Hook>,
 }
 
-impl DetourTransaction {
+impl<'a> DetourTransaction<'a> {
     /// Begins a new detour transaction.
     ///
     /// The returned transaction can be used to register inline or IAT hooks and
@@ -52,6 +58,7 @@ impl DetourTransaction {
         crate::reclaim::reclaim();
         Self {
             inner: Some(TransactionCore::begin()),
+            detached: PhantomData,
         }
     }
 
@@ -274,11 +281,16 @@ impl DetourTransaction {
     /// If a later operation in the same transaction fails, the hook is
     /// re-enabled before the commit error is returned. On success, `hook` is
     /// made inert and dropping it afterwards is a no-op.
-    pub fn detach(&mut self, hook: &mut Hook) -> Result<(), DetourError> {
-        self.inner
-            .as_mut()
-            .ok_or(DetourError::NotStarted)?
-            .detach(hook)
+    ///
+    /// `hook` stays mutably borrowed for the rest of the transaction, so it can
+    /// be neither moved nor dropped before the commit applies the detach. To
+    /// queue several hooks from one collection, borrow them disjointly, e.g.
+    /// with `iter_mut()`.
+    pub fn detach(&mut self, hook: &'a mut Hook) -> Result<(), DetourError> {
+        let inner = self.inner.as_mut().ok_or(DetourError::NotStarted)?;
+        // SAFETY: the `'a` borrow keeps `hook` alive and in place until this
+        // transaction is committed, aborted or dropped.
+        unsafe { inner.detach(hook) }
     }
 
     /// Commits the transaction and returns the installed hooks.
@@ -324,7 +336,7 @@ impl DetourTransaction {
     }
 }
 
-impl Drop for DetourTransaction {
+impl Drop for DetourTransaction<'_> {
     fn drop(&mut self) {
         self.abort();
     }
@@ -353,7 +365,7 @@ pub unsafe extern "C" fn detours_code_from_pointer(pointer: *const u8) -> *mut u
 ///
 /// Returns a non-null pointer on success.
 #[unsafe(no_mangle)]
-pub extern "C" fn detours_transaction_begin() -> *mut DetourTransaction {
+pub extern "C" fn detours_transaction_begin() -> *mut DetourTransaction<'static> {
     Box::into_raw(Box::new(DetourTransaction::begin()))
 }
 
@@ -370,7 +382,7 @@ pub extern "C" fn detours_transaction_begin() -> *mut DetourTransaction {
 /// `detours_transaction_begin()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn detours_transaction_update_thread(
-    tx: *mut DetourTransaction,
+    tx: *mut DetourTransaction<'static>,
     thread_id: u32,
 ) -> i32 {
     if tx.is_null() {
@@ -396,7 +408,7 @@ pub unsafe extern "C" fn detours_transaction_update_thread(
 /// detour function, respectively.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn detours_transaction_attach(
-    tx: *mut DetourTransaction,
+    tx: *mut DetourTransaction<'static>,
     target: *mut u8,
     detour: *const u8,
 ) -> *mut u8 {
@@ -427,7 +439,7 @@ pub unsafe extern "C" fn detours_transaction_attach(
 /// `detours_transaction_commit()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn detours_transaction_detach(
-    tx: *mut DetourTransaction,
+    tx: *mut DetourTransaction<'static>,
     handle: *mut c_void,
     idx: usize,
 ) -> i32 {
@@ -461,7 +473,9 @@ pub unsafe extern "C" fn detours_transaction_detach(
 /// `detours_transaction_begin()`. Ownership of `tx` is consumed by this
 /// function, regardless of success or failure.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn detours_transaction_commit(tx: *mut DetourTransaction) -> *mut c_void {
+pub unsafe extern "C" fn detours_transaction_commit(
+    tx: *mut DetourTransaction<'static>,
+) -> *mut c_void {
     ffi_guard(std::ptr::null_mut(), || {
         if tx.is_null() {
             return std::ptr::null_mut();
@@ -597,7 +611,7 @@ pub unsafe extern "C" fn detours_handle_unhook_and_free(handle: *mut c_void) -> 
 /// `detours_transaction_begin()`. `h_module` must be a valid module handle
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn detours_transaction_attach_iat(
-    tx: *mut DetourTransaction,
+    tx: *mut DetourTransaction<'static>,
     h_module: *mut core::ffi::c_void,
     target_dll: *const std::ffi::c_char,
     target_func: *const std::ffi::c_char,
@@ -643,7 +657,7 @@ pub unsafe extern "C" fn detours_transaction_attach_iat(
 /// `target_func` must be a valid NUL-terminated C string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn detours_transaction_attach_eat(
-    tx: *mut DetourTransaction,
+    tx: *mut DetourTransaction<'static>,
     h_module: *mut core::ffi::c_void,
     target_func: *const std::ffi::c_char,
     detour: *const u8,
@@ -683,7 +697,7 @@ pub unsafe extern "C" fn detours_transaction_attach_eat(
 /// ABI/signature for the selected virtual method.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn detours_transaction_attach_vtable(
-    tx: *mut DetourTransaction,
+    tx: *mut DetourTransaction<'static>,
     vtable: *mut *mut u8,
     index: usize,
     detour: *const u8,
@@ -712,7 +726,7 @@ pub unsafe extern "C" fn detours_transaction_attach_vtable(
 /// vptr field, and `vtable_len` must cover the entire VTable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn detours_transaction_attach_vtable_instance(
-    tx: *mut DetourTransaction,
+    tx: *mut DetourTransaction<'static>,
     object_vptr: *mut *mut u8,
     index: usize,
     vtable_len: usize,
@@ -741,7 +755,9 @@ pub unsafe extern "C" fn detours_transaction_attach_vtable_instance(
 /// `tx` must be a valid transaction pointer previously returned by
 /// `detours_transaction_begin()`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn detours_transaction_update_all_threads(tx: *mut DetourTransaction) -> i32 {
+pub unsafe extern "C" fn detours_transaction_update_all_threads(
+    tx: *mut DetourTransaction<'static>,
+) -> i32 {
     if tx.is_null() {
         return 0;
     }
@@ -765,7 +781,7 @@ pub unsafe extern "C" fn detours_transaction_update_all_threads(tx: *mut DetourT
 /// `detours_transaction_begin()`. Ownership of `tx` is consumed by this
 /// function and it must not be used again afterwards.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn detours_transaction_abort(tx: *mut DetourTransaction) -> i32 {
+pub unsafe extern "C" fn detours_transaction_abort(tx: *mut DetourTransaction<'static>) -> i32 {
     if tx.is_null() {
         return 0;
     }
@@ -1329,7 +1345,7 @@ pub unsafe extern "C" fn detours_scan_range(
 /// NUL-terminated C strings.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn detours_transaction_attach_pattern(
-    tx: *mut DetourTransaction,
+    tx: *mut DetourTransaction<'static>,
     module: *const c_char,
     pattern: *const c_char,
     detour: *const u8,
@@ -1368,7 +1384,7 @@ pub unsafe extern "C" fn detours_transaction_attach_pattern(
 /// NUL-terminated C strings.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn detours_transaction_attach_export(
-    tx: *mut DetourTransaction,
+    tx: *mut DetourTransaction<'static>,
     module: *const c_char,
     func: *const c_char,
     detour: *const u8,

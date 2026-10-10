@@ -1232,7 +1232,13 @@ impl TransactionCore {
     /// in the same transaction fails, the hook is re-enabled before the error is
     /// returned. On successful commit the hook guard is made inert, so dropping
     /// it afterwards is a no-op.
-    pub fn detach(&mut self, hook: &mut Hook) -> Result<(), DetourError> {
+    ///
+    /// # Safety
+    ///
+    /// Only a pointer to `hook` is queued. It must stay alive and must not be
+    /// moved until this transaction is committed or aborted.
+    /// [`crate::DetourTransaction::detach`] enforces this with a borrow.
+    pub unsafe fn detach(&mut self, hook: &mut Hook) -> Result<(), DetourError> {
         if !self.is_pending {
             return Err(DetourError::NotStarted);
         }
