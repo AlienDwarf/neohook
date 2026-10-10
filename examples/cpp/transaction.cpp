@@ -15,6 +15,7 @@
  *   guard owns 1 hook(s)
  *   after scope exit: GetTickCount() = <real tick count>
  *   an abandoned transaction rolls back: GetTickCount() = <real tick count>
+ *   a failed commit throws: yes
  *   OK
  */
 
@@ -44,6 +45,16 @@ void check(bool condition, const char *message)
 std::uint32_t WINAPI hooked_get_tick_count()
 {
     return kFakeTicks;
+}
+
+int vtable_slot()
+{
+    return 1;
+}
+
+int vtable_detour()
+{
+    return 2;
 }
 
 } // namespace
@@ -107,6 +118,32 @@ int main()
         ticks = GetTickCount();
         std::printf("an abandoned transaction rolls back: GetTickCount() = %u\n", ticks);
         check(ticks != kFakeTicks, "an aborted transaction installed a hook anyway");
+
+        {
+            // A commit that fails throws, and the transaction is released exactly
+            // once. Releasing the vtable page between attach and commit leaves the
+            // slot unwritable, so the commit cannot succeed.
+            void **vtable = static_cast<void **>(
+                VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+            check(vtable != nullptr, "VirtualAlloc failed");
+            vtable[0] = reinterpret_cast<void *>(&vtable_slot);
+
+            bool threw = false;
+            {
+                neohook::Transaction tx;
+                tx.attach_vtable(vtable, 0, &vtable_detour);
+                VirtualFree(vtable, 0, MEM_RELEASE);
+                try {
+                    neohook::HookGuard guard = tx.commit();
+                } catch (const std::runtime_error &) {
+                    threw = true;
+                }
+            }
+            std::printf("a failed commit throws: %s\n", threw ? "yes" : "no");
+            check(threw, "a failed commit did not throw");
+            check(HeapValidate(GetProcessHeap(), 0, nullptr) != 0,
+                  "the process heap is corrupt after a failed commit");
+        }
     } catch (const std::exception &e) {
         std::fprintf(stderr, "unexpected exception: %s\n", e.what());
         return 1;
