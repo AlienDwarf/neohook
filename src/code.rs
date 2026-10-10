@@ -270,4 +270,46 @@ mod tests {
             assert_ne!(VirtualFree(page.cast(), 0, MEM_RELEASE), 0);
         }
     }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn code_from_pointer_follows_mov_r10_jmp_r10() {
+        unsafe {
+            let page = alloc_page();
+            assert!(!page.is_null());
+
+            let stub = page;
+            let target = page.add(128);
+
+            // mov r10, imm64 ; jmp r10
+            *stub.add(0) = 0x49;
+            *stub.add(1) = 0xBA;
+            std::ptr::write_unaligned(stub.add(2) as *mut u64, target as u64);
+            std::ptr::copy_nonoverlapping([0x41u8, 0xFF, 0xE2].as_ptr(), stub.add(10), 3);
+
+            assert_eq!(detour_code_from_pointer(stub), target);
+            assert_ne!(VirtualFree(page.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn code_from_pointer_ignores_mov_r10_jmp_other_register() {
+        unsafe {
+            let page = alloc_page();
+            assert!(!page.is_null());
+
+            let stub = page;
+            let target = page.add(128);
+
+            // mov r10, imm64 ; jmp rdx  (the jump does not use r10)
+            *stub.add(0) = 0x49;
+            *stub.add(1) = 0xBA;
+            std::ptr::write_unaligned(stub.add(2) as *mut u64, target as u64);
+            std::ptr::copy_nonoverlapping([0xFFu8, 0xE2].as_ptr(), stub.add(10), 2);
+
+            assert_eq!(detour_code_from_pointer(stub), stub);
+            assert_ne!(VirtualFree(page.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
 }
