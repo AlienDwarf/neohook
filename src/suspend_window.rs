@@ -140,3 +140,126 @@ fn commit_survives_concurrent_heap_use() {
         race_against(churn_heap)
     });
 }
+
+/// A one-export PE image in a read-only view of a pagefile section. Its export
+/// table is readable but can never be made writable, so an EAT hook on it gets
+/// all the way to the slot write and fails there.
+#[cfg(target_arch = "x86_64")]
+fn read_only_module() -> windows_sys::Win32::Foundation::HMODULE {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        IMAGE_DIRECTORY_ENTRY_EXPORT, IMAGE_NT_HEADERS64, IMAGE_NT_OPTIONAL_HDR64_MAGIC,
+    };
+    use windows_sys::Win32::System::Memory::{
+        FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE,
+    };
+
+    // Declared here: windows-sys only exposes it with its `Win32_Security`
+    // feature, which the crate does not otherwise need.
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateFileMappingW(
+            file: windows_sys::Win32::Foundation::HANDLE,
+            attributes: *const core::ffi::c_void,
+            protect: u32,
+            size_high: u32,
+            size_low: u32,
+            name: *const u16,
+        ) -> windows_sys::Win32::Foundation::HANDLE;
+    }
+    use windows_sys::Win32::System::SystemServices::{
+        IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_EXPORT_DIRECTORY, IMAGE_NT_SIGNATURE,
+    };
+
+    const NT: usize = 0x40;
+    const EXPORTS: u32 = 0x200;
+    const FUNCTIONS: u32 = 0x300;
+    const NAMES: u32 = 0x310;
+    const ORDINALS: u32 = 0x320;
+    const NAME: u32 = 0x340;
+
+    unsafe {
+        let section = CreateFileMappingW(
+            INVALID_HANDLE_VALUE,
+            std::ptr::null(),
+            PAGE_READWRITE,
+            0,
+            0x1000,
+            std::ptr::null(),
+        );
+        assert!(!section.is_null(), "create section");
+        let rw = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 0).Value as *mut u8;
+        assert!(!rw.is_null(), "map writable view");
+
+        let dos = rw as *mut IMAGE_DOS_HEADER;
+        (*dos).e_magic = IMAGE_DOS_SIGNATURE;
+        (*dos).e_lfanew = NT as i32;
+        let nt = rw.add(NT) as *mut IMAGE_NT_HEADERS64;
+        (*nt).Signature = IMAGE_NT_SIGNATURE;
+        (*nt).OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+        (*nt).OptionalHeader.SizeOfImage = 0x1000;
+        (*nt).OptionalHeader.NumberOfRvaAndSizes = 16;
+        let dir = &mut (*nt).OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT as usize];
+        dir.VirtualAddress = EXPORTS;
+        dir.Size = 0x100;
+
+        let exports = rw.add(EXPORTS as usize) as *mut IMAGE_EXPORT_DIRECTORY;
+        (*exports).NumberOfFunctions = 1;
+        (*exports).NumberOfNames = 1;
+        (*exports).AddressOfFunctions = FUNCTIONS;
+        (*exports).AddressOfNames = NAMES;
+        (*exports).AddressOfNameOrdinals = ORDINALS;
+        *(rw.add(FUNCTIONS as usize) as *mut u32) = 0x800;
+        *(rw.add(NAMES as usize) as *mut u32) = NAME;
+        *(rw.add(ORDINALS as usize) as *mut u16) = 0;
+        let name = c"Fake".to_bytes_with_nul();
+        std::ptr::copy_nonoverlapping(name.as_ptr(), rw.add(NAME as usize), name.len());
+
+        let ro = MapViewOfFile(section, FILE_MAP_READ, 0, 0, 0).Value;
+        assert!(!ro.is_null(), "map read-only view");
+        ro as windows_sys::Win32::Foundation::HMODULE
+    }
+}
+
+/// An EAT hook whose detour needs a jump stub, and whose slot write fails inside
+/// the commit, must not release the stub until the threads run again: that
+/// takes the stub quarantine lock, which a suspended thread may hold.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn failed_eat_write_releases_its_stub_after_resume() {
+    run_in_child("failed_eat_write_releases_its_stub_after_resume", || {
+        let module = read_only_module();
+        let mut tx = crate::transaction::TransactionCore::begin();
+        // Below the module base, so the slot cannot encode it and a stub is built.
+        tx.attach_eat(module, "Fake", 0x10 as *const u8)
+            .expect("attach_eat on the read-only module");
+
+        let held = Arc::new(AtomicBool::new(false));
+        let held_in = Arc::clone(&held);
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            tid_tx
+                .send(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() })
+                .expect("send thread id");
+            crate::reclaim::hold_quarantine(&held_in, Duration::from_secs(1));
+        });
+        let holder_tid = tid_rx.recv().expect("holder thread id");
+        while !held.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+
+        tx.update_thread(holder_tid).expect("track holder");
+        let err = tx.commit().expect_err("the slot write must fail");
+        assert!(
+            matches!(
+                err,
+                crate::DetourError::CommitFailed {
+                    kind: crate::HookKind::Eat,
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+        holder.join().expect("holder thread");
+    });
+}
