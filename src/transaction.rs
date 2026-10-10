@@ -675,7 +675,8 @@ impl TransactionCore {
     /// any thread is suspended, otherwise two transactions could suspend each
     /// other and deadlock.
     fn acquire_global_lock(&mut self) {
-        if self.global_lock.is_none() {
+        // A thread already inside `with_code_lock` keeps the lock it holds.
+        if self.global_lock.is_none() && !owns_transaction_lock() {
             self.global_lock = Some(lock_transaction());
         }
     }
@@ -2129,9 +2130,8 @@ impl Drop for TransactionCore {
 /// Lock order: this lock first, then any other crate mutex (gateway registry,
 /// stub quarantine, INT3 slot manager), never the reverse.
 ///
-/// A transaction must not be nested on the same thread (i.e. suspend threads or
-/// commit a second transaction while a first one on that thread still holds the
-/// lock), as the lock is not reentrant and that would deadlock.
+/// A transaction started on a thread that already holds the lock (inside
+/// [`with_code_lock`]) runs under that hold instead of taking it again.
 static TRANSACTION_LOCK: Mutex<()> = Mutex::new(());
 
 /// Thread id of the current [`TRANSACTION_LOCK`] holder, or 0 while it is free.

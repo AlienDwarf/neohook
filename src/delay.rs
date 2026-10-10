@@ -142,27 +142,10 @@ impl DelayHook {
             return Err(DelayHookError::InvalidParameter);
         }
 
-        let mut mgr = lock_manager();
-        ensure_ldr_hook(&mut mgr)?;
-
-        let id = mgr.next_id;
-        mgr.next_id += 1;
-
-        let mut pending = Pending {
-            id,
-            module: module.to_ascii_lowercase(),
-            func: func.to_string(),
-            detour,
-            hook: None,
-        };
-
-        // If the module is already loaded, install right away.
-        if let Some(target) = resolve_loaded(&pending.module, &pending.func) {
-            pending.hook = unsafe { Int3Hook::install(target, detour) }.ok();
-        }
-
-        mgr.pending.push(pending);
-        Ok(Self { id })
+        // Transaction lock before the manager, as everywhere else. The other
+        // order deadlocks against a lock holder whose LoadLibrary call waits for
+        // the manager in the LdrLoadDll detour.
+        crate::transaction::with_code_lock(|| unsafe { register_locked(module, func, detour) })
     }
 
     /// Returns whether the underlying module has been loaded and the hook is now
@@ -183,6 +166,10 @@ impl DelayHook {
     }
 
     fn remove(&mut self) {
+        crate::transaction::with_code_lock(|| self.remove_locked());
+    }
+
+    fn remove_locked(&mut self) {
         let mut mgr = lock_manager();
         if let Some(pos) = mgr.pending.iter().position(|p| p.id == self.id) {
             let pending = mgr.pending.remove(pos);
@@ -203,6 +190,35 @@ impl Drop for DelayHook {
     fn drop(&mut self) {
         self.remove();
     }
+}
+
+/// Body of [`DelayHook::register`], run with the transaction lock held.
+unsafe fn register_locked(
+    module: &str,
+    func: &str,
+    detour: *const u8,
+) -> Result<DelayHook, DelayHookError> {
+    let mut mgr = lock_manager();
+    ensure_ldr_hook(&mut mgr)?;
+
+    let id = mgr.next_id;
+    mgr.next_id += 1;
+
+    let mut pending = Pending {
+        id,
+        module: module.to_ascii_lowercase(),
+        func: func.to_string(),
+        detour,
+        hook: None,
+    };
+
+    // If the module is already loaded, install right away.
+    if let Some(target) = resolve_loaded(&pending.module, &pending.func) {
+        pending.hook = unsafe { Int3Hook::install(target, detour) }.ok();
+    }
+
+    mgr.pending.push(pending);
+    Ok(DelayHook { id })
 }
 
 /// Locks the manager, recovering from a poisoned mutex.
