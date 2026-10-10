@@ -706,8 +706,10 @@ fn main() {
 The argument names in the signature are reused for the closure parameters.
 Returns `Result<Vec<Hook>, DetourError>` like `detour_inline!`; keep the value
 alive to keep the hook installed. The closure is heap-allocated and leaked for
-the process lifetime, and - like any detour - may run concurrently, so guard any
-mutable captured state yourself. See
+the process lifetime, and - like any detour - may run concurrently, so it must be
+`Fn + Send + Sync`: keep mutable state in atomics or behind a lock. Each macro
+invocation drives one live hook at a time; running it again works once the
+previous hook is dropped. See
 [`examples/closure_detour.rs`](examples/closure_detour.rs).
 
 ---
