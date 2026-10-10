@@ -330,4 +330,50 @@ mod tests {
             "original should be restored after unhook"
         );
     }
+
+    unsafe extern "system" fn fake_tick_count() -> u32 {
+        0x1234_5678
+    }
+
+    /// The trampoline `hooked_ldr_load_dll` forwards to right now.
+    fn forwarded_ldr() -> *const u8 {
+        ORIG_LDR.get().map_or(std::ptr::null(), |f| *f as *const u8)
+    }
+
+    #[test]
+    fn reregistering_forwards_to_the_new_ldr_trampoline() {
+        // kernel32 is always loaded, so these install immediately; only the
+        // LdrLoadDll hook lifecycle matters here.
+        let first = unsafe {
+            DelayHook::register("kernel32.dll", "GetTickCount", fake_tick_count as *const u8)
+        }
+        .expect("first register");
+        drop(first);
+
+        let second = unsafe {
+            DelayHook::register("kernel32.dll", "GetTickCount", fake_tick_count as *const u8)
+        }
+        .expect("second register");
+
+        let current = lock_manager()
+            .ldr_hook
+            .as_ref()
+            .expect("LdrLoadDll hook installed")
+            .original_ptr();
+        assert_eq!(
+            forwarded_ldr(),
+            current,
+            "LdrLoadDll detour must forward to the trampoline of the live hook"
+        );
+
+        // Free the first trampoline, then load a module through the detour.
+        crate::reclaim();
+        let module = unsafe { LoadLibraryW(wide("version.dll").as_ptr()) };
+        assert!(
+            !module.is_null(),
+            "a load through the re-installed hook works"
+        );
+
+        drop(second);
+    }
 }
