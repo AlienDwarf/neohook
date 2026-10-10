@@ -288,6 +288,10 @@ macro_rules! detour_helper {
 /// - The closure is heap-allocated and **leaked** for the lifetime of the
 ///   process (the per-site shim references it through a `static`). Unhooking
 ///   stops it from being called but does not free it.
+/// - Each macro invocation has one shim, so it drives at most one live hook at
+///   a time. Running the same invocation again (e.g. from a helper function)
+///   works once the previous hook is gone; while it is still installed the
+///   second install returns [`DetourError::InvalidParameter`].
 /// - Like any detour, the closure may run concurrently on multiple threads. It
 ///   is `FnMut`, so if it mutates captured state you are responsible for making
 ///   that state thread-safe.
@@ -325,7 +329,13 @@ macro_rules! detour_closure {
         type __ClosureBox =
             ::std::boxed::Box<dyn ::std::ops::FnMut(__OrigFn, $($argty),*) $(-> $ret)?>;
 
-        static __ORIG: ::std::sync::OnceLock<__OrigFn> = ::std::sync::OnceLock::new();
+        // Per-invocation shim state. All three are replaced on every install,
+        // so running this invocation again after its hook was dropped picks up
+        // the new trampoline instead of the reclaimed one.
+        static __ORIG: ::std::sync::atomic::AtomicPtr<u8> =
+            ::std::sync::atomic::AtomicPtr::new(::std::ptr::null_mut());
+        static __TARGET: ::std::sync::atomic::AtomicPtr<u8> =
+            ::std::sync::atomic::AtomicPtr::new(::std::ptr::null_mut());
         static __CLOSURE: ::std::sync::atomic::AtomicPtr<__ClosureBox> =
             ::std::sync::atomic::AtomicPtr::new(::std::ptr::null_mut());
 
@@ -333,9 +343,11 @@ macro_rules! detour_closure {
         // ABI, loads the boxed closure, and dispatches with the original first.
         extern $abi fn __shim($($arg : $argty),*) $(-> $ret)? {
             let __p = __CLOSURE.load(::std::sync::atomic::Ordering::Acquire);
-            let __orig = *__ORIG
-                .get()
-                .expect("neohook: closure detour original not set");
+            let __tramp = __ORIG.load(::std::sync::atomic::Ordering::Acquire);
+            assert!(!__tramp.is_null(), "neohook: closure detour original not set");
+            // SAFETY: `__tramp` is the trampoline returned by `attach` for the
+            // live hook, stored before the commit made this shim reachable.
+            let __orig: __OrigFn = unsafe { ::std::mem::transmute(__tramp) };
             // SAFETY: `__p` points at a leaked Box set during install and is
             // never freed while the hook is live.
             unsafe { (&mut **__p)(__orig $(, $arg)*) }
@@ -345,20 +357,32 @@ macro_rules! detour_closure {
         // owns it so we can hand a stable `*mut __ClosureBox` to the shim.
         let __boxed: ::std::boxed::Box<__ClosureBox> =
             ::std::boxed::Box::new(::std::boxed::Box::new($closure));
-        __CLOSURE.store(
-            ::std::boxed::Box::into_raw(__boxed),
-            ::std::sync::atomic::Ordering::Release,
-        );
+        let __target = $target as *mut u8;
 
-        let mut __session = $crate::DetourTransaction::begin();
-        __session.update_all_threads();
-        match __session.attach($target as *mut u8, __shim as *const u8) {
-            ::std::result::Result::Ok(__tramp) => {
-                let __orig_fn: __OrigFn = unsafe { ::std::mem::transmute(__tramp) };
-                let _ = __ORIG.set(__orig_fn);
-                __session.commit()
+        // One shim serves one hook. If the previous target still resolves to
+        // the shim, that hook is live and its state must not be replaced.
+        let __shim_code = unsafe { $crate::detour_code_from_pointer(__shim as *const u8) };
+        let __prev = __TARGET.load(::std::sync::atomic::Ordering::Acquire);
+        if !__prev.is_null() && unsafe { $crate::detour_code_from_pointer(__prev) } == __shim_code
+        {
+            ::std::result::Result::Err($crate::DetourError::InvalidParameter)
+        } else {
+            let mut __session = $crate::DetourTransaction::begin();
+            __session.update_all_threads();
+            match __session.attach(__target, __shim as *const u8) {
+                ::std::result::Result::Ok(__tramp) => {
+                    // Publish before the commit patches the target, so the first
+                    // call through the shim already sees this hook's state.
+                    __CLOSURE.store(
+                        ::std::boxed::Box::into_raw(__boxed),
+                        ::std::sync::atomic::Ordering::Release,
+                    );
+                    __ORIG.store(__tramp, ::std::sync::atomic::Ordering::Release);
+                    __TARGET.store(__target, ::std::sync::atomic::Ordering::Release);
+                    __session.commit()
+                }
+                ::std::result::Result::Err(__e) => ::std::result::Result::Err(__e),
             }
-            ::std::result::Result::Err(__e) => ::std::result::Result::Err(__e),
         }
     }};
 }
