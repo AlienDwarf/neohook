@@ -502,6 +502,56 @@ fn program_slot(ctx: &mut CONTEXT, slot: usize, address: usize, enable: bool) {
 mod tests {
     use super::*;
 
+    #[repr(align(16))]
+    struct AlignedContext(CONTEXT);
+
+    /// Calls the handler directly with a single-step at `addr` whose context
+    /// carries `dr6` and `dr0`, as if the trap raced an unhook.
+    fn handle_stale_trap(addr: usize, dr6: DrWord, dr0: DrWord) -> (i32, CONTEXT) {
+        let mut ctx: AlignedContext = unsafe { std::mem::zeroed() };
+        ctx.0.Dr6 = dr6;
+        ctx.0.Dr0 = dr0;
+        ctx.0.Dr7 = 1;
+        let mut record: EXCEPTION_RECORD = unsafe { std::mem::zeroed() };
+        record.ExceptionCode = STATUS_SINGLE_STEP;
+        record.ExceptionAddress = addr as *mut _;
+        let mut pointers = EXCEPTION_POINTERS {
+            ExceptionRecord: &mut record,
+            ContextRecord: &mut ctx.0,
+        };
+        let verdict = unsafe { veh_handler(&mut pointers) };
+        (verdict, ctx.0)
+    }
+
+    #[test]
+    fn handler_resumes_traps_of_removed_hooks() {
+        // An address no live slot uses, recorded as recently removed.
+        let addr = 0x7FFE_1230usize;
+        let next = RETIRED_NEXT.fetch_add(1, Ordering::Relaxed) % RETIRED_COUNT;
+        RETIRED[next].store(addr, Ordering::Release);
+
+        // DR6 reports slot 0, but the unhook already cleared DR0.
+        let (verdict, ctx) = handle_stale_trap(addr, 1, 0);
+        assert_eq!(
+            verdict, EXCEPTION_CONTINUE_EXECUTION,
+            "DR6 hit, DR0 cleared"
+        );
+        assert_ne!(ctx.EFlags & 0x1_0000, 0, "resume flag set");
+        assert_eq!(ctx.Dr6, 0, "DR6 consumed");
+
+        // DR6 already empty.
+        let (verdict, _) = handle_stale_trap(addr, 0, 0);
+        assert_eq!(verdict, EXCEPTION_CONTINUE_EXECUTION, "DR6 empty");
+
+        RETIRED[next].store(0, Ordering::Release);
+    }
+
+    #[test]
+    fn handler_leaves_foreign_single_steps_alone() {
+        let (verdict, _) = handle_stale_trap(0x7FFE_4560, 0, 0);
+        assert_eq!(verdict, EXCEPTION_CONTINUE_SEARCH);
+    }
+
     extern "system" fn slot_target_a() -> u32 {
         std::hint::black_box(1)
     }
