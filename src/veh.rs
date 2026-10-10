@@ -368,13 +368,22 @@ unsafe extern "system" fn veh_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         program_slot(ctx, slot, live, live != 0);
         handled = true;
     }
-    // The trap can also be captured after an unhook already cleared the
-    // thread's debug registers, leaving DR6 empty. Recognise those by the
-    // address of a recently removed hook.
-    if !handled && hits == 0 {
-        handled = RETIRED
+    // The trap can also be captured after an unhook already rewrote the
+    // thread's debug registers, so DR6 is empty or the fired slot no longer
+    // holds the address. Recognise those by the address of a recently removed
+    // hook, and re-sync every slot DR6 reports.
+    if !handled
+        && RETIRED
             .iter()
-            .any(|retired| retired.load(Ordering::Acquire) == fault_addr);
+            .any(|retired| retired.load(Ordering::Acquire) == fault_addr)
+    {
+        for (slot, slot_target) in SLOT_TARGET.iter().enumerate() {
+            if hits & ((1 as DrWord) << slot) != 0 {
+                let live = slot_target.load(Ordering::Acquire);
+                program_slot(ctx, slot, live, live != 0);
+            }
+        }
+        handled = true;
     }
     if !handled {
         return EXCEPTION_CONTINUE_SEARCH;
