@@ -364,11 +364,17 @@ unsafe fn write_export_slot_with(
         return Err(EatHookError::ProtectFailed(std::io::Error::last_os_error()));
     }
 
+    let old_rva = unsafe { slot_ptr.read() };
     unsafe { slot_ptr.write(rva) };
 
     let mut ignored = 0u32;
     if unsafe { protect(slot_ptr.cast(), size, old_protect, &mut ignored) } == 0 {
-        return Err(EatHookError::ProtectFailed(std::io::Error::last_os_error()));
+        // Put the old RVA back so a caller that discards the new target (e.g.
+        // frees its stub) does not leave the export pointing at it.
+        let protect_err = std::io::Error::last_os_error();
+        unsafe { slot_ptr.write(old_rva) };
+        let _ = unsafe { protect(slot_ptr.cast(), size, old_protect, &mut ignored) };
+        return Err(EatHookError::ProtectFailed(protect_err));
     }
 
     Ok(())
