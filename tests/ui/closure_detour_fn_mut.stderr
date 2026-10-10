@@ -1,5 +1,7 @@
 error[E0594]: cannot assign to `calls`, as it is a captured variable in a `Fn` closure
   --> tests/ui/closure_detour_fn_mut.rs:14:9
    |
+13 |     let _ = detour_closure!(target, "system" fn(a: i32) -> i32, move |orig, a| {
+   |                                                                 -------------- in this closure
 14 |         calls += 1;
    |         ^^^^^^^^^^ cannot assign

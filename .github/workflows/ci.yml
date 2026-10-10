@@ -48,6 +48,14 @@ jobs:
       - name: Test
         run: cargo test --target ${{ matrix.target }} --all-features -- --test-threads=1
 
+      # The expected compiler errors are toolchain-specific, so the compile-fail
+      # tests run on a pinned toolchain instead of the moving stable one.
+      - name: Compile-fail tests
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal
+          cargo +1.99.0 test --test compile_fail -- --ignored
+
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }}
 
