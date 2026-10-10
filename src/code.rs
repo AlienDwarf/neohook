@@ -86,7 +86,8 @@ unsafe fn detour_code_from_pointer_once(src: *const u8) -> Option<*const u8> {
         0x49 => {
             let op1 = unsafe { read_value::<u8>(src.add(1))? };
             // mov r10, imm64; jmp r10
-            if op1 == 0xBA && unsafe { read_value::<u16>(src.add(10))? } == 0xE2FF {
+            // `jmp r10` is 41 FF E2; plain FF E2 would be `jmp rdx`.
+            if op1 == 0xBA && unsafe { read_value::<[u8; 3]>(src.add(10))? } == [0x41, 0xFF, 0xE2] {
                 let target = unsafe { read_value::<u64>(src.add(2))? };
                 Some(target as *const u8)
             } else {
