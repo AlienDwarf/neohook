@@ -2237,7 +2237,7 @@ fn register_managed_gateway(ptr: *mut u8) {
     });
 }
 
-fn unregister_managed_gateway(ptr: *mut u8) {
+pub(crate) fn unregister_managed_gateway(ptr: *mut u8) {
     let _ = managed_gateways().lock().map(|mut s| {
         s.remove(&(ptr as usize));
     });
