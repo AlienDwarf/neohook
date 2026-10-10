@@ -107,36 +107,41 @@ impl VTableHook {
         let slot = unsafe { vtable.add(index) };
         let slot_size = std::mem::size_of::<*mut u8>();
 
-        let mut old_protect = 0u32;
-        if unsafe {
-            crate::mem::virtual_protect_same_execute(
-                slot.cast(),
-                slot_size,
-                PAGE_READWRITE,
-                &mut old_protect,
-            )
-        } == 0
-        {
-            return Err(map_err(InternalVTableHookError::ProtectFailed(
-                std::io::Error::last_os_error(),
-            )));
-        }
-
-        let original_ptr = unsafe { *slot };
-        unsafe {
-            *slot = detour as *mut u8;
-        }
-
-        let mut ignored = 0u32;
-        if unsafe { VirtualProtect(slot.cast(), slot_size, old_protect, &mut ignored) } == 0 {
-            let protect_err = std::io::Error::last_os_error();
-            unsafe {
-                *slot = original_ptr;
+        // Serialized with every other code and table write on the page.
+        let original_ptr = crate::transaction::with_code_lock(|| {
+            let mut old_protect = 0u32;
+            if unsafe {
+                crate::mem::virtual_protect_same_execute(
+                    slot.cast(),
+                    slot_size,
+                    PAGE_READWRITE,
+                    &mut old_protect,
+                )
+            } == 0
+            {
+                return Err(map_err(InternalVTableHookError::ProtectFailed(
+                    std::io::Error::last_os_error(),
+                )));
             }
-            let _ = unsafe { VirtualProtect(slot.cast(), slot_size, old_protect, &mut ignored) };
 
-            return Err(map_err(InternalVTableHookError::ProtectFailed(protect_err)));
-        }
+            let original_ptr = unsafe { *slot };
+            unsafe {
+                *slot = detour as *mut u8;
+            }
+
+            let mut ignored = 0u32;
+            if unsafe { VirtualProtect(slot.cast(), slot_size, old_protect, &mut ignored) } == 0 {
+                let protect_err = std::io::Error::last_os_error();
+                unsafe {
+                    *slot = original_ptr;
+                }
+                let _ =
+                    unsafe { VirtualProtect(slot.cast(), slot_size, old_protect, &mut ignored) };
+
+                return Err(map_err(InternalVTableHookError::ProtectFailed(protect_err)));
+            }
+            Ok(original_ptr)
+        })?;
 
         Ok(Self {
             slot,
@@ -198,7 +203,12 @@ impl VTableHook {
     }
 
     /// Writes `value` into `slot`, flipping page protection around the write.
+    /// Serialized with every other code and table write on the page.
     fn write_slot(slot: *mut *mut u8, value: *mut u8) -> Result<(), DetourError> {
+        crate::transaction::with_code_lock(|| Self::write_slot_locked(slot, value))
+    }
+
+    fn write_slot_locked(slot: *mut *mut u8, value: *mut u8) -> Result<(), DetourError> {
         if slot.is_null() {
             return Err(map_err(InternalVTableHookError::NullVTable).into());
         }
@@ -240,6 +250,37 @@ impl Drop for VTableHook {
     fn drop(&mut self) {
         if self.active {
             let _ = self.perform_unhook();
+        }
+    }
+}
+
+/// Heap storage for a per-instance VTable clone, released on drop unless a hook
+/// takes it over.
+pub(crate) struct ClonedVtable {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl ClonedVtable {
+    /// Allocates room for a clone of a VTable with `len` slots.
+    pub(crate) fn new(len: usize) -> Result<Self, VTableHookError> {
+        if len == 0 {
+            return Err(map_err(InternalVTableHookError::InvalidLength));
+        }
+        let layout = Layout::array::<*mut u8>(len)
+            .map_err(|_| map_err(InternalVTableHookError::AllocationFailed))?;
+        let ptr = unsafe { alloc(layout) };
+        if ptr.is_null() {
+            return Err(map_err(InternalVTableHookError::AllocationFailed));
+        }
+        Ok(Self { ptr, len })
+    }
+}
+
+impl Drop for ClonedVtable {
+    fn drop(&mut self) {
+        if let Ok(layout) = Layout::array::<*mut u8>(self.len) {
+            unsafe { dealloc(self.ptr, layout) };
         }
     }
 }
@@ -299,6 +340,39 @@ impl VTableInstanceHook {
             return Err(map_err(InternalVTableHookError::IndexOutOfRange));
         }
 
+        let mut table = Some(ClonedVtable::new(vtable_len)?);
+        unsafe { Self::install_into(object_vptr, index, detour, &mut table) }
+    }
+
+    /// Installs the hook into clone storage allocated up front, so a commit can
+    /// call this while other threads are suspended without touching the heap.
+    ///
+    /// `table` is taken only on success. On failure it is left in place for the
+    /// caller to release once doing so is safe.
+    ///
+    /// # Safety
+    /// Same contract as [`Self::install`], with `table` sized for the full VTable.
+    pub(crate) unsafe fn install_into(
+        object_vptr: *mut *mut u8,
+        index: usize,
+        detour: *const u8,
+        table: &mut Option<ClonedVtable>,
+    ) -> Result<Self, VTableHookError> {
+        let Some(storage) = table.as_ref() else {
+            return Err(map_err(InternalVTableHookError::AllocationFailed));
+        };
+        let (cloned_vtable, vtable_len) = (storage.ptr, storage.len);
+
+        if object_vptr.is_null() {
+            return Err(map_err(InternalVTableHookError::NullObject));
+        }
+        if detour.is_null() {
+            return Err(map_err(InternalVTableHookError::NullDetour));
+        }
+        if index >= vtable_len {
+            return Err(map_err(InternalVTableHookError::IndexOutOfRange));
+        }
+
         // The cloned slot is dispatched through a CFG-guarded indirect call; mark
         // the detour as a valid call target so dispatch holds under strict CFG /
         // export suppression. No-op otherwise and when CFG is not enforced.
@@ -310,14 +384,6 @@ impl VTableInstanceHook {
         }
 
         let original_vtable_ptr = original_vtable as *const *mut u8;
-
-        let layout = Layout::array::<*mut u8>(vtable_len)
-            .map_err(|_| map_err(InternalVTableHookError::AllocationFailed))?;
-
-        let cloned_vtable = unsafe { alloc(layout) };
-        if cloned_vtable.is_null() {
-            return Err(map_err(InternalVTableHookError::AllocationFailed));
-        }
 
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -333,44 +399,49 @@ impl VTableInstanceHook {
             *slot = detour as *mut u8;
         }
 
-        let mut old_protect = 0u32;
-        if unsafe {
-            crate::mem::virtual_protect_same_execute(
-                object_vptr.cast(),
-                std::mem::size_of::<*mut u8>(),
-                PAGE_READWRITE,
-                &mut old_protect,
-            )
-        } == 0
-        {
-            unsafe {
-                dealloc(cloned_vtable.cast(), layout);
+        // Serialized with every other code and table write on the page.
+        crate::transaction::with_code_lock(|| {
+            let mut old_protect = 0u32;
+            if unsafe {
+                crate::mem::virtual_protect_same_execute(
+                    object_vptr.cast(),
+                    std::mem::size_of::<*mut u8>(),
+                    PAGE_READWRITE,
+                    &mut old_protect,
+                )
+            } == 0
+            {
+                return Err(map_err(InternalVTableHookError::ProtectFailed(
+                    std::io::Error::last_os_error(),
+                )));
             }
-            return Err(map_err(InternalVTableHookError::ProtectFailed(
-                std::io::Error::last_os_error(),
-            )));
-        }
 
-        unsafe {
-            *object_vptr = cloned_vtable;
-        }
-
-        let mut ignored = 0u32;
-        if unsafe {
-            VirtualProtect(
-                object_vptr.cast(),
-                std::mem::size_of::<*mut u8>(),
-                old_protect,
-                &mut ignored,
-            )
-        } == 0
-        {
-            let restore_err = std::io::Error::last_os_error();
             unsafe {
-                *object_vptr = original_vtable;
-                dealloc(cloned_vtable.cast(), layout);
+                *object_vptr = cloned_vtable;
             }
-            return Err(map_err(InternalVTableHookError::ProtectFailed(restore_err)));
+
+            let mut ignored = 0u32;
+            if unsafe {
+                VirtualProtect(
+                    object_vptr.cast(),
+                    std::mem::size_of::<*mut u8>(),
+                    old_protect,
+                    &mut ignored,
+                )
+            } == 0
+            {
+                let restore_err = std::io::Error::last_os_error();
+                unsafe {
+                    *object_vptr = original_vtable;
+                }
+                return Err(map_err(InternalVTableHookError::ProtectFailed(restore_err)));
+            }
+            Ok(())
+        })?;
+
+        // The object now uses the clone; the hook owns and releases it from here.
+        if let Some(storage) = table.take() {
+            std::mem::forget(storage);
         }
 
         Ok(Self {
@@ -423,8 +494,13 @@ impl VTableInstanceHook {
     }
 
     /// Writes `value` into the object's vptr field, flipping page protection
-    /// around the write.
+    /// around the write. Serialized with every other code and table write on the
+    /// page.
     fn write_vptr(object_vptr: *mut *mut u8, value: *mut u8) -> Result<(), DetourError> {
+        crate::transaction::with_code_lock(|| Self::write_vptr_locked(object_vptr, value))
+    }
+
+    fn write_vptr_locked(object_vptr: *mut *mut u8, value: *mut u8) -> Result<(), DetourError> {
         let mut old_protect = 0u32;
         if unsafe {
             crate::mem::virtual_protect_same_execute(

@@ -41,6 +41,8 @@ mod watchdog;
 
 #[cfg(test)]
 mod export_sweep;
+#[cfg(test)]
+mod suspend_window;
 
 // Re-exports for public API
 pub use crate::api::DetourTransaction;

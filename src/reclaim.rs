@@ -60,6 +60,14 @@ fn lock_quarantine() -> std::sync::MutexGuard<'static, Vec<Region>> {
     QUARANTINE.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// Holds the quarantine lock for `duration`, setting `held` once it is taken.
+#[cfg(all(test, target_arch = "x86_64"))]
+pub(crate) fn hold_quarantine(held: &std::sync::atomic::AtomicBool, duration: std::time::Duration) {
+    let _quarantine = lock_quarantine();
+    held.store(true, std::sync::atomic::Ordering::Release);
+    std::thread::sleep(duration);
+}
+
 /// Hands an executable stub over for deferred, quiescence-checked release instead
 /// of freeing it immediately.
 ///

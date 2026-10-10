@@ -33,7 +33,6 @@
 //!   exceptions whose address matches a registered target and passes every other
 //!   breakpoint straight through, so an attached debugger keeps working.
 
-use std::ffi::c_void;
 use std::fmt;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -67,18 +66,30 @@ const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 static SLOT_TARGET: [AtomicUsize; MAX_HOOKS] = [const { AtomicUsize::new(0) }; MAX_HOOKS];
 static SLOT_DETOUR: [AtomicUsize; MAX_HOOKS] = [const { AtomicUsize::new(0) }; MAX_HOOKS];
 
+/// Number of recently removed targets remembered in [`RETIRED`].
+const RETIRED_LEN: usize = 1024;
+
+/// Ring of recently removed targets.
+///
+/// A thread can trap on the `0xCC` byte and be preempted before the handler
+/// runs; if the hook is removed meanwhile, its slot is gone. The handler uses
+/// this table to recognise such a stale trap and re-run the restored byte
+/// instead of passing an unhandled breakpoint on.
+static RETIRED: [AtomicUsize; RETIRED_LEN] = [const { AtomicUsize::new(0) }; RETIRED_LEN];
+
 /// Serializes installs/unhooks and owns the registered handler.
 struct Int3Manager {
     /// Handle from `AddVectoredExceptionHandler`, stored as `usize` so the
-    /// state is `Send`. Zero when no handler is registered.
+    /// state is `Send`. Zero until the first install. The handler is never
+    /// removed: a thread may still be on its way into it after an unhook.
     handler: usize,
-    /// Number of active hooks; the handler is removed when it drops to zero.
-    count: usize,
+    /// Next [`RETIRED`] index to overwrite.
+    retired_next: usize,
 }
 
 static MANAGER: Mutex<Int3Manager> = Mutex::new(Int3Manager {
     handler: 0,
-    count: 0,
+    retired_next: 0,
 });
 
 /// Errors produced while installing or removing an INT3 hook.
@@ -126,8 +137,9 @@ impl std::error::Error for Int3HookError {}
 /// An installed INT3 software-breakpoint hook.
 ///
 /// The hook stays active until it is explicitly removed with [`Self::unhook`]
-/// or dropped, at which point the original byte is restored and the vectored
-/// handler is removed once the last hook is gone.
+/// or dropped, at which point the original byte is restored. The vectored
+/// handler stays registered so a thread that trapped just before the removal
+/// is still resumed safely.
 #[derive(Debug)]
 pub struct Int3Hook {
     target: *const u8,
@@ -218,6 +230,30 @@ impl Int3Hook {
             None
         };
 
+        // The transaction lock serializes the byte write with every other code
+        // write on the page; it is taken before the slot manager.
+        crate::transaction::with_code_lock(|| unsafe { Self::arm(target, detour, gateway) })
+    }
+
+    /// Like [`Self::install`], but returns `None` without changing anything
+    /// instead of waiting while another thread holds the transaction lock.
+    pub(crate) unsafe fn try_install(
+        target: *const u8,
+        detour: *const u8,
+    ) -> Option<Result<Self, Int3HookError>> {
+        if target.is_null() || detour.is_null() {
+            return Some(Err(Int3HookError::InvalidParameter));
+        }
+        crate::transaction::try_with_code_lock(|| unsafe { Self::arm(target, detour, None) })
+    }
+
+    /// Publishes a slot for `target` and patches its entry byte. The caller holds
+    /// the transaction lock.
+    unsafe fn arm(
+        target: *const u8,
+        detour: *const u8,
+        gateway: Option<Trampoline>,
+    ) -> Result<Self, Int3HookError> {
         let target_addr = target as usize;
         let detour_addr = detour as usize;
 
@@ -257,18 +293,12 @@ impl Int3Hook {
         let original_byte = match original {
             Some(bytes) => bytes[0],
             None => {
-                // Roll back the published slot and the handler refcount.
+                // Roll back the published slot.
                 SLOT_TARGET[slot].store(0, Ordering::Release);
                 SLOT_DETOUR[slot].store(0, Ordering::Release);
-                if mgr.count == 0 && mgr.handler != 0 {
-                    unsafe { RemoveVectoredExceptionHandler(mgr.handler as *mut c_void) };
-                    mgr.handler = 0;
-                }
                 return Err(Int3HookError::PatchFailed);
             }
         };
-
-        mgr.count += 1;
 
         Ok(Self {
             target,
@@ -301,8 +331,7 @@ impl Int3Hook {
         self.gateway.as_ref().map(|t| t.ptr as *const u8)
     }
 
-    /// Removes the hook: restores the original byte and frees its slot, removing
-    /// the vectored handler once the last hook is gone.
+    /// Removes the hook: restores the original byte and frees its slot.
     pub fn unhook(mut self) -> Result<(), Int3HookError> {
         self.remove();
         Ok(())
@@ -314,22 +343,22 @@ impl Int3Hook {
         }
         self.active = false;
 
-        let mut mgr = lock_manager();
+        // Transaction lock first, then the slot manager (see `install`).
+        crate::transaction::with_code_lock(|| {
+            let mut mgr = lock_manager();
 
-        // Restore the original byte first so no further trap is taken, then
-        // retire the slot. A thread already inside the handler still finds a
-        // valid detour because the slot is cleared only afterwards.
-        unsafe { write_memory_atomic(self.target as *mut u8, &self.original_byte, 1) };
-        SLOT_TARGET[self.slot].store(0, Ordering::Release);
-        SLOT_DETOUR[self.slot].store(0, Ordering::Release);
+            // Remember the target before anything else, so a thread that already
+            // trapped and reaches the handler after the slot is cleared can still
+            // recognise the breakpoint as ours. Then restore the original byte so
+            // no further trap is taken, and retire the slot.
+            let idx = mgr.retired_next;
+            RETIRED[idx].store(self.target as usize, Ordering::Release);
+            mgr.retired_next = (idx + 1) % RETIRED_LEN;
 
-        if mgr.count > 0 {
-            mgr.count -= 1;
-        }
-        if mgr.count == 0 && mgr.handler != 0 {
-            unsafe { RemoveVectoredExceptionHandler(mgr.handler as *mut c_void) };
-            mgr.handler = 0;
-        }
+            unsafe { write_memory_atomic(self.target as *mut u8, &self.original_byte, 1) };
+            SLOT_TARGET[self.slot].store(0, Ordering::Release);
+            SLOT_DETOUR[self.slot].store(0, Ordering::Release);
+        });
     }
 }
 
@@ -367,20 +396,45 @@ unsafe extern "system" fn int3_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    for (i, slot_target) in SLOT_TARGET.iter().enumerate() {
-        if slot_target.load(Ordering::Acquire) == fault_addr {
-            let detour = SLOT_DETOUR[i].load(Ordering::Acquire);
-            if detour != 0 {
-                // Redirect to the detour. The new instruction pointer is no
-                // longer the breakpoint address, so execution resumes in the
-                // detour without re-triggering the trap.
-                unsafe { set_instruction_pointer(context, detour) };
-                return EXCEPTION_CONTINUE_EXECUTION;
-            }
+    if let Some(detour) = find_detour(fault_addr) {
+        // Redirect to the detour. The new instruction pointer is no longer the
+        // breakpoint address, so execution resumes in the detour without
+        // re-triggering the trap.
+        unsafe { set_instruction_pointer(context, detour) };
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    // No live slot. If the address belonged to a hook that was removed after
+    // this thread trapped, the original byte is back: re-run it.
+    if RETIRED
+        .iter()
+        .any(|retired| retired.load(Ordering::Acquire) == fault_addr)
+    {
+        let byte = unsafe { std::ptr::read_volatile(fault_addr as *const u8) };
+        if byte != INT3_OPCODE {
+            unsafe { set_instruction_pointer(context, fault_addr) };
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        // Still `0xCC`: the target may have been hooked again in the meantime.
+        // Installs publish the slot before writing the byte, so a re-scan sees
+        // it.
+        if let Some(detour) = find_detour(fault_addr) {
+            unsafe { set_instruction_pointer(context, detour) };
+            return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
 
     EXCEPTION_CONTINUE_SEARCH
+}
+
+/// Returns the detour of the live slot hooking `addr`, if any.
+fn find_detour(addr: usize) -> Option<usize> {
+    SLOT_TARGET
+        .iter()
+        .zip(SLOT_DETOUR.iter())
+        .filter(|(target, _)| target.load(Ordering::Acquire) == addr)
+        .map(|(_, detour)| detour.load(Ordering::Acquire))
+        .find(|&detour| detour != 0)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -404,6 +458,58 @@ fn lock_manager() -> std::sync::MutexGuard<'static, Int3Manager> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[repr(align(16))]
+    struct AlignedContext(CONTEXT);
+
+    /// Calls the handler directly with a breakpoint trap at `addr`, as if the
+    /// trap raced the removal of the hook there.
+    fn handle_trap(addr: usize) -> (i32, usize) {
+        let mut ctx: AlignedContext = unsafe { std::mem::zeroed() };
+        let mut record: EXCEPTION_RECORD = unsafe { std::mem::zeroed() };
+        record.ExceptionCode = STATUS_BREAKPOINT;
+        record.ExceptionAddress = addr as *mut _;
+        let mut pointers = EXCEPTION_POINTERS {
+            ExceptionRecord: &mut record,
+            ContextRecord: &mut ctx.0,
+        };
+        let verdict = unsafe { int3_handler(&mut pointers) };
+        #[cfg(target_arch = "x86_64")]
+        let ip = ctx.0.Rip as usize;
+        #[cfg(target_arch = "x86")]
+        let ip = ctx.0.Eip as usize;
+        (verdict, ip)
+    }
+
+    #[test]
+    fn handler_reruns_the_restored_byte_of_a_removed_hook() {
+        // Byte 0 was restored by an unhook; byte 1 is a foreign breakpoint.
+        static CODE: [u8; 2] = [0x90, INT3_OPCODE];
+        let restored = CODE.as_ptr() as usize;
+        let foreign = restored + 1;
+
+        let idx = {
+            let mut mgr = lock_manager();
+            let idx = mgr.retired_next;
+            mgr.retired_next = (idx + 1) % RETIRED_LEN;
+            idx
+        };
+        RETIRED[idx].store(restored, Ordering::Release);
+        let (verdict, ip) = handle_trap(restored);
+        RETIRED[idx].store(0, Ordering::Release);
+
+        assert_eq!(
+            verdict, EXCEPTION_CONTINUE_EXECUTION,
+            "removed hook resumes"
+        );
+        assert_eq!(ip, restored, "the restored instruction runs again");
+
+        let (verdict, _) = handle_trap(foreign);
+        assert_eq!(
+            verdict, EXCEPTION_CONTINUE_SEARCH,
+            "foreign int3 is passed on"
+        );
+    }
 
     #[inline(never)]
     extern "system" fn t_a() -> u32 {

@@ -143,37 +143,41 @@ impl IatHook {
         let slot_ptr = unsafe { thunk_function_slot_ptr(thunk) };
         let slot_size = std::mem::size_of::<usize>();
 
-        let original_fn = unsafe { thunk_function(thunk) as *mut u8 };
+        // Other slots on this page may be written concurrently; see
+        // `transaction::with_code_lock`.
+        crate::transaction::with_code_lock(|| {
+            let original_fn = unsafe { thunk_function(thunk) as *mut u8 };
 
-        // Change the protection of the memory page containing the IAT entry to allow writing
-        let mut old_protect = 0;
-        let success =
-            unsafe { VirtualProtect(slot_ptr, slot_size, PAGE_READWRITE, &mut old_protect) };
+            // Change the protection of the memory page containing the IAT entry to allow writing
+            let mut old_protect = 0;
+            let success =
+                unsafe { VirtualProtect(slot_ptr, slot_size, PAGE_READWRITE, &mut old_protect) };
 
-        // 11.03.26 (03-11-26) If we fail to change the protection, we return an error with the last OS error
-        if success == 0 {
-            return Err(map_err(InternalIatHookError::ProtectFailed(
-                std::io::Error::last_os_error(),
-            )));
-        }
-
-        // HERE WE INSTALL THE HOOK
-        unsafe {
-            write_thunk_function_slot(slot_ptr, detour_function);
-        };
-
-        let mut ignored: u32 = 0;
-        if unsafe { VirtualProtect(slot_ptr, slot_size, old_protect, &mut ignored) } == 0 {
-            let protect_err = std::io::Error::last_os_error();
-            unsafe {
-                write_thunk_function_slot(slot_ptr, original_fn);
+            // 11.03.26 (03-11-26) If we fail to change the protection, we return an error with the last OS error
+            if success == 0 {
+                return Err(map_err(InternalIatHookError::ProtectFailed(
+                    std::io::Error::last_os_error(),
+                )));
             }
-            let _ = unsafe { VirtualProtect(slot_ptr, slot_size, old_protect, &mut ignored) };
 
-            return Err(map_err(InternalIatHookError::ProtectFailed(protect_err)));
-        }
+            // HERE WE INSTALL THE HOOK
+            unsafe {
+                write_thunk_function_slot(slot_ptr, detour_function);
+            };
 
-        Ok(original_fn)
+            let mut ignored: u32 = 0;
+            if unsafe { VirtualProtect(slot_ptr, slot_size, old_protect, &mut ignored) } == 0 {
+                let protect_err = std::io::Error::last_os_error();
+                unsafe {
+                    write_thunk_function_slot(slot_ptr, original_fn);
+                }
+                let _ = unsafe { VirtualProtect(slot_ptr, slot_size, old_protect, &mut ignored) };
+
+                return Err(map_err(InternalIatHookError::ProtectFailed(protect_err)));
+            }
+
+            Ok(original_fn)
+        })
     }
 
     /// Finds the address of the IAT slot for a named import.
@@ -224,6 +228,11 @@ unsafe fn find_import_thunk(
     // desc_rva = RVA of the current IMAGE_IMPORT_DESCRIPTOR we're checking
     let mut desc_rva = image.import_dir_rva;
 
+    // A DLL can appear in several descriptors, so a descriptor that matches the
+    // DLL but cannot be searched (or lacks the function) does not end the walk.
+    // Its error is reported only if no later descriptor has the import.
+    let mut not_found = InternalIatHookError::TargetNotFound;
+
     // Calculate the end RVA of the import directory
     let desc_end = image
         .import_dir_rva
@@ -247,7 +256,7 @@ unsafe fn find_import_thunk(
         // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#import-directory-table
         // "The last [...] entry is empty"
         if desc.Name == 0 {
-            return Err(InternalIatHookError::TargetNotFound);
+            return Err(not_found);
         }
 
         // Read the DLL name from the Name RVA
@@ -257,57 +266,11 @@ unsafe fn find_import_thunk(
         // Compare the DLL name with the target DLL name (case-insensitive)
         if dll_name.eq_ignore_ascii_case(target_dll) {
             // Here we found the DLL. Now we look for target func
-
-            // sanity check if ft is 0 it means there are not iat entries
-            if desc.FirstThunk == 0 {
-                return Err(InternalIatHookError::MalformedImportDirectory);
+            match unsafe { find_thunk_in_descriptor(image, &desc, target_func) } {
+                Ok(thunk) => return Ok(thunk),
+                Err(InternalIatHookError::TargetNotFound) => {}
+                Err(err) => not_found = err,
             }
-
-            // IMPORTANT: For name resolution we need the INT (OriginalFirstThunk).
-            // If it's missing, we deliberately fail instead of trying to misuse the already overwritten IAT as a name table.
-
-            if unsafe { desc.Anonymous.OriginalFirstThunk } == 0 {
-                return Err(InternalIatHookError::NameResolutionUnavailable);
-            }
-
-            let mut thunk_rva = desc.FirstThunk as usize;
-            let mut original_thunk_rva = unsafe { desc.Anonymous.OriginalFirstThunk as usize };
-
-            // Loop through the thunks to find the target function
-            loop {
-                let thunk = pe::rva_to_mut_ptr::<IMAGE_THUNK_DATA>(&image.image, thunk_rva)
-                    .ok_or(InternalIatHookError::MalformedImportDirectory)?;
-                let original_thunk =
-                    pe::rva_to_ptr::<IMAGE_THUNK_DATA>(&image.image, original_thunk_rva)
-                        .ok_or(InternalIatHookError::MalformedImportDirectory)?;
-
-                // Our loop termination when we reach the end of the tunks
-                let lookup = unsafe { thunk_address_of_data(original_thunk) };
-                if lookup == 0 {
-                    break;
-                }
-
-                // Check if the import is by ordinal or by name. If it's by ordinal, we can't resolve the name, so we skip it.
-                if !unsafe { thunk_is_ordinal(original_thunk) } {
-                    let func_name = read_import_name(&image.image, lookup)
-                        .ok_or(InternalIatHookError::MalformedImportDirectory)?;
-
-                    // If the name matches we retourn the pointer to the IAT slot
-                    if func_name == target_func {
-                        return Ok(thunk);
-                    }
-                }
-
-                thunk_rva = thunk_rva
-                    .checked_add(std::mem::size_of::<IMAGE_THUNK_DATA>())
-                    .ok_or(InternalIatHookError::MalformedImportDirectory)?;
-                original_thunk_rva = original_thunk_rva
-                    .checked_add(std::mem::size_of::<IMAGE_THUNK_DATA>())
-                    .ok_or(InternalIatHookError::MalformedImportDirectory)?;
-            }
-
-            // If we reach here, it means we found the target DLL but not the target function within its imports
-            return Err(InternalIatHookError::TargetNotFound);
         }
 
         // Move to the next IMAGE_IMPORT_DESCRIPTOR (WHILE ITERATION. NOT LOOP)
@@ -317,6 +280,64 @@ unsafe fn find_import_thunk(
     }
 
     Err(InternalIatHookError::MalformedImportDirectory)
+}
+
+/// Searches the import name table of one descriptor for `target_func` and
+/// returns its IAT slot.
+unsafe fn find_thunk_in_descriptor(
+    image: &ModuleImage,
+    desc: &IMAGE_IMPORT_DESCRIPTOR,
+    target_func: &str,
+) -> Result<*mut IMAGE_THUNK_DATA, InternalIatHookError> {
+    // sanity check if ft is 0 it means there are not iat entries
+    if desc.FirstThunk == 0 {
+        return Err(InternalIatHookError::MalformedImportDirectory);
+    }
+
+    // IMPORTANT: For name resolution we need the INT (OriginalFirstThunk).
+    // If it's missing, we deliberately fail instead of trying to misuse the already overwritten IAT as a name table.
+
+    if unsafe { desc.Anonymous.OriginalFirstThunk } == 0 {
+        return Err(InternalIatHookError::NameResolutionUnavailable);
+    }
+
+    let mut thunk_rva = desc.FirstThunk as usize;
+    let mut original_thunk_rva = unsafe { desc.Anonymous.OriginalFirstThunk as usize };
+
+    // Loop through the thunks to find the target function
+    loop {
+        let thunk = pe::rva_to_mut_ptr::<IMAGE_THUNK_DATA>(&image.image, thunk_rva)
+            .ok_or(InternalIatHookError::MalformedImportDirectory)?;
+        let original_thunk = pe::rva_to_ptr::<IMAGE_THUNK_DATA>(&image.image, original_thunk_rva)
+            .ok_or(InternalIatHookError::MalformedImportDirectory)?;
+
+        // Our loop termination when we reach the end of the tunks
+        let lookup = unsafe { thunk_address_of_data(original_thunk) };
+        if lookup == 0 {
+            break;
+        }
+
+        // Check if the import is by ordinal or by name. If it's by ordinal, we can't resolve the name, so we skip it.
+        if !unsafe { thunk_is_ordinal(original_thunk) } {
+            let func_name = read_import_name(&image.image, lookup)
+                .ok_or(InternalIatHookError::MalformedImportDirectory)?;
+
+            // If the name matches we retourn the pointer to the IAT slot
+            if func_name == target_func {
+                return Ok(thunk);
+            }
+        }
+
+        thunk_rva = thunk_rva
+            .checked_add(std::mem::size_of::<IMAGE_THUNK_DATA>())
+            .ok_or(InternalIatHookError::MalformedImportDirectory)?;
+        original_thunk_rva = original_thunk_rva
+            .checked_add(std::mem::size_of::<IMAGE_THUNK_DATA>())
+            .ok_or(InternalIatHookError::MalformedImportDirectory)?;
+    }
+
+    // If we reach here, this descriptor does not import the target function
+    Err(InternalIatHookError::TargetNotFound)
 }
 
 fn read_import_name(image: &PeImage, import_by_name_rva: usize) -> Option<String> {
@@ -359,4 +380,97 @@ unsafe fn write_thunk_function_slot(slot_ptr: *mut core::ffi::c_void, detour: *c
 #[cfg(target_arch = "x86_64")]
 unsafe fn write_thunk_function_slot(slot_ptr: *mut core::ffi::c_void, detour: *const u8) {
     unsafe { std::ptr::write(slot_ptr as *mut u64, detour as u64) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_arch = "x86")]
+    use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS32 as IMAGE_NT_HEADERS;
+    #[cfg(target_arch = "x86")]
+    const OPTIONAL_MAGIC: u16 = IMAGE_NT_OPTIONAL_HDR32_MAGIC;
+    #[cfg(target_arch = "x86_64")]
+    use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64 as IMAGE_NT_HEADERS;
+    #[cfg(target_arch = "x86_64")]
+    const OPTIONAL_MAGIC: u16 = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+
+    /// A minimal fake PE image in a private page whose import directory holds
+    /// two descriptors for the same DLL, each importing a different function.
+    struct FakeImage(*mut u8);
+
+    impl FakeImage {
+        fn two_descriptors_for_one_dll() -> Self {
+            let base = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    0x1000,
+                    MEM_COMMIT | MEM_RESERVE,
+                    PAGE_READWRITE,
+                )
+            } as *mut u8;
+            assert!(!base.is_null());
+
+            unsafe {
+                let dos = base as *mut IMAGE_DOS_HEADER;
+                (*dos).e_magic = IMAGE_DOS_SIGNATURE;
+                (*dos).e_lfanew = 0x40;
+
+                let nt = base.add(0x40) as *mut IMAGE_NT_HEADERS;
+                (*nt).Signature = IMAGE_NT_SIGNATURE;
+                (*nt).OptionalHeader.Magic = OPTIONAL_MAGIC;
+                (*nt).OptionalHeader.SizeOfImage = 0x1000;
+                (*nt).OptionalHeader.NumberOfRvaAndSizes = 16;
+                let dir =
+                    &mut (*nt).OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT as usize];
+                dir.VirtualAddress = 0x200;
+                dir.Size = 3 * std::mem::size_of::<IMAGE_IMPORT_DESCRIPTOR>() as u32;
+
+                let descs = base.add(0x200) as *mut IMAGE_IMPORT_DESCRIPTOR;
+                (*descs).Name = 0x280;
+                (*descs).Anonymous.OriginalFirstThunk = 0x300;
+                (*descs).FirstThunk = 0x340;
+                (*descs.add(1)).Name = 0x280;
+                (*descs.add(1)).Anonymous.OriginalFirstThunk = 0x380;
+                (*descs.add(1)).FirstThunk = 0x3C0;
+
+                std::ptr::copy_nonoverlapping(c"fake.dll".as_ptr().cast(), base.add(0x280), 9);
+
+                (*(base.add(0x300) as *mut IMAGE_THUNK_DATA))
+                    .u1
+                    .AddressOfData = 0x400;
+                (*(base.add(0x380) as *mut IMAGE_THUNK_DATA))
+                    .u1
+                    .AddressOfData = 0x420;
+                // IMAGE_IMPORT_BY_NAME: a 2-byte hint followed by the name.
+                std::ptr::copy_nonoverlapping(c"FuncA".as_ptr().cast(), base.add(0x402), 6);
+                std::ptr::copy_nonoverlapping(c"FuncB".as_ptr().cast(), base.add(0x422), 6);
+            }
+
+            Self(base)
+        }
+
+        fn module(&self) -> HMODULE {
+            self.0 as HMODULE
+        }
+    }
+
+    impl Drop for FakeImage {
+        fn drop(&mut self) {
+            unsafe { VirtualFree(self.0.cast(), 0, MEM_RELEASE) };
+        }
+    }
+
+    #[test]
+    fn finds_imports_in_later_descriptors_for_the_same_dll() {
+        let image = FakeImage::two_descriptors_for_one_dll();
+
+        let slot_a = unsafe { IatHook::find_import_address(image.module(), "fake.dll", "FuncA") }
+            .expect("FuncA is in the first descriptor");
+        assert_eq!(slot_a as usize, image.0 as usize + 0x340);
+
+        let slot_b = unsafe { IatHook::find_import_address(image.module(), "fake.dll", "FuncB") }
+            .expect("FuncB is in the second descriptor");
+        assert_eq!(slot_b as usize, image.0 as usize + 0x3C0);
+    }
 }

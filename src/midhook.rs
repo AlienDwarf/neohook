@@ -417,6 +417,7 @@ fn build_stub(stub_addr: *mut u8, handler: *const u8, gateway: *mut u8) -> Vec<u
         0x50, // push rax
         0x9C, // pushfq
     ]);
+    c.push(0xFC); // cld  (the ABI requires DF=0 at calls; popfq restores it)
 
     // --- call handler(&context) ---
     c.extend_from_slice(&[0x48, 0x89, 0xE1]); // mov rcx, rsp   (arg1 = &context)
@@ -508,6 +509,7 @@ fn build_stub(stub_addr: *mut u8, handler: *const u8, gateway: *mut u8) -> Vec<u
     c.extend_from_slice(&[0x0F, 0xAE, 0x1C, 0x24]); // stmxcsr [esp]
     c.push(0x60); // pushad
     c.push(0x9C); // pushfd
+    c.push(0xFC); // cld  (the ABI requires DF=0 at calls; popfd restores it)
 
     // --- call handler(&context) ---
     c.extend_from_slice(&[0x89, 0xE0]); // mov eax, esp   (eax = &context)

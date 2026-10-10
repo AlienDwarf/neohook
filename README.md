@@ -269,7 +269,7 @@ use neohook::DetourTransaction;
 fn main() {
     let mut session = DetourTransaction::begin();
 
-    // Suspend all threads in the process before the commit
+    // Track all threads in the process; the commit suspends them while it patches
     session.update_all_threads();
 
     // Queue hooks - none are applied yet
