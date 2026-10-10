@@ -360,3 +360,96 @@ unsafe fn write_thunk_function_slot(slot_ptr: *mut core::ffi::c_void, detour: *c
 unsafe fn write_thunk_function_slot(slot_ptr: *mut core::ffi::c_void, detour: *const u8) {
     unsafe { std::ptr::write(slot_ptr as *mut u64, detour as u64) };
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_arch = "x86")]
+    use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS32 as IMAGE_NT_HEADERS;
+    #[cfg(target_arch = "x86")]
+    const OPTIONAL_MAGIC: u16 = IMAGE_NT_OPTIONAL_HDR32_MAGIC;
+    #[cfg(target_arch = "x86_64")]
+    use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64 as IMAGE_NT_HEADERS;
+    #[cfg(target_arch = "x86_64")]
+    const OPTIONAL_MAGIC: u16 = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+
+    /// A minimal fake PE image in a private page whose import directory holds
+    /// two descriptors for the same DLL, each importing a different function.
+    struct FakeImage(*mut u8);
+
+    impl FakeImage {
+        fn two_descriptors_for_one_dll() -> Self {
+            let base = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    0x1000,
+                    MEM_COMMIT | MEM_RESERVE,
+                    PAGE_READWRITE,
+                )
+            } as *mut u8;
+            assert!(!base.is_null());
+
+            unsafe {
+                let dos = base as *mut IMAGE_DOS_HEADER;
+                (*dos).e_magic = IMAGE_DOS_SIGNATURE;
+                (*dos).e_lfanew = 0x40;
+
+                let nt = base.add(0x40) as *mut IMAGE_NT_HEADERS;
+                (*nt).Signature = IMAGE_NT_SIGNATURE;
+                (*nt).OptionalHeader.Magic = OPTIONAL_MAGIC;
+                (*nt).OptionalHeader.SizeOfImage = 0x1000;
+                (*nt).OptionalHeader.NumberOfRvaAndSizes = 16;
+                let dir =
+                    &mut (*nt).OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT as usize];
+                dir.VirtualAddress = 0x200;
+                dir.Size = 3 * std::mem::size_of::<IMAGE_IMPORT_DESCRIPTOR>() as u32;
+
+                let descs = base.add(0x200) as *mut IMAGE_IMPORT_DESCRIPTOR;
+                (*descs).Name = 0x280;
+                (*descs).Anonymous.OriginalFirstThunk = 0x300;
+                (*descs).FirstThunk = 0x340;
+                (*descs.add(1)).Name = 0x280;
+                (*descs.add(1)).Anonymous.OriginalFirstThunk = 0x380;
+                (*descs.add(1)).FirstThunk = 0x3C0;
+
+                std::ptr::copy_nonoverlapping(c"fake.dll".as_ptr().cast(), base.add(0x280), 9);
+
+                (*(base.add(0x300) as *mut IMAGE_THUNK_DATA))
+                    .u1
+                    .AddressOfData = 0x400;
+                (*(base.add(0x380) as *mut IMAGE_THUNK_DATA))
+                    .u1
+                    .AddressOfData = 0x420;
+                // IMAGE_IMPORT_BY_NAME: a 2-byte hint followed by the name.
+                std::ptr::copy_nonoverlapping(c"FuncA".as_ptr().cast(), base.add(0x402), 6);
+                std::ptr::copy_nonoverlapping(c"FuncB".as_ptr().cast(), base.add(0x422), 6);
+            }
+
+            Self(base)
+        }
+
+        fn module(&self) -> HMODULE {
+            self.0 as HMODULE
+        }
+    }
+
+    impl Drop for FakeImage {
+        fn drop(&mut self) {
+            unsafe { VirtualFree(self.0.cast(), 0, MEM_RELEASE) };
+        }
+    }
+
+    #[test]
+    fn finds_imports_in_later_descriptors_for_the_same_dll() {
+        let image = FakeImage::two_descriptors_for_one_dll();
+
+        let slot_a = unsafe { IatHook::find_import_address(image.module(), "fake.dll", "FuncA") }
+            .expect("FuncA is in the first descriptor");
+        assert_eq!(slot_a as usize, image.0 as usize + 0x340);
+
+        let slot_b = unsafe { IatHook::find_import_address(image.module(), "fake.dll", "FuncB") }
+            .expect("FuncB is in the second descriptor");
+        assert_eq!(slot_b as usize, image.0 as usize + 0x3C0);
+    }
+}
