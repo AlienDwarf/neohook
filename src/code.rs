@@ -86,7 +86,8 @@ unsafe fn detour_code_from_pointer_once(src: *const u8) -> Option<*const u8> {
         0x49 => {
             let op1 = unsafe { read_value::<u8>(src.add(1))? };
             // mov r10, imm64; jmp r10
-            if op1 == 0xBA && unsafe { read_value::<u16>(src.add(10))? } == 0xE2FF {
+            // `jmp r10` is 41 FF E2; plain FF E2 would be `jmp rdx`.
+            if op1 == 0xBA && unsafe { read_value::<[u8; 3]>(src.add(10))? } == [0x41, 0xFF, 0xE2] {
                 let target = unsafe { read_value::<u64>(src.add(2))? };
                 Some(target as *const u8)
             } else {
@@ -267,6 +268,48 @@ mod tests {
             }
 
             assert_eq!(detour_code_from_pointer(stub), target);
+            assert_ne!(VirtualFree(page.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn code_from_pointer_follows_mov_r10_jmp_r10() {
+        unsafe {
+            let page = alloc_page();
+            assert!(!page.is_null());
+
+            let stub = page;
+            let target = page.add(128);
+
+            // mov r10, imm64 ; jmp r10
+            *stub.add(0) = 0x49;
+            *stub.add(1) = 0xBA;
+            std::ptr::write_unaligned(stub.add(2) as *mut u64, target as u64);
+            std::ptr::copy_nonoverlapping([0x41u8, 0xFF, 0xE2].as_ptr(), stub.add(10), 3);
+
+            assert_eq!(detour_code_from_pointer(stub), target);
+            assert_ne!(VirtualFree(page.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn code_from_pointer_ignores_mov_r10_jmp_other_register() {
+        unsafe {
+            let page = alloc_page();
+            assert!(!page.is_null());
+
+            let stub = page;
+            let target = page.add(128);
+
+            // mov r10, imm64 ; jmp rdx  (the jump does not use r10)
+            *stub.add(0) = 0x49;
+            *stub.add(1) = 0xBA;
+            std::ptr::write_unaligned(stub.add(2) as *mut u64, target as u64);
+            std::ptr::copy_nonoverlapping([0xFFu8, 0xE2].as_ptr(), stub.add(10), 2);
+
+            assert_eq!(detour_code_from_pointer(stub), stub);
             assert_ne!(VirtualFree(page.cast(), 0, MEM_RELEASE), 0);
         }
     }
