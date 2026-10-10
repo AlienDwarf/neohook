@@ -340,23 +340,34 @@ unsafe fn write_abs_jump_stub(src: *mut u8, dst: *const u8) {
     }
 }
 
+/// Signature of `VirtualProtect`, injectable so tests can simulate failures.
+type ProtectFn = unsafe extern "system" fn(*const core::ffi::c_void, usize, u32, *mut u32) -> i32;
+
 /// Writes a 32-bit RVA into an EAT slot, flipping the page to writable for the
 /// duration of the store.
 unsafe fn write_export_slot(slot_ptr: *mut u32, rva: u32) -> Result<(), EatHookError> {
+    unsafe { write_export_slot_with(slot_ptr, rva, VirtualProtect) }
+}
+
+unsafe fn write_export_slot_with(
+    slot_ptr: *mut u32,
+    rva: u32,
+    protect: ProtectFn,
+) -> Result<(), EatHookError> {
     if slot_ptr.is_null() {
         return Err(EatHookError::InvalidParameter);
     }
 
     let size = std::mem::size_of::<u32>();
     let mut old_protect = 0u32;
-    if unsafe { VirtualProtect(slot_ptr.cast(), size, PAGE_READWRITE, &mut old_protect) } == 0 {
+    if unsafe { protect(slot_ptr.cast(), size, PAGE_READWRITE, &mut old_protect) } == 0 {
         return Err(EatHookError::ProtectFailed(std::io::Error::last_os_error()));
     }
 
     unsafe { slot_ptr.write(rva) };
 
     let mut ignored = 0u32;
-    if unsafe { VirtualProtect(slot_ptr.cast(), size, old_protect, &mut ignored) } == 0 {
+    if unsafe { protect(slot_ptr.cast(), size, old_protect, &mut ignored) } == 0 {
         return Err(EatHookError::ProtectFailed(std::io::Error::last_os_error()));
     }
 
@@ -381,6 +392,35 @@ fn read_u16(image: &ModuleImage, base_rva: usize, index: usize) -> Option<u16> {
 mod tests {
     use super::*;
     use crate::module;
+
+    thread_local! {
+        static PROTECT_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Succeeds on the first call (making the slot "writable") and fails every
+    /// later one, simulating a failed protection restore.
+    unsafe extern "system" fn protect_fails_on_restore(
+        _addr: *const core::ffi::c_void,
+        _size: usize,
+        _new: u32,
+        old: *mut u32,
+    ) -> i32 {
+        let n = PROTECT_CALLS.with(|c| c.replace(c.get() + 1));
+        unsafe { *old = PAGE_READWRITE };
+        (n == 0) as i32
+    }
+
+    #[test]
+    fn failed_protect_restore_puts_the_old_rva_back() {
+        PROTECT_CALLS.with(|c| c.set(0));
+        let mut slot = 0x1111u32;
+        let result = unsafe { write_export_slot_with(&mut slot, 0x2222, protect_fails_on_restore) };
+        assert!(matches!(result, Err(EatHookError::ProtectFailed(_))));
+        assert_eq!(
+            slot, 0x1111,
+            "the slot must hold the old RVA after a failed restore"
+        );
+    }
 
     #[test]
     fn hook_export_rejects_null_module() {
