@@ -1,3 +1,4 @@
+// expect: E0505
 use neohook::DetourTransaction;
 
 fn main() {

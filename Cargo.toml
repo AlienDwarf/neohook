@@ -63,7 +63,6 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Graphics_OpenGL",
     "Win32_System_LibraryLoader",
 ] }
-trybuild = "1.0.110"
 
 [build-dependencies]
 cbindgen = { version = "0.29.2", optional = true }

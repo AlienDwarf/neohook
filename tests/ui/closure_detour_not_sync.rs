@@ -1,3 +1,4 @@
+// expect: E0277
 use neohook::detour_closure;
 use std::cell::Cell;
 

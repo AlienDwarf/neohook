@@ -1,3 +1,4 @@
+// expect: E0594
 #![allow(unused)]
 
 use neohook::detour_closure;
