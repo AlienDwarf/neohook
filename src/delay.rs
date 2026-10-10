@@ -27,6 +27,9 @@
 //!   target; there is no trampoline to call the original through.
 //! * **Capacity.** Each installed delay hook consumes one INT3 slot
 //!   ([`crate::int3::MAX_HOOKS`]).
+//! * **Busy loads are skipped.** A load that completes while another thread is
+//!   inside a NeoHook transaction or code write leaves the hook pending; it is
+//!   installed on a later load.
 
 use std::ffi::{CString, c_void};
 use std::fmt;
@@ -274,7 +277,12 @@ fn install_ready_pending() {
             continue;
         }
         if let Some(target) = resolve_loaded(&pending.module, &pending.func) {
-            pending.hook = unsafe { Int3Hook::install(target, pending.detour) }.ok();
+            // This runs under the loader lock. Waiting for the transaction lock
+            // here could deadlock against a thread that holds it and is itself
+            // loading a library, so a busy lock leaves the hook pending for the
+            // next load instead.
+            pending.hook =
+                unsafe { Int3Hook::try_install(target, pending.detour) }.and_then(Result::ok);
         }
     }
 }

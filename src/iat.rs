@@ -143,37 +143,41 @@ impl IatHook {
         let slot_ptr = unsafe { thunk_function_slot_ptr(thunk) };
         let slot_size = std::mem::size_of::<usize>();
 
-        let original_fn = unsafe { thunk_function(thunk) as *mut u8 };
+        // Other slots on this page may be written concurrently; see
+        // `transaction::with_code_lock`.
+        crate::transaction::with_code_lock(|| {
+            let original_fn = unsafe { thunk_function(thunk) as *mut u8 };
 
-        // Change the protection of the memory page containing the IAT entry to allow writing
-        let mut old_protect = 0;
-        let success =
-            unsafe { VirtualProtect(slot_ptr, slot_size, PAGE_READWRITE, &mut old_protect) };
+            // Change the protection of the memory page containing the IAT entry to allow writing
+            let mut old_protect = 0;
+            let success =
+                unsafe { VirtualProtect(slot_ptr, slot_size, PAGE_READWRITE, &mut old_protect) };
 
-        // 11.03.26 (03-11-26) If we fail to change the protection, we return an error with the last OS error
-        if success == 0 {
-            return Err(map_err(InternalIatHookError::ProtectFailed(
-                std::io::Error::last_os_error(),
-            )));
-        }
-
-        // HERE WE INSTALL THE HOOK
-        unsafe {
-            write_thunk_function_slot(slot_ptr, detour_function);
-        };
-
-        let mut ignored: u32 = 0;
-        if unsafe { VirtualProtect(slot_ptr, slot_size, old_protect, &mut ignored) } == 0 {
-            let protect_err = std::io::Error::last_os_error();
-            unsafe {
-                write_thunk_function_slot(slot_ptr, original_fn);
+            // 11.03.26 (03-11-26) If we fail to change the protection, we return an error with the last OS error
+            if success == 0 {
+                return Err(map_err(InternalIatHookError::ProtectFailed(
+                    std::io::Error::last_os_error(),
+                )));
             }
-            let _ = unsafe { VirtualProtect(slot_ptr, slot_size, old_protect, &mut ignored) };
 
-            return Err(map_err(InternalIatHookError::ProtectFailed(protect_err)));
-        }
+            // HERE WE INSTALL THE HOOK
+            unsafe {
+                write_thunk_function_slot(slot_ptr, detour_function);
+            };
 
-        Ok(original_fn)
+            let mut ignored: u32 = 0;
+            if unsafe { VirtualProtect(slot_ptr, slot_size, old_protect, &mut ignored) } == 0 {
+                let protect_err = std::io::Error::last_os_error();
+                unsafe {
+                    write_thunk_function_slot(slot_ptr, original_fn);
+                }
+                let _ = unsafe { VirtualProtect(slot_ptr, slot_size, old_protect, &mut ignored) };
+
+                return Err(map_err(InternalIatHookError::ProtectFailed(protect_err)));
+            }
+
+            Ok(original_fn)
+        })
     }
 
     /// Finds the address of the IAT slot for a named import.

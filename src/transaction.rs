@@ -5,6 +5,7 @@ use crate::HookKind;
 use crate::alloc::{Trampoline, TrampolineAlloc};
 use crate::disasm;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, GetThreadContext, SetThreadContext};
@@ -286,8 +287,10 @@ impl InlineHook {
             return Err(DetourError::InvalidParameter);
         }
         // Also runs inside a commit's suspend window (detach, rollback), so it
-        // must not allocate.
-        if unsafe { crate::mem::write_code_bytes(target, bytes.as_ptr(), bytes.len()) } {
+        // must not allocate; the lock is already held there.
+        if with_code_lock(|| unsafe {
+            crate::mem::write_code_bytes(target, bytes.as_ptr(), bytes.len())
+        }) {
             Ok(())
         } else {
             Err(DetourError::RelocationFailed)
@@ -296,8 +299,11 @@ impl InlineHook {
 
     /// Unhooks this inline hook by restoring the original bytes at the target address.
     pub fn unhook(mut self) -> Result<(), DetourError> {
-        self.perform_unhook()?;
-        unregister_managed_gateway(self.trampoline.ptr);
+        with_code_lock(|| {
+            self.perform_unhook()?;
+            unregister_managed_gateway(self.trampoline.ptr);
+            Ok::<(), DetourError>(())
+        })?;
         self.active = false;
 
         Ok(())
@@ -366,11 +372,13 @@ impl InlineHook {
 
 impl Drop for InlineHook {
     fn drop(&mut self) {
-        if self.active {
-            // auto unhook when dropped, best effort, ignore errors
-            let _ = self.perform_unhook();
-        }
-        unregister_managed_gateway(self.trampoline.ptr);
+        with_code_lock(|| {
+            if self.active {
+                // auto unhook when dropped, best effort, ignore errors
+                let _ = self.perform_unhook();
+            }
+            unregister_managed_gateway(self.trampoline.ptr);
+        });
     }
 }
 
@@ -624,7 +632,7 @@ pub struct TransactionCore {
     // suspension (or the start of commit) until threads are resumed, so two
     // transactions on different threads cannot suspend each other or patch
     // code concurrently. `None` while the transaction holds no lock.
-    global_lock: Option<std::sync::MutexGuard<'static, ()>>,
+    global_lock: Option<TransactionGuard>,
     // Diagnostics captured while threads may be suspended, flushed once they are
     // resumed. See `DebugEvent` for why nothing is formatted in the window.
     #[cfg(feature = "debug-log")]
@@ -2116,20 +2124,84 @@ impl Drop for TransactionCore {
 /// suspend each other or patch overlapping code at the same time. This mirrors
 /// the "one transaction at a time" model used by Microsoft Detours.
 ///
+/// It is also the single lock for every code and table write: lifting a page's
+/// protection, writing and restoring it must not interleave with another such
+/// write on the same page, or one thread restores the protection while the
+/// other is still writing. Writers outside a transaction take it through
+/// [`with_code_lock`].
+///
+/// Lock order: this lock first, then any other crate mutex (gateway registry,
+/// stub quarantine, INT3 slot manager), never the reverse.
+///
 /// A transaction must not be nested on the same thread (i.e. suspend threads or
 /// commit a second transaction while a first one on that thread still holds the
 /// lock), as the lock is not reentrant and that would deadlock.
 static TRANSACTION_LOCK: Mutex<()> = Mutex::new(());
+
+/// Thread id of the current [`TRANSACTION_LOCK`] holder, or 0 while it is free.
+/// Lets a code write made by the holder itself (a detach or rollback inside a
+/// commit) run without taking the lock again.
+static TRANSACTION_OWNER: AtomicU32 = AtomicU32::new(0);
+
+/// A held [`TRANSACTION_LOCK`] that records its owning thread.
+pub(crate) struct TransactionGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl TransactionGuard {
+    fn new(guard: std::sync::MutexGuard<'static, ()>) -> Self {
+        TRANSACTION_OWNER.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+        Self { _guard: guard }
+    }
+}
+
+impl Drop for TransactionGuard {
+    fn drop(&mut self) {
+        // Cleared before the mutex itself is released.
+        TRANSACTION_OWNER.store(0, Ordering::Release);
+    }
+}
+
+/// Whether the calling thread holds [`TRANSACTION_LOCK`]. Only the holder ever
+/// stores its own id, so seeing it means this thread owns the lock.
+fn owns_transaction_lock() -> bool {
+    TRANSACTION_OWNER.load(Ordering::Acquire) == unsafe { GetCurrentThreadId() }
+}
 
 /// Acquires the process-wide transaction lock, recovering from poisoning.
 ///
 /// If another transaction panicked while holding the lock, the underlying data
 /// is `()` and carries no invariant, so recovering the guard keeps NeoHook
 /// usable instead of permanently wedging every future transaction.
-fn lock_transaction() -> std::sync::MutexGuard<'static, ()> {
-    TRANSACTION_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+fn lock_transaction() -> TransactionGuard {
+    TransactionGuard::new(
+        TRANSACTION_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    )
+}
+
+/// Runs a code or table write under the transaction lock.
+///
+/// When this thread already holds the lock (a commit detaching or rolling back
+/// hooks inside its suspend window) `write` runs directly, so it neither
+/// deadlocks nor waits on a mutex there.
+pub(crate) fn with_code_lock<R>(write: impl FnOnce() -> R) -> R {
+    if owns_transaction_lock() {
+        return write();
+    }
+    let _guard = lock_transaction();
+    write()
+}
+
+/// Like [`with_code_lock`], but returns `None` instead of waiting while another
+/// thread holds the lock.
+pub(crate) fn try_with_code_lock<R>(write: impl FnOnce() -> R) -> Option<R> {
+    if owns_transaction_lock() {
+        return Some(write());
+    }
+    let _guard = try_lock_transaction()?;
+    Some(write())
 }
 
 /// Tries to take the process-wide transaction lock without blocking.
@@ -2138,11 +2210,13 @@ fn lock_transaction() -> std::sync::MutexGuard<'static, ()> {
 /// mid-commit/rollback, where the lock is not reentrant. Used by deferred stub
 /// reclamation ([`crate::reclaim`]) so it can suspend threads only when it is safe
 /// to do so, and otherwise leave the work for a later pass.
-pub(crate) fn try_lock_transaction() -> Option<std::sync::MutexGuard<'static, ()>> {
+pub(crate) fn try_lock_transaction() -> Option<TransactionGuard> {
     match TRANSACTION_LOCK.try_lock() {
-        Ok(guard) => Some(guard),
+        Ok(guard) => Some(TransactionGuard::new(guard)),
         Err(std::sync::TryLockError::WouldBlock) => None,
-        Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+            Some(TransactionGuard::new(poisoned.into_inner()))
+        }
     }
 }
 

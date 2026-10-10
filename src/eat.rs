@@ -344,9 +344,12 @@ unsafe fn write_abs_jump_stub(src: *mut u8, dst: *const u8) {
 type ProtectFn = unsafe extern "system" fn(*const core::ffi::c_void, usize, u32, *mut u32) -> i32;
 
 /// Writes a 32-bit RVA into an EAT slot, flipping the page to writable for the
-/// duration of the store.
+/// duration of the store. Serialized with every other code and table write
+/// (see `transaction::with_code_lock`).
 unsafe fn write_export_slot(slot_ptr: *mut u32, rva: u32) -> Result<(), EatHookError> {
-    unsafe { write_export_slot_with(slot_ptr, rva, VirtualProtect) }
+    crate::transaction::with_code_lock(|| unsafe {
+        write_export_slot_with(slot_ptr, rva, VirtualProtect)
+    })
 }
 
 unsafe fn write_export_slot_with(

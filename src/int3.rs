@@ -230,6 +230,30 @@ impl Int3Hook {
             None
         };
 
+        // The transaction lock serializes the byte write with every other code
+        // write on the page; it is taken before the slot manager.
+        crate::transaction::with_code_lock(|| unsafe { Self::arm(target, detour, gateway) })
+    }
+
+    /// Like [`Self::install`], but returns `None` without changing anything
+    /// instead of waiting while another thread holds the transaction lock.
+    pub(crate) unsafe fn try_install(
+        target: *const u8,
+        detour: *const u8,
+    ) -> Option<Result<Self, Int3HookError>> {
+        if target.is_null() || detour.is_null() {
+            return Some(Err(Int3HookError::InvalidParameter));
+        }
+        crate::transaction::try_with_code_lock(|| unsafe { Self::arm(target, detour, None) })
+    }
+
+    /// Publishes a slot for `target` and patches its entry byte. The caller holds
+    /// the transaction lock.
+    unsafe fn arm(
+        target: *const u8,
+        detour: *const u8,
+        gateway: Option<Trampoline>,
+    ) -> Result<Self, Int3HookError> {
         let target_addr = target as usize;
         let detour_addr = detour as usize;
 
@@ -319,19 +343,22 @@ impl Int3Hook {
         }
         self.active = false;
 
-        let mut mgr = lock_manager();
+        // Transaction lock first, then the slot manager (see `install`).
+        crate::transaction::with_code_lock(|| {
+            let mut mgr = lock_manager();
 
-        // Remember the target before anything else, so a thread that already
-        // trapped and reaches the handler after the slot is cleared can still
-        // recognise the breakpoint as ours. Then restore the original byte so
-        // no further trap is taken, and retire the slot.
-        let idx = mgr.retired_next;
-        RETIRED[idx].store(self.target as usize, Ordering::Release);
-        mgr.retired_next = (idx + 1) % RETIRED_LEN;
+            // Remember the target before anything else, so a thread that already
+            // trapped and reaches the handler after the slot is cleared can still
+            // recognise the breakpoint as ours. Then restore the original byte so
+            // no further trap is taken, and retire the slot.
+            let idx = mgr.retired_next;
+            RETIRED[idx].store(self.target as usize, Ordering::Release);
+            mgr.retired_next = (idx + 1) % RETIRED_LEN;
 
-        unsafe { write_memory_atomic(self.target as *mut u8, &self.original_byte, 1) };
-        SLOT_TARGET[self.slot].store(0, Ordering::Release);
-        SLOT_DETOUR[self.slot].store(0, Ordering::Release);
+            unsafe { write_memory_atomic(self.target as *mut u8, &self.original_byte, 1) };
+            SLOT_TARGET[self.slot].store(0, Ordering::Release);
+            SLOT_DETOUR[self.slot].store(0, Ordering::Release);
+        });
     }
 }
 
