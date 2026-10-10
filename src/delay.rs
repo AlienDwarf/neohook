@@ -30,7 +30,8 @@
 
 use std::ffi::{CString, c_void};
 use std::fmt;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
 
@@ -72,8 +73,12 @@ static MANAGER: Mutex<DelayManager> = Mutex::new(DelayManager {
     ldr_hook: None,
 });
 
-/// Trampoline to the real `LdrLoadDll`, set when the inline hook is installed.
-static ORIG_LDR: OnceLock<LdrLoadDllFn> = OnceLock::new();
+/// Trampoline to the real `LdrLoadDll`. Replaced on every install of the inline
+/// hook, because removing the hook retires the previous trampoline.
+static ORIG_LDR: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+
+/// `STATUS_INTERNAL_ERROR`, returned if the detour runs without a trampoline.
+const STATUS_INTERNAL_ERROR: i32 = 0xC000_00E5_u32 as i32;
 
 /// Errors produced while registering a delay hook.
 #[derive(Debug)]
@@ -226,9 +231,11 @@ fn ensure_ldr_hook(mgr: &mut DelayManager) -> Result<(), DelayHookError> {
     let tramp = tx
         .attach(target as *mut u8, hooked_ldr_load_dll as *const u8)
         .map_err(|_| DelayHookError::LdrHookFailed)?;
+    // Publish the trampoline before the commit makes the detour reachable, so
+    // a load racing with the install already forwards to the real LdrLoadDll.
+    ORIG_LDR.store(tramp, Ordering::Release);
     let hooks = tx.commit().map_err(|_| DelayHookError::LdrHookFailed)?;
 
-    let _ = ORIG_LDR.set(unsafe { std::mem::transmute::<*mut u8, LdrLoadDllFn>(tramp) });
     mgr.ldr_hook = hooks.into_iter().next();
     Ok(())
 }
@@ -241,10 +248,14 @@ unsafe extern "system" fn hooked_ldr_load_dll(
     name: *const c_void,
     handle: *mut *mut c_void,
 ) -> i32 {
-    let status = match ORIG_LDR.get() {
-        Some(orig) => unsafe { orig(path, flags, name, handle) },
-        None => return 0,
-    };
+    let tramp = ORIG_LDR.load(Ordering::Acquire);
+    if tramp.is_null() {
+        // Never report success for a load that did not happen.
+        return STATUS_INTERNAL_ERROR;
+    }
+    // SAFETY: `tramp` is the trampoline of the live LdrLoadDll hook.
+    let orig = unsafe { std::mem::transmute::<*mut u8, LdrLoadDllFn>(tramp) };
+    let status = unsafe { orig(path, flags, name, handle) };
 
     // NT_SUCCESS(status): the module is mapped, so its exports can be resolved.
     if status >= 0 {
@@ -329,5 +340,51 @@ mod tests {
             0xABCD_1234,
             "original should be restored after unhook"
         );
+    }
+
+    unsafe extern "system" fn fake_tick_count() -> u32 {
+        0x1234_5678
+    }
+
+    /// The trampoline `hooked_ldr_load_dll` forwards to right now.
+    fn forwarded_ldr() -> *const u8 {
+        ORIG_LDR.load(Ordering::Acquire)
+    }
+
+    #[test]
+    fn reregistering_forwards_to_the_new_ldr_trampoline() {
+        // kernel32 is always loaded, so these install immediately; only the
+        // LdrLoadDll hook lifecycle matters here.
+        let first = unsafe {
+            DelayHook::register("kernel32.dll", "GetTickCount", fake_tick_count as *const u8)
+        }
+        .expect("first register");
+        drop(first);
+
+        let second = unsafe {
+            DelayHook::register("kernel32.dll", "GetTickCount", fake_tick_count as *const u8)
+        }
+        .expect("second register");
+
+        let current = lock_manager()
+            .ldr_hook
+            .as_ref()
+            .expect("LdrLoadDll hook installed")
+            .original_ptr();
+        assert_eq!(
+            forwarded_ldr(),
+            current,
+            "LdrLoadDll detour must forward to the trampoline of the live hook"
+        );
+
+        // Free the first trampoline, then load a module through the detour.
+        crate::reclaim();
+        let module = unsafe { LoadLibraryW(wide("version.dll").as_ptr()) };
+        assert!(
+            !module.is_null(),
+            "a load through the re-installed hook works"
+        );
+
+        drop(second);
     }
 }
