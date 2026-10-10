@@ -52,12 +52,19 @@ pub unsafe fn virtual_protect_same_execute(
     }
 }
 
-/// Atomically (as much as possible) write `len` bytes from `src` into `target`.
-/// Returns true on success. This helper preserves execute flags when changing protections.
+/// Writes `len` bytes from `src` into `target` and returns the bytes that were
+/// there before, or `None` on failure. Execute permission is preserved while the
+/// protection is temporarily lifted, and the instruction cache is flushed.
+///
+/// Despite the name, the write is **not synchronized** with other threads: it is
+/// a plain `VirtualProtect` + copy + `FlushInstructionCache` and suspends nothing.
+/// Only a 1-byte write is observed atomically by a concurrently executing thread;
+/// for anything longer another thread may fetch a half-written instruction or be
+/// left inside the region at a stale instruction boundary. Callers patching
+/// multi-byte code that may be executing must suspend the other threads first.
 ///
 /// # Safety
-/// The caller must ensure that `target` and `src` are valid pointers
-/// Atomicity is only guaranteed if len is 1 byte
+/// The caller must ensure that `target` and `src` are valid pointers.
 pub unsafe fn write_memory_atomic(target: *mut u8, src: *const u8, len: usize) -> Option<Vec<u8>> {
     if target.is_null() || src.is_null() || len == 0 {
         return None;
@@ -86,6 +93,36 @@ pub unsafe fn write_memory_atomic(target: *mut u8, src: *const u8, len: usize) -
 
         Some(orig)
     }
+}
+
+/// Writes `len` bytes from `src` into `target` without allocating, preserving
+/// execute permission and flushing the instruction cache. Returns `true` on
+/// success.
+///
+/// Like [`write_memory_atomic`] this does no thread synchronization of its own,
+/// but because it never touches the heap it is safe to call while other threads
+/// are suspended (one of them may hold the heap lock).
+///
+/// # Safety
+/// The caller must ensure that `target` and `src` are valid for `len` bytes.
+pub(crate) unsafe fn write_code_bytes(target: *mut u8, src: *const u8, len: usize) -> bool {
+    if target.is_null() || src.is_null() || len == 0 {
+        return false;
+    }
+
+    let mut old_protect: u32 = 0;
+    unsafe {
+        if virtual_protect_same_execute(target, len, PAGE_READWRITE, &mut old_protect) == 0 {
+            return false;
+        }
+
+        std::ptr::copy_nonoverlapping(src, target, len);
+        FlushInstructionCache(GetCurrentProcess(), target as _, len);
+
+        let mut tmp = 0u32;
+        VirtualProtect(target as _, len, old_protect, &mut tmp);
+    }
+    true
 }
 
 #[cfg(test)]

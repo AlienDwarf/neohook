@@ -55,7 +55,18 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::mem::write_memory_atomic;
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, GetThreadContext};
+use windows_sys::Win32::System::Threading::{
+    OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_SUSPEND_RESUME,
+};
+
+use crate::mem::write_code_bytes;
+
+#[cfg(target_arch = "x86_64")]
+const CONTEXT_FLAGS: u32 = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64;
+#[cfg(target_arch = "x86")]
+const CONTEXT_FLAGS: u32 = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_X86;
 
 /// Identifies a region registered with [`Watchdog::guard`], used to stop
 /// guarding it again with [`Watchdog::unguard`].
@@ -80,6 +91,10 @@ impl GuardId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WatchMode {
     /// Rewrite the canonical bytes back, re-applying the patch (the default).
+    ///
+    /// The rewrite happens with every other thread suspended. If any of them is
+    /// executing inside the region at that moment, the rewrite is deferred to a
+    /// later sweep rather than patching code under a running thread.
     #[default]
     Restore,
     /// Leave the tampered bytes in place and only report the event - "detect,
@@ -123,7 +138,9 @@ pub struct TamperEvent<'a> {
     pub found: &'a [u8],
     /// `true` if the watchdog rewrote the canonical bytes back this sweep
     /// ([`WatchMode::Restore`] and the write succeeded); `false` in
-    /// [`WatchMode::DetectOnly`] or if the rewrite failed.
+    /// [`WatchMode::DetectOnly`], if the rewrite failed, or if it was deferred
+    /// because a thread was executing inside the region (it is retried on a
+    /// later sweep).
     pub restored: bool,
 }
 
@@ -398,9 +415,11 @@ fn sweep(shared: &Shared) {
 
     let hits = {
         let mut regions = shared.regions.lock().unwrap_or_else(|p| p.into_inner());
-        let mut hits = Vec::new();
 
-        for region in regions.iter_mut() {
+        // Find the tampered regions, snapshotting the bytes found there before
+        // any restore overwrites them.
+        let mut tampered: Vec<(usize, Vec<u8>)> = Vec::new();
+        for (index, region) in regions.iter_mut().enumerate() {
             // SAFETY: the guard contract requires `target` to stay valid for
             // `expected.len()` readable bytes while it is guarded.
             let current = unsafe {
@@ -409,29 +428,35 @@ fn sweep(shared: &Shared) {
 
             if current == region.expected.as_slice() {
                 region.tampered = false;
-                continue;
-            }
-
-            // Snapshot the tampered bytes before any restore overwrites them.
-            let found = current.to_vec();
-
-            let restored = if mode == WatchMode::Restore {
-                let ok = unsafe {
-                    write_memory_atomic(
-                        region.target as *mut u8,
-                        region.expected.as_ptr(),
-                        region.expected.len(),
-                    )
-                }
-                .is_some();
-                if ok {
-                    shared.restorations.fetch_add(1, Ordering::Relaxed);
-                }
-                ok
             } else {
-                false
-            };
+                tampered.push((index, current.to_vec()));
+            }
+        }
 
+        if tampered.is_empty() {
+            return;
+        }
+
+        let mut restored = vec![false; tampered.len()];
+        if mode == WatchMode::Restore {
+            let targets: Vec<(usize, &[u8])> = tampered
+                .iter()
+                .map(|(index, _)| {
+                    let region = &regions[*index];
+                    (region.target, region.expected.as_slice())
+                })
+                .collect();
+            // SAFETY: as above, every target is valid for its expected length.
+            unsafe { restore_quiescent(&targets, &mut restored) };
+            let count = restored.iter().filter(|&&ok| ok).count() as u64;
+            if count != 0 {
+                shared.restorations.fetch_add(count, Ordering::Relaxed);
+            }
+        }
+
+        let mut hits = Vec::new();
+        for ((index, found), restored) in tampered.into_iter().zip(restored) {
+            let region = &mut regions[index];
             // Report only on the intact -> tampered transition, so DetectOnly
             // does not spam the callback every sweep while bytes stay reverted.
             if !region.tampered {
@@ -472,6 +497,88 @@ fn sweep(shared: &Shared) {
             // the watchdog thread (which would silently stop all guarding).
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(&event)));
         }
+    }
+}
+
+/// Rewrites each `(target, bytes)` pair with every other thread suspended,
+/// setting `restored[i]` for each region actually written.
+///
+/// A multi-byte write is not atomic, so a thread executing the region could fetch
+/// a half-written instruction or be resumed at a broken instruction boundary. To
+/// rule that out every other thread is frozen first and its instruction pointer
+/// read; a region any thread is currently inside is left alone and retried on the
+/// next sweep. Nothing allocates or takes a lock while threads are suspended.
+///
+/// The pass is skipped (nothing restored) while a transaction holds the
+/// process-wide lock, so the watchdog never races the commit path's own thread
+/// suspension.
+///
+/// # Safety
+/// Every target must be valid for writing its byte image.
+unsafe fn restore_quiescent(targets: &[(usize, &[u8])], restored: &mut [bool]) {
+    let Some(_guard) = crate::transaction::try_lock_transaction() else {
+        return;
+    };
+
+    // Excludes the calling (watchdog) thread.
+    let tids = crate::threads::ThreadEnumerator::enumerate_process_threads();
+
+    // Reserve everything up front: allocating while a suspended thread holds the
+    // heap lock would deadlock.
+    let mut handles: Vec<HANDLE> = Vec::with_capacity(tids.len());
+    let mut ips: Vec<usize> = Vec::with_capacity(tids.len());
+
+    unsafe {
+        for &tid in &tids {
+            let h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, 0, tid);
+            if h.is_null() {
+                continue;
+            }
+            if SuspendThread(h) == u32::MAX {
+                CloseHandle(h);
+                continue;
+            }
+            handles.push(h);
+        }
+
+        for &h in &handles {
+            if let Some(ip) = thread_ip(h) {
+                ips.push(ip);
+            }
+        }
+
+        for (&(target, bytes), restored) in targets.iter().zip(restored.iter_mut()) {
+            let end = target.saturating_add(bytes.len());
+            if ips.iter().any(|&ip| ip >= target && ip < end) {
+                continue;
+            }
+            *restored = write_code_bytes(target as *mut u8, bytes.as_ptr(), bytes.len());
+        }
+
+        for &h in &handles {
+            ResumeThread(h);
+            CloseHandle(h);
+        }
+    }
+}
+
+/// Reads the instruction pointer of a suspended thread.
+unsafe fn thread_ip(h_thread: HANDLE) -> Option<usize> {
+    #[repr(align(16))]
+    struct AlignedContext(CONTEXT);
+
+    unsafe {
+        let mut ctx: AlignedContext = std::mem::zeroed();
+        ctx.0.ContextFlags = CONTEXT_FLAGS;
+        if GetThreadContext(h_thread, &mut ctx.0) == 0 {
+            return None;
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        let ip = ctx.0.Rip as usize;
+        #[cfg(target_arch = "x86")]
+        let ip = ctx.0.Eip as usize;
+        Some(ip)
     }
 }
 
