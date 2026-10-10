@@ -368,34 +368,36 @@ fn build_stub(stub_addr: *mut u8, handler: *const u8, gateway: *mut u8) -> Vec<u
     let _ = stub_addr; // x64 stub is position-independent.
     let mut c = Vec::with_capacity(STUB_CAPACITY);
 
-    // sub rsp,16 ; movups [rsp], xmmN   (REX.R for xmm8..15).
+    // lea rsp,[rsp-16] ; movups [rsp], xmmN   (REX.R for xmm8..15).
     let save_xmm = |c: &mut Vec<u8>, n: u8| {
-        c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x10]); // sub rsp, 16
+        c.extend_from_slice(&[0x48, 0x8D, 0x64, 0x24, 0xF0]); // lea rsp, [rsp - 16]
         if n >= 8 {
             c.push(0x44); // REX.R
         }
         c.extend_from_slice(&[0x0F, 0x11, 0x04 | ((n & 7) << 3), 0x24]); // movups [rsp], xmmN
     };
-    // movups xmmN, [rsp] ; add rsp,16
+    // movups xmmN, [rsp] ; lea rsp,[rsp+16]
     let restore_xmm = |c: &mut Vec<u8>, n: u8| {
         if n >= 8 {
             c.push(0x44); // REX.R
         }
         c.extend_from_slice(&[0x0F, 0x10, 0x04 | ((n & 7) << 3), 0x24]); // movups xmmN, [rsp]
-        c.extend_from_slice(&[0x48, 0x83, 0xC4, 0x10]); // add rsp, 16
+        c.extend_from_slice(&[0x48, 0x8D, 0x64, 0x24, 0x10]); // lea rsp, [rsp + 16]
     };
 
+    // Every stack adjustment outside the pushfq/popfq window uses `lea`, which
+    // leaves the flags alone; `sub`/`add` would clobber them on the way in and out.
     // Reserve and zero the redirect slot at the very top of the frame. The
     // handler sees it as `HookContext::redirect_rip` (0 == "do not redirect");
     // after the handler returns this slot holds the address the stub jumps to.
-    c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8
+    c.extend_from_slice(&[0x48, 0x8D, 0x64, 0x24, 0xF8]); // lea rsp, [rsp - 8]
     c.extend_from_slice(&[0x48, 0xC7, 0x04, 0x24, 0x00, 0x00, 0x00, 0x00]); // mov qword [rsp], 0
 
     // --- save: xmm15..xmm0 (xmm0 ends lowest), MXCSR, GPRs, flags last ---
     for n in (0..16u8).rev() {
         save_xmm(&mut c, n);
     }
-    c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8   (mxcsr + 4 pad bytes)
+    c.extend_from_slice(&[0x48, 0x8D, 0x64, 0x24, 0xF8]); // lea rsp, [rsp - 8]   (mxcsr + 4 pad bytes)
     c.extend_from_slice(&[0x0F, 0xAE, 0x1C, 0x24]); // stmxcsr [rsp]
     c.extend_from_slice(&[
         0x41, 0x57, // push r15
@@ -459,7 +461,7 @@ fn build_stub(stub_addr: *mut u8, handler: *const u8, gateway: *mut u8) -> Vec<u
         0x41, 0x5F, // pop r15
     ]);
     c.extend_from_slice(&[0x0F, 0xAE, 0x14, 0x24]); // ldmxcsr [rsp]
-    c.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8
+    c.extend_from_slice(&[0x48, 0x8D, 0x64, 0x24, 0x08]); // lea rsp, [rsp + 8]
     for n in 0..16u8 {
         restore_xmm(&mut c, n);
     }
@@ -467,7 +469,7 @@ fn build_stub(stub_addr: *mut u8, handler: *const u8, gateway: *mut u8) -> Vec<u
     // target). Drop it back to the entry rsp and jump through it. Using an
     // indirect `jmp` (not `ret`) keeps the CET shadow stack intact; the operand
     // sits 8 bytes below rsp only for this single instruction.
-    c.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8     (rsp = entry rsp)
+    c.extend_from_slice(&[0x48, 0x8D, 0x64, 0x24, 0x08]); // lea rsp, [rsp + 8]   (rsp = entry rsp)
     c.extend_from_slice(&[0xFF, 0x64, 0x24, 0xF8]); // jmp qword [rsp - 8]
 
     c
@@ -477,30 +479,32 @@ fn build_stub(stub_addr: *mut u8, handler: *const u8, gateway: *mut u8) -> Vec<u
 fn build_stub(stub_addr: *mut u8, handler: *const u8, gateway: *mut u8) -> Vec<u8> {
     let mut c = Vec::with_capacity(STUB_CAPACITY);
 
-    // sub esp,16 ; movups [esp], xmmN
+    // lea esp,[esp-16] ; movups [esp], xmmN
     let save_xmm = |c: &mut Vec<u8>, n: u8| {
-        c.extend_from_slice(&[0x83, 0xEC, 0x10]); // sub esp, 16
+        c.extend_from_slice(&[0x8D, 0x64, 0x24, 0xF0]); // lea esp, [esp - 16]
         c.extend_from_slice(&[0x0F, 0x11, 0x04 | (n << 3), 0x24]); // movups [esp], xmmN
     };
-    // movups xmmN, [esp] ; add esp,16
+    // movups xmmN, [esp] ; lea esp,[esp+16]
     let restore_xmm = |c: &mut Vec<u8>, n: u8| {
         c.extend_from_slice(&[0x0F, 0x10, 0x04 | (n << 3), 0x24]); // movups xmmN, [esp]
-        c.extend_from_slice(&[0x83, 0xC4, 0x10]); // add esp, 16
+        c.extend_from_slice(&[0x8D, 0x64, 0x24, 0x10]); // lea esp, [esp + 16]
     };
 
+    // Stack adjustments outside the pushfd/popfd window use `lea` so the flags
+    // survive the round trip.
     // Reserve and zero the redirect slot at the top of the frame (the handler
     // sees it as `HookContext::redirect_eip`; 0 == "do not redirect"). Eight
     // bytes are reserved - `redirect_eip` (4) plus 4 of tail padding - so the
     // frame size matches `size_of::<HookContext>()` (the struct is 8-aligned
     // because of `Xmm`), leaving no slack a full-struct read could run past.
-    c.extend_from_slice(&[0x83, 0xEC, 0x08]); // sub esp, 8
+    c.extend_from_slice(&[0x8D, 0x64, 0x24, 0xF8]); // lea esp, [esp - 8]
     c.extend_from_slice(&[0xC7, 0x04, 0x24, 0x00, 0x00, 0x00, 0x00]); // mov dword [esp], 0 (redirect_eip)
 
     // --- save: xmm7..xmm0 (xmm0 ends lowest), MXCSR, then pushad + pushfd ---
     for n in (0..8u8).rev() {
         save_xmm(&mut c, n);
     }
-    c.extend_from_slice(&[0x83, 0xEC, 0x04]); // sub esp, 4   (mxcsr)
+    c.extend_from_slice(&[0x8D, 0x64, 0x24, 0xFC]); // lea esp, [esp - 4]   (mxcsr)
     c.extend_from_slice(&[0x0F, 0xAE, 0x1C, 0x24]); // stmxcsr [esp]
     c.push(0x60); // pushad
     c.push(0x9C); // pushfd
@@ -530,14 +534,14 @@ fn build_stub(stub_addr: *mut u8, handler: *const u8, gateway: *mut u8) -> Vec<u
     c.push(0x9D); // popfd
     c.push(0x61); // popad
     c.extend_from_slice(&[0x0F, 0xAE, 0x14, 0x24]); // ldmxcsr [esp]
-    c.extend_from_slice(&[0x83, 0xC4, 0x04]); // add esp, 4
+    c.extend_from_slice(&[0x8D, 0x64, 0x24, 0x04]); // lea esp, [esp + 4]
     for n in 0..8u8 {
         restore_xmm(&mut c, n);
     }
     // After the XMM reloads esp points at the redirect slot (= chosen target).
     // Drop back to the entry esp (past the 8-byte slot) and jump through it
     // (indirect jmp, not ret). redirect_eip sits at the low dword of the slot.
-    c.extend_from_slice(&[0x83, 0xC4, 0x08]); // add esp, 8      (esp = entry esp)
+    c.extend_from_slice(&[0x8D, 0x64, 0x24, 0x08]); // lea esp, [esp + 8]   (esp = entry esp)
     c.extend_from_slice(&[0xFF, 0x64, 0x24, 0xF8]); // jmp dword [esp - 8]
 
     let _ = stub_addr; // position-independent now; kept for signature symmetry.
@@ -588,7 +592,7 @@ mod tests {
         let gw = u64::from_le_bytes(bytes[movabs_rcx + 2..movabs_rcx + 10].try_into().unwrap());
         assert_eq!(gw, gateway);
 
-        // The stub ends with `add rsp, 8` then an indirect `jmp [rsp - 8]`
+        // The stub ends with `lea rsp, [rsp + 8]` then an indirect `jmp [rsp - 8]`
         // (FF 64 24 F8) - a jmp, never a `ret`, to keep the CET shadow stack
         // intact.
         assert_eq!(
@@ -671,8 +675,12 @@ mod tests {
             gateway as *mut u8,
         );
 
-        // First op reserves the 8-byte redirect slot (sub esp, 8).
-        assert_eq!(&bytes[0..3], &[0x83, 0xEC, 0x08], "first op is sub esp, 8");
+        // First op reserves the 8-byte redirect slot (lea esp, [esp - 8]).
+        assert_eq!(
+            &bytes[0..4],
+            &[0x8D, 0x64, 0x24, 0xF8],
+            "first op is lea esp, [esp - 8]"
+        );
         assert!(bytes.contains(&0x60), "pushad present");
 
         // The gateway is embedded as imm32 after `mov ecx, imm32` (B9).
@@ -683,7 +691,7 @@ mod tests {
         let gw = u32::from_le_bytes(bytes[movimm + 1..movimm + 5].try_into().unwrap());
         assert_eq!(gw, gateway);
 
-        // Tail is `add esp, 8` then indirect `jmp [esp - 8]` (FF 64 24 F8), no ret.
+        // Tail is `lea esp, [esp + 8]` then indirect `jmp [esp - 8]` (FF 64 24 F8), no ret.
         assert_eq!(
             &bytes[bytes.len() - 4..],
             &[0xFF, 0x64, 0x24, 0xF8],
