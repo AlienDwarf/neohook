@@ -224,6 +224,11 @@ unsafe fn find_import_thunk(
     // desc_rva = RVA of the current IMAGE_IMPORT_DESCRIPTOR we're checking
     let mut desc_rva = image.import_dir_rva;
 
+    // A DLL can appear in several descriptors, so a descriptor that matches the
+    // DLL but cannot be searched (or lacks the function) does not end the walk.
+    // Its error is reported only if no later descriptor has the import.
+    let mut not_found = InternalIatHookError::TargetNotFound;
+
     // Calculate the end RVA of the import directory
     let desc_end = image
         .import_dir_rva
@@ -247,7 +252,7 @@ unsafe fn find_import_thunk(
         // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#import-directory-table
         // "The last [...] entry is empty"
         if desc.Name == 0 {
-            return Err(InternalIatHookError::TargetNotFound);
+            return Err(not_found);
         }
 
         // Read the DLL name from the Name RVA
@@ -257,57 +262,11 @@ unsafe fn find_import_thunk(
         // Compare the DLL name with the target DLL name (case-insensitive)
         if dll_name.eq_ignore_ascii_case(target_dll) {
             // Here we found the DLL. Now we look for target func
-
-            // sanity check if ft is 0 it means there are not iat entries
-            if desc.FirstThunk == 0 {
-                return Err(InternalIatHookError::MalformedImportDirectory);
+            match unsafe { find_thunk_in_descriptor(image, &desc, target_func) } {
+                Ok(thunk) => return Ok(thunk),
+                Err(InternalIatHookError::TargetNotFound) => {}
+                Err(err) => not_found = err,
             }
-
-            // IMPORTANT: For name resolution we need the INT (OriginalFirstThunk).
-            // If it's missing, we deliberately fail instead of trying to misuse the already overwritten IAT as a name table.
-
-            if unsafe { desc.Anonymous.OriginalFirstThunk } == 0 {
-                return Err(InternalIatHookError::NameResolutionUnavailable);
-            }
-
-            let mut thunk_rva = desc.FirstThunk as usize;
-            let mut original_thunk_rva = unsafe { desc.Anonymous.OriginalFirstThunk as usize };
-
-            // Loop through the thunks to find the target function
-            loop {
-                let thunk = pe::rva_to_mut_ptr::<IMAGE_THUNK_DATA>(&image.image, thunk_rva)
-                    .ok_or(InternalIatHookError::MalformedImportDirectory)?;
-                let original_thunk =
-                    pe::rva_to_ptr::<IMAGE_THUNK_DATA>(&image.image, original_thunk_rva)
-                        .ok_or(InternalIatHookError::MalformedImportDirectory)?;
-
-                // Our loop termination when we reach the end of the tunks
-                let lookup = unsafe { thunk_address_of_data(original_thunk) };
-                if lookup == 0 {
-                    break;
-                }
-
-                // Check if the import is by ordinal or by name. If it's by ordinal, we can't resolve the name, so we skip it.
-                if !unsafe { thunk_is_ordinal(original_thunk) } {
-                    let func_name = read_import_name(&image.image, lookup)
-                        .ok_or(InternalIatHookError::MalformedImportDirectory)?;
-
-                    // If the name matches we retourn the pointer to the IAT slot
-                    if func_name == target_func {
-                        return Ok(thunk);
-                    }
-                }
-
-                thunk_rva = thunk_rva
-                    .checked_add(std::mem::size_of::<IMAGE_THUNK_DATA>())
-                    .ok_or(InternalIatHookError::MalformedImportDirectory)?;
-                original_thunk_rva = original_thunk_rva
-                    .checked_add(std::mem::size_of::<IMAGE_THUNK_DATA>())
-                    .ok_or(InternalIatHookError::MalformedImportDirectory)?;
-            }
-
-            // If we reach here, it means we found the target DLL but not the target function within its imports
-            return Err(InternalIatHookError::TargetNotFound);
         }
 
         // Move to the next IMAGE_IMPORT_DESCRIPTOR (WHILE ITERATION. NOT LOOP)
@@ -317,6 +276,64 @@ unsafe fn find_import_thunk(
     }
 
     Err(InternalIatHookError::MalformedImportDirectory)
+}
+
+/// Searches the import name table of one descriptor for `target_func` and
+/// returns its IAT slot.
+unsafe fn find_thunk_in_descriptor(
+    image: &ModuleImage,
+    desc: &IMAGE_IMPORT_DESCRIPTOR,
+    target_func: &str,
+) -> Result<*mut IMAGE_THUNK_DATA, InternalIatHookError> {
+    // sanity check if ft is 0 it means there are not iat entries
+    if desc.FirstThunk == 0 {
+        return Err(InternalIatHookError::MalformedImportDirectory);
+    }
+
+    // IMPORTANT: For name resolution we need the INT (OriginalFirstThunk).
+    // If it's missing, we deliberately fail instead of trying to misuse the already overwritten IAT as a name table.
+
+    if unsafe { desc.Anonymous.OriginalFirstThunk } == 0 {
+        return Err(InternalIatHookError::NameResolutionUnavailable);
+    }
+
+    let mut thunk_rva = desc.FirstThunk as usize;
+    let mut original_thunk_rva = unsafe { desc.Anonymous.OriginalFirstThunk as usize };
+
+    // Loop through the thunks to find the target function
+    loop {
+        let thunk = pe::rva_to_mut_ptr::<IMAGE_THUNK_DATA>(&image.image, thunk_rva)
+            .ok_or(InternalIatHookError::MalformedImportDirectory)?;
+        let original_thunk = pe::rva_to_ptr::<IMAGE_THUNK_DATA>(&image.image, original_thunk_rva)
+            .ok_or(InternalIatHookError::MalformedImportDirectory)?;
+
+        // Our loop termination when we reach the end of the tunks
+        let lookup = unsafe { thunk_address_of_data(original_thunk) };
+        if lookup == 0 {
+            break;
+        }
+
+        // Check if the import is by ordinal or by name. If it's by ordinal, we can't resolve the name, so we skip it.
+        if !unsafe { thunk_is_ordinal(original_thunk) } {
+            let func_name = read_import_name(&image.image, lookup)
+                .ok_or(InternalIatHookError::MalformedImportDirectory)?;
+
+            // If the name matches we retourn the pointer to the IAT slot
+            if func_name == target_func {
+                return Ok(thunk);
+            }
+        }
+
+        thunk_rva = thunk_rva
+            .checked_add(std::mem::size_of::<IMAGE_THUNK_DATA>())
+            .ok_or(InternalIatHookError::MalformedImportDirectory)?;
+        original_thunk_rva = original_thunk_rva
+            .checked_add(std::mem::size_of::<IMAGE_THUNK_DATA>())
+            .ok_or(InternalIatHookError::MalformedImportDirectory)?;
+    }
+
+    // If we reach here, this descriptor does not import the target function
+    Err(InternalIatHookError::TargetNotFound)
 }
 
 fn read_import_name(image: &PeImage, import_by_name_rva: usize) -> Option<String> {
