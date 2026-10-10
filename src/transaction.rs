@@ -285,8 +285,9 @@ impl InlineHook {
         if target.is_null() || bytes.is_empty() {
             return Err(DetourError::InvalidParameter);
         }
-        if unsafe { crate::mem::write_memory_atomic(target, bytes.as_ptr(), bytes.len()) }.is_some()
-        {
+        // Also runs inside a commit's suspend window (detach, rollback), so it
+        // must not allocate.
+        if unsafe { crate::mem::write_code_bytes(target, bytes.as_ptr(), bytes.len()) } {
             Ok(())
         } else {
             Err(DetourError::RelocationFailed)
@@ -1317,7 +1318,7 @@ impl TransactionCore {
         }
 
         // Serialize the patch phase against other transactions. If threads were
-        // suspended earlier this is a no-op, since the lock is already held.
+        // tracked earlier this is a no-op, since the lock is already held.
         self.acquire_global_lock();
 
         #[cfg(feature = "debug-log")]
@@ -1326,91 +1327,101 @@ impl TransactionCore {
             threads: self.threads.len(),
         });
 
-        let pending = std::mem::take(&mut self.pending_hooks);
-        let mut installed: Vec<Hook> = Vec::new();
-        let mut detached: Vec<AppliedDetach> = Vec::new();
+        // Suspend window rule: between `suspend_threads` and the resume, a
+        // suspended thread may own the heap lock or one of neohook's own mutexes
+        // (gateway registry, stub quarantine), so this thread must take neither.
+        // Everything that allocates is done up front, pending hooks are consumed
+        // in place and only dropped after the resume, and the registry is
+        // updated once every thread runs again.
+        let mut pending = std::mem::take(&mut self.pending_hooks);
+        let mut reserved: Vec<Reserved> = Vec::with_capacity(pending.len());
+        let mut inline_count = 0;
+        let mut detach_count = 0;
+        for (index, hook) in pending.iter().enumerate() {
+            let slot = match hook {
+                PendingHook::Inline(data) => {
+                    inline_count += 1;
+                    inline_patch_bytes(data)
+                        .map(Reserved::Patch)
+                        .map_err(|e| (HookKind::Inline, e))
+                }
+                PendingHook::VtableInstance { vtable_len, .. } => {
+                    crate::vtable::ClonedVtable::new(*vtable_len)
+                        .map(|table| Reserved::Table(Some(table)))
+                        .map_err(|e| (HookKind::VtableInstance, e.into()))
+                }
+                PendingHook::Detach(_) => {
+                    detach_count += 1;
+                    Ok(Reserved::Nothing)
+                }
+                _ => Ok(Reserved::Nothing),
+            };
+            match slot {
+                Ok(slot) => reserved.push(slot),
+                Err((kind, e)) => {
+                    self.cleanup_threads();
+                    return Err(DetourError::CommitFailed {
+                        index,
+                        kind,
+                        source: Box::new(e),
+                    });
+                }
+            }
+        }
+
+        let mut installed: Vec<Hook> = Vec::with_capacity(pending.len());
+        let mut detached: Vec<AppliedDetach> = Vec::with_capacity(detach_count);
+        if inline_count > 0 {
+            // An instruction pointer or stack slot is redirected at most once:
+            // afterwards it points into a fresh trampoline, which no other hook
+            // in this commit can target.
+            self.redirected_threads.reserve(self.threads.len());
+            self.redirected_stacks
+                .reserve(self.threads.len() * STACK_SCAN_DEPTH);
+        }
+        crate::cfg::prepare();
 
         self.suspend_threads();
 
-        // Apply hooks
-        for (hook_index, hook) in pending.into_iter().enumerate() {
-            match hook {
-                PendingHook::Inline(data) => {
-                    // Borrow
-                    let thread_handles = self.threads.clone();
-                    // check if any thread is executing in the range of the original bytes, and if so, redirect them to the trampoline before we overwrite the code
-                    for h_thread in thread_handles {
-                        if let Err(e) = self.redirect_rip_relative_threads(h_thread, &data) {
-                            rollback_detaches(&mut detached);
-                            self.rollback(&mut installed);
-                            self.cleanup_threads();
-                            return Err(DetourError::CommitFailed {
-                                index: hook_index,
-                                kind: HookKind::Inline,
-                                source: Box::new(e),
-                            });
-                        }
-                    }
-
-                    match self.apply_inline_hook(data) {
-                        Ok(inst) => installed.push(Hook::Inline(inst)),
-                        Err(e) => {
-                            rollback_detaches(&mut detached);
-                            self.rollback(&mut installed);
-                            self.cleanup_threads();
-                            return Err(DetourError::CommitFailed {
-                                index: hook_index,
-                                kind: HookKind::Inline,
-                                source: Box::new(e),
-                            });
-                        }
-                    }
-                }
+        let mut failure = None;
+        for (index, hook) in pending.iter_mut().enumerate() {
+            let step = match hook {
+                PendingHook::Inline(data) => self
+                    .install_inline(data, &mut reserved[index])
+                    .map(Some)
+                    .map_err(|e| (HookKind::Inline, e)),
                 PendingHook::Iat {
                     module,
                     target_dll,
                     target_func,
                     detour,
                 } => unsafe {
-                    match crate::iat::IatHook::hook_import(
-                        module,
-                        &target_dll,
-                        &target_func,
-                        detour,
-                    ) {
-                        Ok(original) => {
-                            installed.push(Hook::Iat(IatHook {
-                                module,
-                                dll_name: target_dll,
-                                func_name: target_func,
+                    crate::iat::IatHook::hook_import(*module, target_dll, target_func, *detour)
+                        .map(|original| {
+                            Some(Hook::Iat(IatHook {
+                                module: *module,
+                                // Moved out rather than cloned: the empty
+                                // `String` left behind owns no allocation.
+                                dll_name: std::mem::take(target_dll),
+                                func_name: std::mem::take(target_func),
                                 original_ptr: original,
                                 active: true,
-                                detour: detour as *mut u8,
+                                detour: *detour as *mut u8,
                                 enabled: true,
-                            }));
-                        }
-                        Err(err) => {
-                            rollback_detaches(&mut detached);
-                            self.rollback(&mut installed);
-                            self.cleanup_threads();
-                            return Err(DetourError::CommitFailed {
-                                index: hook_index,
-                                kind: HookKind::Iat,
-                                source: Box::new(err.into()),
-                            });
-                        }
-                    }
+                            }))
+                        })
+                        .map_err(|err| (HookKind::Iat, err.into()))
                 },
                 PendingHook::Eat {
                     module,
                     target_func,
                     detour,
                 } => unsafe {
-                    match crate::eat::EatHook::hook_export(module, &target_func, detour) {
-                        Ok(inst) => {
-                            installed.push(Hook::Eat(EatHook {
-                                module,
-                                func_name: target_func,
+                    crate::eat::EatHook::hook_export(*module, target_func, *detour)
+                        .map(|inst| {
+                            Some(Hook::Eat(EatHook {
+                                module: *module,
+                                func_name: std::mem::take(target_func),
                                 slot_ptr: inst.slot_ptr,
                                 original_rva: inst.original_rva,
                                 detour_rva: inst.detour_rva,
@@ -1418,19 +1429,9 @@ impl TransactionCore {
                                 stub: inst.stub,
                                 active: true,
                                 enabled: true,
-                            }));
-                        }
-                        Err(err) => {
-                            rollback_detaches(&mut detached);
-                            self.rollback(&mut installed);
-                            self.cleanup_threads();
-                            return Err(DetourError::CommitFailed {
-                                index: hook_index,
-                                kind: HookKind::Eat,
-                                source: Box::new(err.into()),
-                            });
-                        }
-                    }
+                            }))
+                        })
+                        .map_err(|err| (HookKind::Eat, err.into()))
                 },
                 PendingHook::Vtable {
                     vtable,
@@ -1438,67 +1439,64 @@ impl TransactionCore {
                     detour,
                 } => unsafe {
                     // Install as RAII hook object so rollback/drop can restore.
-                    match crate::vtable::VTableHook::install(vtable, index, detour) {
-                        Ok(inst) => {
-                            installed.push(Hook::Vtable(inst));
-                        }
-                        Err(err) => {
-                            rollback_detaches(&mut detached);
-                            self.rollback(&mut installed);
-                            self.cleanup_threads();
-                            return Err(DetourError::CommitFailed {
-                                index: hook_index,
-                                kind: HookKind::Vtable,
-                                source: Box::new(err.into()),
-                            });
-                        }
-                    }
+                    crate::vtable::VTableHook::install(*vtable, *index, *detour)
+                        .map(|inst| Some(Hook::Vtable(inst)))
+                        .map_err(|err| (HookKind::Vtable, err.into()))
                 },
                 PendingHook::VtableInstance {
                     object_vptr,
-                    vtable_len,
-                    index,
+                    index: slot,
                     detour,
-                } => unsafe {
-                    match crate::vtable::VTableInstanceHook::install(
-                        object_vptr,
-                        vtable_len,
-                        index,
-                        detour,
-                    ) {
-                        Ok(inst) => {
-                            installed.push(Hook::VtableInstance(inst));
-                        }
-                        Err(err) => {
-                            rollback_detaches(&mut detached);
-                            self.rollback(&mut installed);
-                            self.cleanup_threads();
-                            return Err(DetourError::CommitFailed {
-                                index: hook_index,
-                                kind: HookKind::VtableInstance,
-                                source: Box::new(err.into()),
-                            });
-                        }
+                    ..
+                } => {
+                    let Reserved::Table(table) = &mut reserved[index] else {
+                        unreachable!("clone storage is reserved for every VTable instance hook");
+                    };
+                    unsafe {
+                        crate::vtable::VTableInstanceHook::install_into(
+                            *object_vptr,
+                            *slot,
+                            *detour,
+                            table,
+                        )
                     }
-                },
-                PendingHook::Detach(target) => match unsafe { prepare_detach(target) } {
-                    Ok(was_enabled) => detached.push(AppliedDetach {
-                        target,
-                        was_enabled,
-                    }),
-                    Err(e) => {
-                        rollback_detaches(&mut detached);
-                        rollback_detaches(&mut detached);
-                        self.rollback(&mut installed);
-                        self.cleanup_threads();
-                        return Err(DetourError::CommitFailed {
-                            index: hook_index,
-                            kind: HookKind::Detach,
-                            source: Box::new(e),
+                    .map(|inst| Some(Hook::VtableInstance(inst)))
+                    .map_err(|err| (HookKind::VtableInstance, err.into()))
+                }
+                PendingHook::Detach(target) => match unsafe { prepare_detach(*target) } {
+                    Ok(was_enabled) => {
+                        detached.push(AppliedDetach {
+                            target: *target,
+                            was_enabled,
                         });
+                        Ok(None)
                     }
+                    Err(e) => Err((HookKind::Detach, e)),
                 },
+            };
+            match step {
+                Ok(Some(hook)) => installed.push(hook),
+                Ok(None) => {}
+                Err((kind, source)) => {
+                    failure = Some((index, kind, source));
+                    break;
+                }
             }
+        }
+
+        if let Some((index, kind, source)) = failure {
+            rollback_detaches(&mut detached);
+            self.rollback(&mut installed);
+            self.cleanup_threads();
+            // Threads run again: dismantle what the failed commit built.
+            drop(installed);
+            drop(pending);
+            drop(reserved);
+            return Err(DetourError::CommitFailed {
+                index,
+                kind,
+                source: Box::new(source),
+            });
         }
 
         // CPU Cache flush after all hooks installed
@@ -1515,7 +1513,19 @@ impl TransactionCore {
             hooks: installed.len(),
         });
 
-        // resume threads
+        self.resume_threads();
+
+        // Publish the new gateways while the transaction lock is still held, so
+        // the next transaction already sees them.
+        for hook in &installed {
+            if let Hook::Inline(inline) = hook {
+                if matches!(inline.target_kind, TargetKind::ManagedGateway) {
+                    unregister_managed_gateway(inline.target);
+                }
+                register_managed_gateway(inline.trampoline.ptr);
+            }
+        }
+
         self.cleanup_threads();
         finalize_detaches(&mut detached);
         self.is_pending = false;
@@ -1597,6 +1607,11 @@ impl TransactionCore {
                 let redirected_ip = Self::map_redirect_address_exact(data, original_rip)?
                     .ok_or(DetourError::RelocationFailed)?;
 
+                // Capacity is reserved before any thread is suspended; growing
+                // here would allocate inside the suspend window.
+                if self.redirected_threads.len() == self.redirected_threads.capacity() {
+                    return Err(DetourError::RelocationFailed);
+                }
                 self.redirected_threads
                     .push((h_thread, original_rip as u64));
 
@@ -1654,6 +1669,10 @@ impl TransactionCore {
                     if let Some(new_return_addr) =
                         Self::map_redirect_address_exact(data, stack_value)?
                     {
+                        if self.redirected_stacks.len() == self.redirected_stacks.capacity() {
+                            return Err(DetourError::RelocationFailed);
+                        }
+
                         #[cfg(feature = "debug-log")]
                         self.record_debug(DebugEvent::StackRedirected {
                             tid,
@@ -1691,7 +1710,7 @@ impl TransactionCore {
     }
 
     /// Rollback function to undo all installed hooks in case of an error during commit. It takes a mutable reference to the list of installed hooks and unhooks each one.
-    fn rollback(&mut self, installed: &mut Vec<Hook>) {
+    fn rollback(&mut self, installed: &mut [Hook]) {
         // restore threads first before unhook.
         //
         // Indexed rather than `drain(..)`/`mem::take`: draining would keep
@@ -1738,25 +1757,12 @@ impl TransactionCore {
             }
         }
 
-        // Restore original bytes or IAT entries for each installed hook
-        for detour in installed.drain(..) {
-            match detour {
-                Hook::Inline(hook) => {
-                    let _ = hook.unhook();
-                }
-                Hook::Iat(hook) => {
-                    let _ = hook.unhook();
-                }
-                Hook::Eat(hook) => {
-                    let _ = hook.unhook();
-                }
-                Hook::Vtable(hook) => {
-                    let _ = hook.unhook();
-                }
-                Hook::VtableInstance(hook) => {
-                    let _ = hook.unhook();
-                }
-            }
+        // Restore the original bytes or pointers in place. Dropping the hooks
+        // would also free memory and update the gateway registry and stub
+        // quarantine, which must wait until the threads are resumed; the caller
+        // drops them then, and that unhook is idempotent.
+        for hook in installed.iter_mut().rev() {
+            let _ = hook.disable();
         }
     }
 
@@ -1863,17 +1869,23 @@ impl TransactionCore {
         self.threads_suspended = true;
     }
 
-    fn cleanup_threads(&mut self) {
-        for &h in &self.threads {
-            unsafe {
-                if self.threads_suspended {
-                    ResumeThread(h);
-                }
-                CloseHandle(h);
+    /// Resumes the tracked threads if they are suspended, keeping the handles
+    /// and the transaction lock.
+    fn resume_threads(&mut self) {
+        if self.threads_suspended {
+            for &h in &self.threads {
+                unsafe { ResumeThread(h) };
             }
+            self.threads_suspended = false;
+        }
+    }
+
+    fn cleanup_threads(&mut self) {
+        self.resume_threads();
+        for &h in &self.threads {
+            unsafe { CloseHandle(h) };
         }
         self.threads.clear();
-        self.threads_suspended = false;
         // All threads have been resumed; release the process-wide transaction
         // lock (if this transaction holds it) so another transaction can run.
         self.global_lock = None;
@@ -1884,79 +1896,51 @@ impl TransactionCore {
         self.flush_debug_events();
     }
 
-    // Apply an inline hook, returning an InstalledHook on success.
-    fn apply_inline_hook(&mut self, data: InlineData) -> Result<InlineHook, DetourError> {
-        unsafe {
-            let target = data.target;
-            let dest = data.detour;
-
-            // We prepare the jump instruction in a buffer. For Relative5, it's 5 bytes: E9 + 4-byte offset. For Absolute14, it's 14 bytes: FF 25 00 00 00 00 + 8-byte absolute address.
-            let mut patch_buffer = [0u8; 14];
-            let patch_len: usize;
-
-            match data.jump_type {
-                JumpType::Relative5 => {
-                    let offset = (dest as isize)
-                        .wrapping_sub(target as isize)
-                        .wrapping_sub(5);
-
-                    debug_assert!(
-                        (i32::MIN as isize..=i32::MAX as isize).contains(&offset),
-                        "Offset for relative jump does not fit in 32 bits"
-                    );
-
-                    patch_buffer[0] = 0xE9;
-                    // We write the offset as a little-endian 4-byte value starting at patch_buffer[1]
-                    patch_buffer[1..5].copy_from_slice(&(offset as i32).to_le_bytes());
-                    patch_len = 5;
-                }
-                JumpType::Absolute14 => {
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        patch_buffer[0..6].copy_from_slice(&[0xFF, 0x25, 0x00, 0x00, 0x00, 0x00]);
-                        patch_buffer[6..14].copy_from_slice(&(dest as u64).to_le_bytes());
-                        patch_len = 14;
-                    }
-                    #[cfg(target_arch = "x86")]
-                    {
-                        // Absolute jumps are not supported on x86, we should never reach this case because attach() should have returned an error if the target was too far away. We put this here just for completeness, but it should never be used.
-                        return Err(DetourError::InvalidParameter);
-                    }
-                }
-            };
-
-            // stolen_len could be > patch_len, in that case we fill the rest with NOP 0x90 bytes
-            let mut full_patch = vec![0x90u8; data.stolen_len];
-            full_patch[..patch_len].copy_from_slice(&patch_buffer[..patch_len]); // E9 xx xx xx xx 90 90 90 90....
-
-            // we write atomic to ensure a thread-safe patching. If something fails we return an error
-            if crate::mem::write_memory_atomic(target, full_patch.as_ptr(), data.stolen_len)
-                .is_some()
-            {
-                // If this hook is overwriting a managed gateway, we need to unregister it
-                if matches!(data.target_kind, TargetKind::ManagedGateway) {
-                    unregister_managed_gateway(data.target);
-                }
-
-                // Write was successful now we register the trampoline as a managed gateway so it can be hooked itself
-                register_managed_gateway(data.trampoline.ptr);
-
-                Ok(InlineHook {
-                    target: data.target,
-                    trampoline: data.trampoline,
-                    stolen_len: data.stolen_len,
-                    orig_bytes: data.orig_bytes,
-                    jump_type: data.jump_type,
-                    active: true,
-                    target_kind: data.target_kind,
-                    patch_bytes: full_patch,
-                    enabled: true,
-                })
-            } else {
-                // If the write fails, we return an error. The commit() function will catch this and call rollback() to undo any hooks that were already installed.
-                Err(DetourError::RelocationFailed)
-            }
+    /// Redirects the suspended threads away from `data`'s stolen bytes and writes
+    /// the prebuilt jump in `reserved` over them.
+    ///
+    /// Runs inside the suspend window, so it allocates and frees nothing: the
+    /// hook's parts are moved out of `data` (which is dropped after the resume)
+    /// and the patch is taken from `reserved` only on success. The gateway
+    /// registry is updated by `commit` once the threads run again.
+    fn install_inline(
+        &mut self,
+        data: &mut InlineData,
+        reserved: &mut Reserved,
+    ) -> Result<Hook, DetourError> {
+        // check if any thread is executing in the range of the original bytes, and if so, redirect them to the trampoline before we overwrite the code
+        for i in 0..self.threads.len() {
+            let h_thread = self.threads[i];
+            self.redirect_rip_relative_threads(h_thread, data)?;
         }
+
+        let Reserved::Patch(patch) = reserved else {
+            return Err(DetourError::InvalidParameter);
+        };
+        if patch.len() != data.stolen_len
+            || !unsafe { crate::mem::write_code_bytes(data.target, patch.as_ptr(), patch.len()) }
+        {
+            // The commit rolls back the hooks that were already installed.
+            return Err(DetourError::RelocationFailed);
+        }
+
+        Ok(Hook::Inline(InlineHook {
+            target: data.target,
+            trampoline: std::mem::replace(
+                &mut data.trampoline,
+                Trampoline {
+                    ptr: std::ptr::null_mut(),
+                    size: 0,
+                },
+            ),
+            stolen_len: data.stolen_len,
+            orig_bytes: std::mem::take(&mut data.orig_bytes),
+            jump_type: data.jump_type,
+            active: true,
+            target_kind: std::mem::replace(&mut data.target_kind, TargetKind::Normal),
+            patch_bytes: std::mem::take(patch),
+            enabled: true,
+        }))
     }
 
     /// Prints a human-readable snapshot of this transaction to standard output:
@@ -2255,6 +2239,66 @@ fn finalize_detaches(detached: &mut Vec<AppliedDetach>) {
     }
 
     detached.clear();
+}
+
+/// Per-hook resources a commit allocates before it suspends any thread.
+enum Reserved {
+    Nothing,
+    /// The bytes an inline hook writes over its target.
+    Patch(Vec<u8>),
+    /// Clone storage for a VTable instance hook, taken over on install.
+    Table(Option<crate::vtable::ClonedVtable>),
+}
+
+/// Builds the jump an inline hook writes over its target: a jump to the detour,
+/// padded with NOPs to the full stolen length.
+fn inline_patch_bytes(data: &InlineData) -> Result<Vec<u8>, DetourError> {
+    let target = data.target;
+    let dest = data.detour;
+
+    // We prepare the jump instruction in a buffer. For Relative5, it's 5 bytes: E9 + 4-byte offset. For Absolute14, it's 14 bytes: FF 25 00 00 00 00 + 8-byte absolute address.
+    let mut patch_buffer = [0u8; 14];
+    let patch_len: usize;
+
+    match data.jump_type {
+        JumpType::Relative5 => {
+            let offset = (dest as isize)
+                .wrapping_sub(target as isize)
+                .wrapping_sub(5);
+
+            debug_assert!(
+                (i32::MIN as isize..=i32::MAX as isize).contains(&offset),
+                "Offset for relative jump does not fit in 32 bits"
+            );
+
+            patch_buffer[0] = 0xE9;
+            // We write the offset as a little-endian 4-byte value starting at patch_buffer[1]
+            patch_buffer[1..5].copy_from_slice(&(offset as i32).to_le_bytes());
+            patch_len = 5;
+        }
+        JumpType::Absolute14 => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                patch_buffer[0..6].copy_from_slice(&[0xFF, 0x25, 0x00, 0x00, 0x00, 0x00]);
+                patch_buffer[6..14].copy_from_slice(&(dest as u64).to_le_bytes());
+                patch_len = 14;
+            }
+            #[cfg(target_arch = "x86")]
+            {
+                // Absolute jumps are not supported on x86, we should never reach this case because attach() should have returned an error if the target was too far away. We put this here just for completeness, but it should never be used.
+                return Err(DetourError::InvalidParameter);
+            }
+        }
+    };
+
+    if data.stolen_len < patch_len {
+        return Err(DetourError::InvalidParameter);
+    }
+
+    // stolen_len could be > patch_len, in that case we fill the rest with NOP 0x90 bytes
+    let mut full_patch = vec![0x90u8; data.stolen_len];
+    full_patch[..patch_len].copy_from_slice(&patch_buffer[..patch_len]); // E9 xx xx xx xx 90 90 90 90....
+    Ok(full_patch)
 }
 
 fn managed_gateways() -> &'static Mutex<HashSet<usize>> {

@@ -244,6 +244,37 @@ impl Drop for VTableHook {
     }
 }
 
+/// Heap storage for a per-instance VTable clone, released on drop unless a hook
+/// takes it over.
+pub(crate) struct ClonedVtable {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl ClonedVtable {
+    /// Allocates room for a clone of a VTable with `len` slots.
+    pub(crate) fn new(len: usize) -> Result<Self, VTableHookError> {
+        if len == 0 {
+            return Err(map_err(InternalVTableHookError::InvalidLength));
+        }
+        let layout = Layout::array::<*mut u8>(len)
+            .map_err(|_| map_err(InternalVTableHookError::AllocationFailed))?;
+        let ptr = unsafe { alloc(layout) };
+        if ptr.is_null() {
+            return Err(map_err(InternalVTableHookError::AllocationFailed));
+        }
+        Ok(Self { ptr, len })
+    }
+}
+
+impl Drop for ClonedVtable {
+    fn drop(&mut self) {
+        if let Ok(layout) = Layout::array::<*mut u8>(self.len) {
+            unsafe { dealloc(self.ptr, layout) };
+        }
+    }
+}
+
 /// Installed per-instance VTable hook guard.
 ///
 /// This clones the object's VTable, patches the selected slot in the clone,
@@ -299,6 +330,39 @@ impl VTableInstanceHook {
             return Err(map_err(InternalVTableHookError::IndexOutOfRange));
         }
 
+        let mut table = Some(ClonedVtable::new(vtable_len)?);
+        unsafe { Self::install_into(object_vptr, index, detour, &mut table) }
+    }
+
+    /// Installs the hook into clone storage allocated up front, so a commit can
+    /// call this while other threads are suspended without touching the heap.
+    ///
+    /// `table` is taken only on success. On failure it is left in place for the
+    /// caller to release once doing so is safe.
+    ///
+    /// # Safety
+    /// Same contract as [`Self::install`], with `table` sized for the full VTable.
+    pub(crate) unsafe fn install_into(
+        object_vptr: *mut *mut u8,
+        index: usize,
+        detour: *const u8,
+        table: &mut Option<ClonedVtable>,
+    ) -> Result<Self, VTableHookError> {
+        let Some(storage) = table.as_ref() else {
+            return Err(map_err(InternalVTableHookError::AllocationFailed));
+        };
+        let (cloned_vtable, vtable_len) = (storage.ptr, storage.len);
+
+        if object_vptr.is_null() {
+            return Err(map_err(InternalVTableHookError::NullObject));
+        }
+        if detour.is_null() {
+            return Err(map_err(InternalVTableHookError::NullDetour));
+        }
+        if index >= vtable_len {
+            return Err(map_err(InternalVTableHookError::IndexOutOfRange));
+        }
+
         // The cloned slot is dispatched through a CFG-guarded indirect call; mark
         // the detour as a valid call target so dispatch holds under strict CFG /
         // export suppression. No-op otherwise and when CFG is not enforced.
@@ -310,14 +374,6 @@ impl VTableInstanceHook {
         }
 
         let original_vtable_ptr = original_vtable as *const *mut u8;
-
-        let layout = Layout::array::<*mut u8>(vtable_len)
-            .map_err(|_| map_err(InternalVTableHookError::AllocationFailed))?;
-
-        let cloned_vtable = unsafe { alloc(layout) };
-        if cloned_vtable.is_null() {
-            return Err(map_err(InternalVTableHookError::AllocationFailed));
-        }
 
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -343,9 +399,6 @@ impl VTableInstanceHook {
             )
         } == 0
         {
-            unsafe {
-                dealloc(cloned_vtable.cast(), layout);
-            }
             return Err(map_err(InternalVTableHookError::ProtectFailed(
                 std::io::Error::last_os_error(),
             )));
@@ -368,9 +421,13 @@ impl VTableInstanceHook {
             let restore_err = std::io::Error::last_os_error();
             unsafe {
                 *object_vptr = original_vtable;
-                dealloc(cloned_vtable.cast(), layout);
             }
             return Err(map_err(InternalVTableHookError::ProtectFailed(restore_err)));
+        }
+
+        // The object now uses the clone; the hook owns and releases it from here.
+        if let Some(storage) = table.take() {
+            std::mem::forget(storage);
         }
 
         Ok(Self {

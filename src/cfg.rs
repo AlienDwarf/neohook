@@ -186,6 +186,15 @@ fn detect_enforced() -> bool {
     ok != 0 && (flags & ENABLE_CONTROL_FLOW_GUARD) != 0
 }
 
+/// Resolves everything [`register_valid_target`] looks up lazily, so a later
+/// call does no first-time initialization (a module lookup takes the loader
+/// lock) while a transaction holds other threads suspended.
+pub(crate) fn prepare() {
+    if is_enforced() {
+        let _ = set_valid_targets();
+    }
+}
+
 /// Marks `entry` as a valid Control Flow Guard indirect-call target.
 ///
 /// Use this to make runtime-generated code (or a detour in a module that was not
