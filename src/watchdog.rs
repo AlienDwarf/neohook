@@ -655,6 +655,115 @@ mod tests {
     }
 
     #[test]
+    fn restore_waits_while_a_thread_executes_inside_the_region() {
+        // Machine code for a loop that announces itself, then spins until a stop
+        // flag is set:
+        //
+        //   0: mov byte ptr [started], 1
+        //   7: pause
+        //   9: cmp byte ptr [stop], 0
+        //  16: je 7
+        //  18: ret
+        //  19: int3 padding (never executed)
+        //
+        // `[mem]` is RIP-relative on x64 and absolute on x86; both use the same
+        // opcodes and a 32-bit displacement field.
+        const STOP: usize = 0x100;
+        const STARTED: usize = 0x101;
+        const REGION_LEN: usize = 32;
+        const PADDING_BYTE: usize = 28;
+
+        let page = Page::new();
+        let base = page.0 as usize;
+
+        #[cfg(target_arch = "x86_64")]
+        let (started_disp, stop_disp) = (
+            (STARTED as i64 - 7) as i32 as u32,
+            (STOP as i64 - 16) as i32 as u32,
+        );
+        #[cfg(target_arch = "x86")]
+        let (started_disp, stop_disp) = ((base + STARTED) as u32, (base + STOP) as u32);
+
+        let mut code = vec![0xC6, 0x05];
+        code.extend_from_slice(&started_disp.to_le_bytes());
+        code.push(0x01);
+        code.extend_from_slice(&[0xF3, 0x90, 0x80, 0x3D]);
+        code.extend_from_slice(&stop_disp.to_le_bytes());
+        code.extend_from_slice(&[0x00, 0x74, 0xF5, 0xC3]);
+        code.resize(REGION_LEN, 0xCC);
+        page.write(&code);
+
+        let flag = |offset: usize| (base + offset) as *mut u8;
+        unsafe {
+            flag(STOP).write_volatile(0);
+            flag(STARTED).write_volatile(0);
+        }
+
+        // Make sure the spinner is always released, even if an assertion fails.
+        struct Spinner {
+            stop: *mut u8,
+            thread: Option<std::thread::JoinHandle<()>>,
+        }
+        impl Drop for Spinner {
+            fn drop(&mut self) {
+                unsafe { self.stop.write_volatile(1) };
+                if let Some(t) = self.thread.take() {
+                    let _ = t.join();
+                }
+            }
+        }
+
+        let entry = base;
+        let mut spinner = Spinner {
+            stop: flag(STOP),
+            thread: Some(std::thread::spawn(move || {
+                let f: extern "C" fn() = unsafe { std::mem::transmute(entry) };
+                f();
+            })),
+        };
+
+        assert!(
+            wait_until(Duration::from_secs(5), || unsafe {
+                flag(STARTED).read_volatile() == 1
+            }),
+            "spinner thread never entered the guarded code"
+        );
+
+        let wd = Watchdog::with_interval(Duration::from_millis(5));
+        let _id = unsafe { wd.guard(page.0, REGION_LEN) }.expect("guard");
+
+        // Tamper a byte the spinner never executes. Rewriting the region while the
+        // thread's instruction pointer is inside it is unsafe, so the watchdog
+        // must hold off for as long as the thread stays there.
+        unsafe { flag(PADDING_BYTE).write_volatile(0x90) };
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            unsafe { flag(PADDING_BYTE).read_volatile() },
+            0x90,
+            "restore must wait while a thread executes inside the region"
+        );
+        assert_eq!(
+            wd.restorations(),
+            0,
+            "no restoration while the region is busy"
+        );
+
+        // Release the spinner; once it has left, the restore goes through.
+        unsafe { flag(STOP).write_volatile(1) };
+        if let Some(t) = spinner.thread.take() {
+            t.join().expect("spinner thread panicked");
+        }
+        assert!(
+            wait_until(Duration::from_secs(5), || page.read(REGION_LEN) == code),
+            "restore should go through once no thread is inside the region"
+        );
+        assert!(
+            wait_until(Duration::from_secs(3), || wd.restorations() >= 1),
+            "the deferred restoration should be counted"
+        );
+    }
+
+    #[test]
     fn guard_id_round_trips_through_raw() {
         let id = GuardId::from_raw(42);
         assert_eq!(id.raw(), 42);
