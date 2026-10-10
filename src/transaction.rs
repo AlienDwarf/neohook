@@ -610,7 +610,11 @@ enum DebugEvent {
 const DEBUG_EVENT_CAPACITY: usize = 512;
 
 pub struct TransactionCore {
+    // Threads tracked by `update_thread`. They are opened right away but only
+    // suspended by `commit`, see `suspend_threads`.
     threads: Vec<HANDLE>,
+    // Whether every handle in `threads` is currently suspended by us.
+    threads_suspended: bool,
     pending_hooks: Vec<PendingHook>,
     is_pending: bool,
     redirected_threads: Vec<(HANDLE, u64)>, // for safety, we store the original RIP of redirected threads so we can restore it if needed
@@ -639,6 +643,7 @@ impl TransactionCore {
     pub fn begin() -> Self {
         Self {
             threads: Vec::new(),
+            threads_suspended: false,
             pending_hooks: Vec::new(),
             is_pending: true,
             redirected_threads: Vec::new(),
@@ -666,7 +671,8 @@ impl TransactionCore {
         }
     }
 
-    /// Opens, suspends, and tracks the thread identified by `thread_id`.
+    /// Opens and tracks the thread identified by `thread_id`. The thread is
+    /// suspended while [`Self::commit`] patches code and resumed afterwards.
     ///
     /// Note: `thread_id` must be a Win32 thread ID, not a `HANDLE`.
     ///
@@ -700,28 +706,22 @@ impl TransactionCore {
                 return Ok(());
             }
 
-            // Take the process-wide lock before suspending any thread, so a
-            // concurrent transaction can never freeze the thread that holds the
-            // lock (which would deadlock).
+            // Take the process-wide lock before any thread can be suspended, so
+            // a concurrent transaction can never freeze the thread that holds
+            // the lock (which would deadlock).
             self.acquire_global_lock();
-
-            if SuspendThread(h_thread) == u32::MAX {
-                CloseHandle(h_thread);
-                return Ok(());
-            }
 
             self.threads.push(h_thread);
             Ok(())
         }
     }
 
-    /// Suspends and tracks all threads in the current process except the calling
-    /// thread.
+    /// Tracks all threads in the current process except the calling thread, so
+    /// [`Self::commit`] suspends them while it patches code.
     ///
-    /// Thread IDs are collected, then
-    /// each thread is opened and suspended internally. Threads that cannot be
-    /// opened or suspended are skipped so that a single inaccessible thread does
-    /// not abort the transaction.
+    /// Thread IDs are collected, then each thread is opened internally. Threads
+    /// that cannot be opened or suspended are skipped so that a single
+    /// inaccessible thread does not abort the transaction.
     pub fn update_all_threads(&mut self) {
         let thread_ids = crate::threads::ThreadEnumerator::enumerate_process_threads();
         for tid in thread_ids {
@@ -1330,6 +1330,8 @@ impl TransactionCore {
         let mut installed: Vec<Hook> = Vec::new();
         let mut detached: Vec<AppliedDetach> = Vec::new();
 
+        self.suspend_threads();
+
         // Apply hooks
         for (hook_index, hook) in pending.into_iter().enumerate() {
             match hook {
@@ -1835,14 +1837,43 @@ impl TransactionCore {
         }
     }
 
+    /// Suspends every tracked thread, dropping the ones that cannot be
+    /// suspended (e.g. because they already exited).
+    ///
+    /// Suspension is deferred from [`Self::update_thread`] to the commit so the
+    /// frozen window covers only the patching itself: anything that runs while
+    /// other threads are suspended must not allocate or take a lock one of them
+    /// might hold, and `attach` and the caller's own code between `update_thread`
+    /// and `commit` cannot promise that.
+    fn suspend_threads(&mut self) {
+        if self.threads_suspended {
+            return;
+        }
+        let mut i = 0;
+        while i < self.threads.len() {
+            let h = self.threads[i];
+            if unsafe { SuspendThread(h) } == u32::MAX {
+                unsafe { CloseHandle(h) };
+                // Removing in place never reallocates.
+                self.threads.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        self.threads_suspended = true;
+    }
+
     fn cleanup_threads(&mut self) {
         for &h in &self.threads {
             unsafe {
-                ResumeThread(h);
+                if self.threads_suspended {
+                    ResumeThread(h);
+                }
                 CloseHandle(h);
             }
         }
         self.threads.clear();
+        self.threads_suspended = false;
         // All threads have been resumed; release the process-wide transaction
         // lock (if this transaction holds it) so another transaction can run.
         self.global_lock = None;

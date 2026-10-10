@@ -62,8 +62,8 @@ impl<'a> DetourTransaction<'a> {
         }
     }
 
-    /// Suspends the given thread and tracks it for the duration of the transaction.
-    /// Will be resumed when the transaction is committed or aborted.
+    /// Tracks the given thread for the duration of the transaction. It is
+    /// suspended while the commit patches code and resumed afterwards.
     ///
     /// The caller only provides the thread ID. NeoHook opens and owns the required thread handle internally.
     ///
@@ -81,8 +81,8 @@ impl<'a> DetourTransaction<'a> {
             .update_thread(thread_id)
     }
 
-    /// Suspends all threads in the current process except the calling thread and
-    /// registers them to be resumed later.
+    /// Tracks all threads in the current process except the calling thread, so
+    /// the commit suspends them while it patches code.
     ///
     /// This is a convenience method for preparing a transaction before hooks are
     /// attached and committed.
