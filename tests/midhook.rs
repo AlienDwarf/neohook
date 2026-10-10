@@ -9,7 +9,7 @@
 //! "called" and "unhook restores" tests on every target.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 // AtomicU64 backs the register-observation statics, which are x86_64-only.
 #[cfg(target_arch = "x86_64")]
 use std::sync::atomic::AtomicU64;
@@ -392,5 +392,76 @@ fn handler_can_rewrite_flags() {
         flags & (CF | ZF),
         CF | ZF,
         "flags written by the handler must reach the resumed code (got {flags:#x})"
+    );
+}
+
+// Direction-flag probe: `std` (1 byte) sets DF at the hook site, the live flags
+// are captured after the pad, and `cld` clears DF again before returning to
+// Rust code (the ABI requires DF=0 across calls).
+const DF: u32 = 1 << 10;
+const DF_SET_SITE: usize = 1;
+
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+extern "C" fn df_set_probe() -> u32 {
+    std::arch::naked_asm!(
+        "std",
+        ".fill 16, 1, 0x90",
+        "pushfq",
+        "pop rax",
+        "cld",
+        "ret"
+    )
+}
+
+#[cfg(target_arch = "x86")]
+#[unsafe(naked)]
+extern "C" fn df_set_probe() -> u32 {
+    std::arch::naked_asm!(
+        "std",
+        ".fill 16, 1, 0x90",
+        "pushfd",
+        "pop eax",
+        "cld",
+        "ret"
+    )
+}
+
+static HANDLER_FLAGS: AtomicU32 = AtomicU32::new(0);
+
+unsafe extern "C" fn record_live_flags_handler(_ctx: *mut HookContext) {
+    let flags: usize;
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::asm!("pushfq", "pop {}", out(reg) flags);
+    }
+    #[cfg(target_arch = "x86")]
+    unsafe {
+        std::arch::asm!("pushfd", "pop {}", out(reg) flags);
+    }
+    HANDLER_FLAGS.store(flags as u32, Ordering::SeqCst);
+}
+
+#[test]
+fn handler_runs_with_direction_flag_clear() {
+    let _serial = install_guard();
+    assert_eq!(df_set_probe() & DF, DF, "baseline");
+    HANDLER_FLAGS.store(DF, Ordering::SeqCst);
+
+    let site = probe_site(df_set_probe, DF_SET_SITE);
+    let hook = unsafe { MidHook::install(site, record_live_flags_handler) }.expect("install");
+    let flags = df_set_probe();
+    hook.unhook().expect("unhook");
+
+    let seen = HANDLER_FLAGS.load(Ordering::SeqCst);
+    assert_eq!(
+        seen & DF,
+        0,
+        "handler must run with DF clear (got {seen:#x})"
+    );
+    assert_eq!(
+        flags & DF,
+        DF,
+        "DF must reach the resumed code unchanged (got {flags:#x})"
     );
 }
