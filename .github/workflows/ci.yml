@@ -72,6 +72,29 @@ jobs:
       - name: Build docs
         run: cargo doc --no-deps --target ${{ matrix.target }}
 
+  msrv:
+    name: Minimum supported Rust version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Read `rust-version` from Cargo.toml so this job follows any MSRV bump.
+      - name: Install the declared rust-version
+        id: msrv
+        shell: pwsh
+        run: |
+          $msrv = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].rust_version
+          rustup toolchain install $msrv --profile minimal
+          "version=$msrv" >> $env:GITHUB_OUTPUT
+
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      - name: Check
+        run: cargo +${{ steps.msrv.outputs.version }} check --lib --locked
+
   cfg-guard:
     name: Control Flow Guard build
     runs-on: windows-latest
