@@ -604,11 +604,12 @@ namespace neohook
             if (!tx_)
                 throw std::runtime_error("NeoHook: Transaction is no longer valid");
 
+            // The commit consumes the transaction whether it succeeds or not.
             void *handle = detours_transaction_commit(tx_);
+            tx_ = nullptr;
             if (!handle)
                 throw std::runtime_error("NeoHook: Transaction commit failed");
 
-            tx_ = nullptr; // Rust takes ownership during commit
             return HookGuard(handle);
         }
 
