@@ -24,7 +24,6 @@
 //!   the target; there is no trampoline to call the original through (calling
 //!   the target again from the same thread would re-trigger the breakpoint).
 
-use std::ffi::c_void;
 use std::fmt;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -66,19 +65,22 @@ const CONTEXT_DEBUG: u32 = CONTEXT_DEBUG_REGISTERS_X86;
 static SLOT_TARGET: [AtomicUsize; SLOT_COUNT] = [const { AtomicUsize::new(0) }; SLOT_COUNT];
 static SLOT_DETOUR: [AtomicUsize; SLOT_COUNT] = [const { AtomicUsize::new(0) }; SLOT_COUNT];
 
+/// Ring of recently removed targets, so the handler can still recognise a late
+/// trap from a thread whose stale breakpoint fired just before it was cleared.
+const RETIRED_COUNT: usize = 16;
+static RETIRED: [AtomicUsize; RETIRED_COUNT] = [const { AtomicUsize::new(0) }; RETIRED_COUNT];
+static RETIRED_NEXT: AtomicUsize = AtomicUsize::new(0);
+
 /// Serializes installs/unhooks and owns the registered handler.
 struct VehManager {
     /// Handle from `AddVectoredExceptionHandler`, stored as `usize` so the
-    /// state is `Send`. Zero when no handler is registered.
+    /// state is `Send`. Zero until the first install. The handler is never
+    /// removed: a thread can still trap on a stale breakpoint after its hook is
+    /// gone, and the handler is what disarms it.
     handler: usize,
-    /// Number of active hooks; the handler is removed when it drops to zero.
-    count: usize,
 }
 
-static MANAGER: Mutex<VehManager> = Mutex::new(VehManager {
-    handler: 0,
-    count: 0,
-});
+static MANAGER: Mutex<VehManager> = Mutex::new(VehManager { handler: 0 });
 
 /// Errors produced while installing or removing a VEH hook.
 #[derive(Debug)]
@@ -121,8 +123,9 @@ impl std::error::Error for VehHookError {}
 /// An installed VEH (hardware-breakpoint) hook.
 ///
 /// The hook stays active until it is explicitly removed with [`Self::unhook`]
-/// or dropped, at which point the breakpoint is cleared on every thread and the
-/// vectored handler is removed once the last hook is gone.
+/// or dropped, at which point the breakpoint is cleared on every thread. The
+/// vectored handler stays registered so it can disarm any thread that still
+/// traps on the stale breakpoint.
 #[derive(Debug)]
 pub struct VehHook {
     target: *const u8,
@@ -246,8 +249,6 @@ impl VehHook {
         // Arm the breakpoint on every thread now that the slot is published.
         set_breakpoint_on_all_threads(slot, target_addr, true);
 
-        mgr.count += 1;
-
         Ok(Self {
             target,
             detour,
@@ -279,7 +280,7 @@ impl VehHook {
     }
 
     /// Removes the hook: clears the breakpoint on every thread and frees its
-    /// slot, removing the vectored handler once the last hook is gone.
+    /// slot.
     pub fn unhook(mut self) -> Result<(), VehHookError> {
         self.remove();
         Ok(())
@@ -291,21 +292,18 @@ impl VehHook {
         }
         self.active = false;
 
-        let mut mgr = lock_manager();
+        let _mgr = lock_manager();
 
         // Disarm the breakpoint everywhere before retiring the slot so a late
-        // trap still finds a valid detour rather than an empty slot.
+        // trap still finds a valid detour rather than an empty slot. A thread
+        // that is mid-dispatch can still get the old debug registers restored
+        // on resume; the handler disarms those when they trap.
         set_breakpoint_on_all_threads(self.slot, 0, false);
         SLOT_TARGET[self.slot].store(0, Ordering::Release);
         SLOT_DETOUR[self.slot].store(0, Ordering::Release);
 
-        if mgr.count > 0 {
-            mgr.count -= 1;
-        }
-        if mgr.count == 0 && mgr.handler != 0 {
-            unsafe { RemoveVectoredExceptionHandler(mgr.handler as *mut c_void) };
-            mgr.handler = 0;
-        }
+        let next = RETIRED_NEXT.fetch_add(1, Ordering::Relaxed) % RETIRED_COUNT;
+        RETIRED[next].store(self.target as usize, Ordering::Release);
     }
 }
 
@@ -318,8 +316,10 @@ impl Drop for VehHook {
 /// The process-wide vectored exception handler.
 ///
 /// Runs for every exception in the process, so it does the cheapest possible
-/// work: only single-step exceptions whose address matches a live slot are
-/// redirected; everything else is passed straight through.
+/// work: single-step exceptions whose address matches a live slot are
+/// redirected, and a breakpoint that fired from one of our slots without a
+/// matching hook is disarmed in the faulting thread; everything else is passed
+/// straight through.
 unsafe extern "system" fn veh_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     if info.is_null() {
         return EXCEPTION_CONTINUE_SEARCH;
@@ -353,7 +353,47 @@ unsafe extern "system" fn veh_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         }
     }
 
-    EXCEPTION_CONTINUE_SEARCH
+    // No live hook at this address. If DR6 says one of our breakpoint slots
+    // fired here, the thread still carries a stale arming from a removed (or
+    // replaced) hook: re-sync that slot in the context and resume.
+    let ctx = unsafe { &mut *context };
+    let hits = ctx.Dr6 & 0xF;
+    let mut handled = false;
+    for (slot, slot_target) in SLOT_TARGET.iter().enumerate() {
+        let fired = hits & ((1 as DrWord) << slot) != 0;
+        if !fired || debug_address(ctx, slot) != fault_addr as DrWord {
+            continue;
+        }
+        let live = slot_target.load(Ordering::Acquire);
+        program_slot(ctx, slot, live, live != 0);
+        handled = true;
+    }
+    // The trap can also be captured after an unhook already cleared the
+    // thread's debug registers, leaving DR6 empty. Recognise those by the
+    // address of a recently removed hook.
+    if !handled && hits == 0 {
+        handled = RETIRED
+            .iter()
+            .any(|retired| retired.load(Ordering::Acquire) == fault_addr);
+    }
+    if !handled {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    ctx.Dr6 = 0;
+    // Resume flag: re-run the instruction without re-triggering a breakpoint.
+    ctx.EFlags |= 0x1_0000;
+    EXCEPTION_CONTINUE_EXECUTION
+}
+
+/// Returns the address held in `DR<slot>` of `ctx`.
+fn debug_address(ctx: &CONTEXT, slot: usize) -> DrWord {
+    match slot {
+        0 => ctx.Dr0,
+        1 => ctx.Dr1,
+        2 => ctx.Dr2,
+        _ => ctx.Dr3,
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -389,9 +429,12 @@ fn set_breakpoint_on_all_threads(slot: usize, address: usize, enable: bool) {
 
         unsafe {
             // Suspend so the context read/modify/write is not racing the thread.
-            SuspendThread(h_thread);
-            set_debug_register(h_thread, slot, address, enable);
-            ResumeThread(h_thread);
+            // A thread that cannot be suspended is left alone; if it keeps a
+            // stale breakpoint, the handler disarms it on its next trap.
+            if SuspendThread(h_thread) != u32::MAX {
+                set_debug_register(h_thread, slot, address, enable);
+                ResumeThread(h_thread);
+            }
             CloseHandle(h_thread);
         }
     }
@@ -416,6 +459,15 @@ unsafe fn set_debug_register(h_thread: HANDLE, slot: usize, address: usize, enab
         return false;
     }
 
+    program_slot(ctx, slot, address, enable);
+
+    ctx.ContextFlags = CONTEXT_DEBUG;
+    unsafe { SetThreadContext(h_thread, ctx) != 0 }
+}
+
+/// Sets (or clears) execution breakpoint `slot` in a context's debug
+/// registers, preserving the other slots.
+fn program_slot(ctx: &mut CONTEXT, slot: usize, address: usize, enable: bool) {
     let value: DrWord = if enable { address as DrWord } else { 0 };
     match slot {
         0 => ctx.Dr0 = value,
@@ -435,9 +487,6 @@ unsafe fn set_debug_register(h_thread: HANDLE, slot: usize, address: usize, enab
     } else {
         ctx.Dr7 &= !local_enable;
     }
-
-    ctx.ContextFlags = CONTEXT_DEBUG;
-    unsafe { SetThreadContext(h_thread, ctx) != 0 }
 }
 
 #[cfg(test)]
