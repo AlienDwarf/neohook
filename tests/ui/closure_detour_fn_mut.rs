@@ -1,3 +1,5 @@
+#![allow(unused)]
+
 use neohook::detour_closure;
 
 #[inline(never)]

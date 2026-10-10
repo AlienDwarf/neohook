@@ -1,0 +1,5 @@
+error[E0594]: cannot assign to `calls`, as it is a captured variable in a `Fn` closure
+  --> tests/ui/closure_detour_fn_mut.rs:14:9
+   |
+14 |         calls += 1;
+   |         ^^^^^^^^^^ cannot assign

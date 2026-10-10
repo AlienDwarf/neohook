@@ -292,9 +292,9 @@ macro_rules! detour_helper {
 ///   a time. Running the same invocation again (e.g. from a helper function)
 ///   works once the previous hook is gone; while it is still installed the
 ///   second install returns [`DetourError::InvalidParameter`].
-/// - Like any detour, the closure may run concurrently on multiple threads. It
-///   is `FnMut`, so if it mutates captured state you are responsible for making
-///   that state thread-safe.
+/// - Like any detour, the closure may run concurrently on multiple threads, so
+///   it must be `Fn + Send + Sync + 'static`. Keep mutable state in atomics or
+///   behind a lock.
 ///
 /// # Example
 ///
@@ -327,7 +327,11 @@ macro_rules! detour_closure {
         // Concrete, monomorphic types derived from the provided signature.
         type __OrigFn = extern $abi fn($($argty),*) $(-> $ret)?;
         type __ClosureBox =
-            ::std::boxed::Box<dyn ::std::ops::FnMut(__OrigFn, $($argty),*) $(-> $ret)?>;
+            ::std::boxed::Box<
+                dyn ::std::ops::Fn(__OrigFn, $($argty),*) $(-> $ret)?
+                    + ::std::marker::Send
+                    + ::std::marker::Sync,
+            >;
 
         // Per-invocation shim state. All three are replaced on every install,
         // so running this invocation again after its hook was dropped picks up
@@ -350,10 +354,10 @@ macro_rules! detour_closure {
             let __orig: __OrigFn = unsafe { ::std::mem::transmute(__tramp) };
             // SAFETY: `__p` points at a leaked Box set during install and is
             // never freed while the hook is live.
-            unsafe { (&mut **__p)(__orig $(, $arg)*) }
+            unsafe { (&**__p)(__orig $(, $arg)*) }
         }
 
-        // Box the closure twice: the inner Box is the `dyn FnMut`, the outer Box
+        // Box the closure twice: the inner Box is the `dyn Fn`, the outer Box
         // owns it so we can hand a stable `*mut __ClosureBox` to the shim.
         let __boxed: ::std::boxed::Box<__ClosureBox> =
             ::std::boxed::Box::new(::std::boxed::Box::new($closure));
