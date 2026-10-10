@@ -282,3 +282,115 @@ fn dropping_the_guard_unhooks() {
         "drop should have restored the original bytes"
     );
 }
+
+// Flag probes: set (or clear) CF and ZF, run through a 16-byte NOP pad (the
+// hook site), then return the live flags register. The pad is long enough for
+// either patch size, so the stolen bytes never contain a flag-sensitive
+// instruction.
+const CF: u32 = 1 << 0;
+const ZF: u32 = 1 << 6;
+
+macro_rules! flag_probe {
+    ($name:ident, $($setup:literal),+) => {
+        #[cfg(target_arch = "x86_64")]
+        #[unsafe(naked)]
+        extern "C" fn $name() -> u32 {
+            std::arch::naked_asm!($($setup,)+ ".fill 16, 1, 0x90", "pushfq", "pop rax", "ret")
+        }
+
+        #[cfg(target_arch = "x86")]
+        #[unsafe(naked)]
+        extern "C" fn $name() -> u32 {
+            std::arch::naked_asm!($($setup,)+ ".fill 16, 1, 0x90", "pushfd", "pop eax", "ret")
+        }
+    };
+}
+
+// `xor eax, eax` (2 bytes) + `stc` (1 byte): CF=1, ZF=1 at the hook site.
+flag_probe!(flags_set_probe, "xor eax, eax", "stc");
+const FLAGS_SET_SITE: usize = 3;
+
+// `xor eax, eax` (2 bytes) + `or eax, 1` (3 bytes): CF=0, ZF=0 at the hook site.
+flag_probe!(flags_clear_probe, "xor eax, eax", "or eax, 1");
+const FLAGS_CLEAR_SITE: usize = 5;
+
+fn probe_site(probe: extern "C" fn() -> u32, offset: usize) -> *const u8 {
+    unsafe { (probe as *const u8).add(offset) }
+}
+
+static OBSERVED_FLAGS: Mutex<u32> = Mutex::new(0);
+
+unsafe extern "C" fn noop_handler(_ctx: *mut HookContext) {}
+
+unsafe extern "C" fn record_flags_handler(ctx: *mut HookContext) {
+    let ctx = unsafe { &*ctx };
+    #[cfg(target_arch = "x86_64")]
+    let flags = ctx.rflags as u32;
+    #[cfg(target_arch = "x86")]
+    let flags = ctx.eflags;
+    *OBSERVED_FLAGS.lock().unwrap() = flags;
+}
+
+unsafe extern "C" fn set_flags_handler(ctx: *mut HookContext) {
+    let ctx = unsafe { &mut *ctx };
+    #[cfg(target_arch = "x86_64")]
+    {
+        ctx.rflags |= u64::from(CF | ZF);
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        ctx.eflags |= CF | ZF;
+    }
+}
+
+#[test]
+fn flags_survive_the_hook() {
+    let _serial = install_guard();
+    assert_eq!(flags_set_probe() & (CF | ZF), CF | ZF, "baseline");
+
+    let site = probe_site(flags_set_probe, FLAGS_SET_SITE);
+    let hook = unsafe { MidHook::install(site, noop_handler) }.expect("install");
+    let flags = flags_set_probe();
+    hook.unhook().expect("unhook");
+
+    assert_eq!(
+        flags & (CF | ZF),
+        CF | ZF,
+        "CF/ZF must reach the resumed code unchanged (got {flags:#x})"
+    );
+}
+
+#[test]
+fn handler_observes_live_flags() {
+    let _serial = install_guard();
+    *OBSERVED_FLAGS.lock().unwrap() = 0;
+
+    let site = probe_site(flags_set_probe, FLAGS_SET_SITE);
+    let hook = unsafe { MidHook::install(site, record_flags_handler) }.expect("install");
+    let _ = flags_set_probe();
+    hook.unhook().expect("unhook");
+
+    let seen = *OBSERVED_FLAGS.lock().unwrap();
+    assert_eq!(
+        seen & (CF | ZF),
+        CF | ZF,
+        "context must hold the flags at the hook site (got {seen:#x})"
+    );
+}
+
+#[test]
+fn handler_can_rewrite_flags() {
+    let _serial = install_guard();
+    assert_eq!(flags_clear_probe() & (CF | ZF), 0, "baseline");
+
+    let site = probe_site(flags_clear_probe, FLAGS_CLEAR_SITE);
+    let hook = unsafe { MidHook::install(site, set_flags_handler) }.expect("install");
+    let flags = flags_clear_probe();
+    hook.unhook().expect("unhook");
+
+    assert_eq!(
+        flags & (CF | ZF),
+        CF | ZF,
+        "flags written by the handler must reach the resumed code (got {flags:#x})"
+    );
+}
