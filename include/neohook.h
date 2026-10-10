@@ -41,8 +41,9 @@ typedef struct DelayHook DelayHook;
  * An installed INT3 software-breakpoint hook.
  *
  * The hook stays active until it is explicitly removed with [`Self::unhook`]
- * or dropped, at which point the original byte is restored and the vectored
- * handler is removed once the last hook is gone.
+ * or dropped, at which point the original byte is restored. The vectored
+ * handler stays registered so a thread that trapped just before the removal
+ * is still resumed safely.
  */
 typedef struct Int3Hook Int3Hook;
 
