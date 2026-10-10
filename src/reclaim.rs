@@ -119,14 +119,15 @@ unsafe fn free_quiescent_regions(regions: Vec<Region>) -> Vec<Region> {
     let tids = crate::threads::ThreadEnumerator::enumerate_process_threads();
 
     // Reserve up front so no push reallocates (which would take the heap lock)
-    // while threads are suspended.
+    // while threads are suspended. Inputs are iterated by reference for the same
+    // reason: consuming them would free their buffers inside the frozen window.
     let mut handles: Vec<HANDLE> = Vec::with_capacity(tids.len());
     let mut live: Vec<usize> = Vec::with_capacity(tids.len() * (STACK_SCAN_DEPTH + 4) + 4);
     let mut still_busy: Vec<Region> = Vec::with_capacity(regions.len());
 
     unsafe {
         // Freeze every other thread.
-        for tid in tids {
+        for &tid in &tids {
             let h = OpenThread(
                 THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
                 0,
@@ -150,7 +151,7 @@ unsafe fn free_quiescent_regions(regions: Vec<Region>) -> Vec<Region> {
 
         // Free what nothing references; keep the rest. Done while still frozen so
         // a thread cannot jump into a region between the check and the free.
-        for r in regions {
+        for &r in &regions {
             let busy = live
                 .iter()
                 .any(|&a| a >= r.base && a < r.base.saturating_add(r.size));
