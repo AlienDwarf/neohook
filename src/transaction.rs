@@ -1358,6 +1358,16 @@ impl TransactionCore {
                         .map(|table| Reserved::Table(Some(table)))
                         .map_err(|e| (HookKind::VtableInstance, e.into()))
                 }
+                // Resolving the export allocates, and so may building its jump
+                // stub; the stub also stays here until after the resume if the
+                // slot write fails.
+                PendingHook::Eat {
+                    module,
+                    target_func,
+                    detour,
+                } => unsafe { crate::eat::EatHook::prepare_export(*module, target_func, *detour) }
+                    .map(Reserved::Eat)
+                    .map_err(|e| (HookKind::Eat, e.into())),
                 PendingHook::Detach(_) => {
                     detach_count += 1;
                     Ok(Reserved::Nothing)
@@ -1423,24 +1433,10 @@ impl TransactionCore {
                 PendingHook::Eat {
                     module,
                     target_func,
-                    detour,
-                } => unsafe {
-                    crate::eat::EatHook::hook_export(*module, target_func, *detour)
-                        .map(|inst| {
-                            Some(Hook::Eat(EatHook {
-                                module: *module,
-                                func_name: std::mem::take(target_func),
-                                slot_ptr: inst.slot_ptr,
-                                original_rva: inst.original_rva,
-                                detour_rva: inst.detour_rva,
-                                original_ptr: inst.original_ptr,
-                                stub: inst.stub,
-                                active: true,
-                                enabled: true,
-                            }))
-                        })
-                        .map_err(|err| (HookKind::Eat, err.into()))
-                },
+                    ..
+                } => install_eat(*module, target_func, &mut reserved[index])
+                    .map(Some)
+                    .map_err(|err| (HookKind::Eat, err)),
                 PendingHook::Vtable {
                     vtable,
                     index,
@@ -2322,6 +2318,42 @@ enum Reserved {
     Patch(Vec<u8>),
     /// Clone storage for a VTable instance hook, taken over on install.
     Table(Option<crate::vtable::ClonedVtable>),
+    /// A resolved EAT hook and its jump stub, taken over on install.
+    Eat(crate::eat::PreparedEat),
+}
+
+/// Writes a prepared EAT hook into its export slot. Runs inside the suspend
+/// window: on failure the prepared hook, stub included, stays in `reserved` and
+/// is released with it once the threads run again.
+fn install_eat(
+    module: HMODULE,
+    target_func: &mut String,
+    reserved: &mut Reserved,
+) -> Result<Hook, DetourError> {
+    let Reserved::Eat(prepared) = reserved else {
+        return Err(DetourError::InvalidParameter);
+    };
+    // Re-read the slot: an earlier hook in this commit may have redirected the
+    // same export since it was prepared.
+    let original_rva = unsafe { prepared.slot_ptr.read() };
+    unsafe { crate::eat::EatHook::write_export_rva(prepared.slot_ptr, prepared.detour_rva) }?;
+
+    let Reserved::Eat(prepared) = std::mem::replace(reserved, Reserved::Nothing) else {
+        unreachable!("checked above");
+    };
+    Ok(Hook::Eat(EatHook {
+        module,
+        // Moved out rather than cloned: the empty `String` left behind owns no
+        // allocation.
+        func_name: std::mem::take(target_func),
+        slot_ptr: prepared.slot_ptr,
+        original_rva,
+        detour_rva: prepared.detour_rva,
+        original_ptr: (module as usize).wrapping_add(original_rva as usize) as *mut u8,
+        stub: prepared.stub,
+        active: true,
+        enabled: true,
+    }))
 }
 
 /// Builds the jump an inline hook writes over its target: a jump to the detour,

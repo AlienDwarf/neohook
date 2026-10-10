@@ -96,20 +96,17 @@ impl From<PeError> for EatHookError {
     }
 }
 
-/// The result of installing an EAT hook at a single export slot.
+/// An EAT hook resolved and ready to be written into a single export slot.
 ///
-/// This is the low-level payload returned by [`EatHook::hook_export`]; the
-/// transaction layer wraps it into a `Hook` guard that restores the slot and
-/// releases the stub on drop.
-pub(crate) struct InstalledEat {
-    /// Pointer to the `AddressOfFunctions[index]` RVA entry that was patched.
+/// This is the low-level payload returned by [`EatHook::prepare_export`]; the
+/// transaction layer reads the original RVA from the slot when it writes
+/// `detour_rva` there, and wraps the result into a `Hook` guard that restores
+/// the slot and releases the stub on drop.
+pub(crate) struct PreparedEat {
+    /// Pointer to the `AddressOfFunctions[index]` RVA entry to patch.
     pub slot_ptr: *mut u32,
-    /// RVA that was stored in the slot before patching.
-    pub original_rva: u32,
     /// RVA written into the slot to redirect to the detour (or its stub).
     pub detour_rva: u32,
-    /// Resolved address of the original export (`base + original_rva`).
-    pub original_ptr: *mut u8,
     /// Jump stub keeping an out-of-range x86_64 detour reachable. `None` when
     /// the detour was encoded directly. Freed when the hook is dropped.
     pub stub: Option<Trampoline>,
@@ -122,12 +119,13 @@ pub(crate) struct InstalledEat {
 pub struct EatHook;
 
 impl EatHook {
-    /// Installs an EAT hook for `target_func`, redirecting its export slot to
-    /// `detour`.
+    /// Resolves an EAT hook for `target_func` without touching its export slot.
     ///
-    /// On success the export's RVA slot points at the detour (directly, or via
-    /// an allocated jump stub on x86_64) and an [`InstalledEat`] describing how
-    /// to restore it is returned.
+    /// Finds the slot and the RVA that redirects it to `detour` (directly, or
+    /// via an allocated jump stub on x86_64) and returns them as a
+    /// [`PreparedEat`]; writing the slot is left to the caller. Resolving
+    /// allocates, so the transaction layer does it before suspending threads,
+    /// and keeps the stub alive until they are resumed if the write fails.
     ///
     /// # Safety
     ///
@@ -135,11 +133,11 @@ impl EatHook {
     ///   current process and must remain loaded for the lifetime of the hook.
     /// - `detour` must be a valid function pointer with an ABI/signature
     ///   compatible with the hooked export.
-    pub unsafe fn hook_export(
+    pub unsafe fn prepare_export(
         h_module: windows_sys::Win32::Foundation::HMODULE,
         target_func: &str,
         detour: *const u8,
-    ) -> Result<InstalledEat, EatHookError> {
+    ) -> Result<PreparedEat, EatHookError> {
         if h_module.is_null() {
             return Err(EatHookError::InvalidParameter);
         }
@@ -148,19 +146,15 @@ impl EatHook {
         }
 
         let image = pe::parse_module_image(h_module)?;
-        let (slot_ptr, original_rva) = unsafe { find_export_slot(&image, target_func)? };
+        let (slot_ptr, _original_rva) = unsafe { find_export_slot(&image, target_func)? };
 
         // Resolve the detour to an RVA, building a near jump stub if it cannot
         // be encoded directly. The stub (if any) is owned by the returned value.
         let (detour_rva, stub) = unsafe { resolve_detour_rva(image.base_address, detour)? };
 
-        unsafe { write_export_slot(slot_ptr, detour_rva)? };
-
-        Ok(InstalledEat {
+        Ok(PreparedEat {
             slot_ptr,
-            original_rva,
             detour_rva,
-            original_ptr: (image.base_address + original_rva as usize) as *mut u8,
             stub,
         })
     }
@@ -187,8 +181,9 @@ impl EatHook {
     /// Writes `rva` into a previously located EAT slot, flipping page protection
     /// around the write.
     ///
-    /// Used to toggle a hook between its detour and original RVA
-    /// (enable/disable) and to restore it on unhook.
+    /// Used to install a [`PreparedEat`], to toggle a hook between its detour
+    /// and original RVA (enable/disable) and to restore it on unhook. Does not
+    /// allocate, so it is safe inside a commit's suspend window.
     ///
     /// # Safety
     ///
@@ -432,17 +427,17 @@ mod tests {
     }
 
     #[test]
-    fn hook_export_rejects_null_module() {
+    fn prepare_export_rejects_null_module() {
         let err = unsafe {
-            EatHook::hook_export(std::ptr::null_mut(), "GetTickCount", dummy as *const u8)
+            EatHook::prepare_export(std::ptr::null_mut(), "GetTickCount", dummy as *const u8)
         };
         assert!(matches!(err, Err(EatHookError::InvalidParameter)));
     }
 
     #[test]
-    fn hook_export_rejects_null_detour() {
+    fn prepare_export_rejects_null_detour() {
         let h = module::get_module_handle("kernel32.dll").expect("kernel32 handle");
-        let err = unsafe { EatHook::hook_export(h, "GetTickCount", std::ptr::null()) };
+        let err = unsafe { EatHook::prepare_export(h, "GetTickCount", std::ptr::null()) };
         assert!(matches!(err, Err(EatHookError::InvalidParameter)));
     }
 
