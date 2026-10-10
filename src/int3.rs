@@ -459,6 +459,58 @@ fn lock_manager() -> std::sync::MutexGuard<'static, Int3Manager> {
 mod tests {
     use super::*;
 
+    #[repr(align(16))]
+    struct AlignedContext(CONTEXT);
+
+    /// Calls the handler directly with a breakpoint trap at `addr`, as if the
+    /// trap raced the removal of the hook there.
+    fn handle_trap(addr: usize) -> (i32, usize) {
+        let mut ctx: AlignedContext = unsafe { std::mem::zeroed() };
+        let mut record: EXCEPTION_RECORD = unsafe { std::mem::zeroed() };
+        record.ExceptionCode = STATUS_BREAKPOINT;
+        record.ExceptionAddress = addr as *mut _;
+        let mut pointers = EXCEPTION_POINTERS {
+            ExceptionRecord: &mut record,
+            ContextRecord: &mut ctx.0,
+        };
+        let verdict = unsafe { int3_handler(&mut pointers) };
+        #[cfg(target_arch = "x86_64")]
+        let ip = ctx.0.Rip as usize;
+        #[cfg(target_arch = "x86")]
+        let ip = ctx.0.Eip as usize;
+        (verdict, ip)
+    }
+
+    #[test]
+    fn handler_reruns_the_restored_byte_of_a_removed_hook() {
+        // Byte 0 was restored by an unhook; byte 1 is a foreign breakpoint.
+        static CODE: [u8; 2] = [0x90, INT3_OPCODE];
+        let restored = CODE.as_ptr() as usize;
+        let foreign = restored + 1;
+
+        let idx = {
+            let mut mgr = lock_manager();
+            let idx = mgr.retired_next;
+            mgr.retired_next = (idx + 1) % RETIRED_LEN;
+            idx
+        };
+        RETIRED[idx].store(restored, Ordering::Release);
+        let (verdict, ip) = handle_trap(restored);
+        RETIRED[idx].store(0, Ordering::Release);
+
+        assert_eq!(
+            verdict, EXCEPTION_CONTINUE_EXECUTION,
+            "removed hook resumes"
+        );
+        assert_eq!(ip, restored, "the restored instruction runs again");
+
+        let (verdict, _) = handle_trap(foreign);
+        assert_eq!(
+            verdict, EXCEPTION_CONTINUE_SEARCH,
+            "foreign int3 is passed on"
+        );
+    }
+
     #[inline(never)]
     extern "system" fn t_a() -> u32 {
         std::hint::black_box(1)
