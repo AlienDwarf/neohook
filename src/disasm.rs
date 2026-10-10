@@ -1,7 +1,8 @@
 // Copyright (c) 2026 NeoHook Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use iced_x86::{
-    BlockEncoder, BlockEncoderOptions, Code, Decoder, DecoderOptions, Instruction, InstructionBlock,
+    BlockEncoder, BlockEncoderOptions, Code, Decoder, DecoderOptions, FlowControl, Instruction,
+    InstructionBlock, Mnemonic,
 };
 
 #[derive(Debug, Clone)]
@@ -67,7 +68,36 @@ impl Disassembler {
             64
         }
     }
+    /// Returns `true` if execution never falls through past `instr`, i.e. the
+    /// bytes after it are not part of the same straight-line code path: `ret`,
+    /// `jmp`, `ud2` and `int 29h` (`__fastfail`).
+    ///
+    /// `int3` is deliberately *not* a terminator: functions such as
+    /// `ntdll!DbgBreakPoint` (`int3; ret`) resume after it.
+    fn ends_function(instr: &Instruction) -> bool {
+        match instr.flow_control() {
+            FlowControl::Return
+            | FlowControl::UnconditionalBranch
+            | FlowControl::IndirectBranch
+            | FlowControl::Exception => true,
+            FlowControl::Interrupt => instr.code() == Code::Int_imm8 && instr.immediate8() == 0x29,
+            _ => false,
+        }
+    }
+
+    /// Returns `true` for alignment padding emitted between functions:
+    /// `int3` and (multi-byte) `nop`.
+    fn is_padding(instr: &Instruction) -> bool {
+        matches!(instr.mnemonic(), Mnemonic::Int3 | Mnemonic::Nop)
+    }
+
     /// Calculates the total length of instructions at `address` until at least `min_size` bytes are covered.
+    ///
+    /// If an instruction that ends the function (`ret`, `jmp`, `ud2`, ...) is
+    /// reached before `min_size` bytes are covered, the range may only extend
+    /// over `int3` / `nop` padding after it. Otherwise the bytes that follow
+    /// belong to other code (typically the next function), overwriting them
+    /// would corrupt it, and an error is returned.
     ///
     /// # Safety
     /// The caller must ensure that `address` is a valid pointer
@@ -104,6 +134,10 @@ impl Disassembler {
             DecoderOptions::NONE,
         );
 
+        // Set once an instruction that ends the function has been decoded;
+        // from then on only padding may be covered.
+        let mut function_ended = false;
+
         // Decode instructions until we have at least min_size bytes or we run out of instructions to decode
         while decoder.can_decode() && total_bytes < min_size {
             let mut instruction = Instruction::default();
@@ -116,10 +150,21 @@ impl Disassembler {
                 );
             }
 
+            if function_ended && !Self::is_padding(&instruction) {
+                return Err(
+                    "Function ends before the required patch size and is not followed by enough padding"
+                        .to_string(),
+                );
+            }
+
             total_bytes += instruction.len();
 
             if total_bytes >= min_size {
                 return Ok(total_bytes);
+            }
+
+            if Self::ends_function(&instruction) {
+                function_ended = true;
             }
         }
 

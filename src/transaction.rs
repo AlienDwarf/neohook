@@ -752,7 +752,13 @@ impl TransactionCore {
     ///
     /// Returns an error if the target or detour pointer is invalid, if the stolen
     /// instruction sequence cannot be determined, or if trampoline allocation or
-    /// relocation fails.    
+    /// relocation fails.
+    ///
+    /// Returns `Err(DetourError::InvalidParameter)` if the target function is
+    /// shorter than the jump patch (it ends with `ret`, `jmp`, `ud2`, ... before
+    /// the patch size is reached) and is not followed by enough `int3` / `nop`
+    /// padding. Patching it would overwrite the code that follows, typically
+    /// the next function.
     ///
     /// # Safety
     /// The caller must ensure that `target` and `detour` are valid pointers. NeoHook performs basic validation but does not guarantee that the pointers are valid or that the memory they point to is properly aligned or accessible. Invalid pointers may cause undefined behavior, including crashes.
