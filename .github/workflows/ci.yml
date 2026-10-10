@@ -26,10 +26,8 @@ jobs:
         with:
           arch: x64
 
-      - name: Install x86 target
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup target add ${{ matrix.target }}
+      - name: Install toolchain
+        run: rustup toolchain install
       
       - name: Rust Cache
         uses: swatinem/rust-cache@v2
@@ -47,14 +45,6 @@ jobs:
 
       - name: Test
         run: cargo test --target ${{ matrix.target }} --all-features -- --test-threads=1
-
-      # The expected compiler errors are toolchain-specific, so the compile-fail
-      # tests run on a pinned toolchain instead of the moving stable one.
-      - name: Compile-fail tests
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        run: |
-          rustup toolchain install 1.99.0 --profile minimal
-          cargo +1.99.0 test --test compile_fail -- --ignored
 
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }}
@@ -97,7 +87,7 @@ jobs:
           arch: x64
 
       - name: Install toolchain
-        run: rustup toolchain install stable --profile minimal
+        run: rustup toolchain install
 
       - name: Rust Cache
         uses: swatinem/rust-cache@v2

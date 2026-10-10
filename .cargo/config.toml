@@ -1,0 +1,4 @@
+[env]
+# Hooks patch process-wide code and share global state, so tests in one binary
+# must not run in parallel.
+RUST_TEST_THREADS = "1"

@@ -1,0 +1,8 @@
+# Pinned so local builds and CI see the same compiler and the same diagnostics
+# (the compile-fail tests compare rustc output verbatim). Bump deliberately and
+# re-bless with `TRYBUILD=overwrite cargo test --test compile_fail`.
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-pc-windows-msvc", "i686-pc-windows-msvc"]
