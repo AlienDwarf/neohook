@@ -10,11 +10,15 @@
 //! stack - and freeing it then is a use-after-free.
 //!
 //! Instead a dropped stub is *retired* into a process-wide quarantine and freed
-//! only once no thread is observed to be inside it. The check reuses the install
-//! path's approach: the other threads are suspended, each instruction pointer and
-//! a window of each stack are read, and only the regions no thread references are
-//! released. Anything still in use stays quarantined and is retried on the next
-//! pass.
+//! only once no thread is observed to be inside it. The other threads are
+//! suspended, each instruction pointer and each thread's whole committed stack
+//! are read, and only the regions no thread references are released. Anything
+//! still in use stays quarantined and is retried on the next pass.
+//!
+//! The scan must be complete to be sound: a stub is freed only when *every*
+//! thread was suspended and fully inspected. A thread that cannot be opened,
+//! suspended, or read keeps the entire quarantine for a later pass rather than
+//! counting as idle.
 //!
 //! Retiring a stub is cheap (it only appends to the quarantine), so it is safe to
 //! do from a `Drop` even while a transaction holds the process-wide lock - the
@@ -23,16 +27,19 @@
 //! quarantine is empty) and can also be called directly by code that only ever
 //! unhooks and never installs again.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, HANDLE};
 use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, GetThreadContext};
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
 use windows_sys::Win32::System::Memory::{
-    MEM_RELEASE, MEMORY_BASIC_INFORMATION, VirtualFree, VirtualQuery,
+    MEM_COMMIT, MEM_RELEASE, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualFree,
+    VirtualQuery,
 };
 use windows_sys::Win32::System::Threading::{
-    OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION,
-    THREAD_SUSPEND_RESUME,
+    GetCurrentProcess, GetCurrentThreadId, GetExitCodeThread, GetThreadId, OpenThread,
+    ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION,
+    THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
 #[cfg(target_arch = "x86_64")]
@@ -40,9 +47,44 @@ const CONTEXT_FLAGS: u32 = windows_sys::Win32::System::Diagnostics::Debug::CONTE
 #[cfg(target_arch = "x86")]
 const CONTEXT_FLAGS: u32 = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_ALL_X86;
 
-/// How many stack slots are inspected per thread for return addresses pointing
-/// into a retired stub. Mirrors the install path's `STACK_SCAN_DEPTH`.
-const STACK_SCAN_DEPTH: usize = 512;
+/// Access a thread handle needs to be frozen and inspected by a pass.
+const THREAD_ACCESS: u32 = THREAD_SUSPEND_RESUME
+    | THREAD_GET_CONTEXT
+    | THREAD_QUERY_INFORMATION
+    | THREAD_QUERY_LIMITED_INFORMATION;
+
+/// `STILL_ACTIVE`, the exit code of a thread that has not exited yet. Declared
+/// here because windows-sys only exposes it behind a feature the crate does not
+/// otherwise need.
+const THREAD_STILL_ACTIVE: u32 = 259;
+
+/// Upper bound on the stack bytes read per thread. A stack larger than this is
+/// reported as not fully inspected (so nothing is freed) rather than silently
+/// scanned in part, which is what made a deep return address look absent.
+const MAX_STACK_SCAN_BYTES: usize = 32 * 1024 * 1024;
+
+/// Spare handle slots reserved for threads created after the enumeration, which
+/// a pass freezes and inspects as it finds them.
+const NEW_THREAD_SLACK: usize = 32;
+
+/// How many times a pass re-walks the thread list looking for threads created
+/// after the previous walk.
+const WALK_ROUNDS: usize = 4;
+
+/// Size of one stack slot.
+const WORD: usize = std::mem::size_of::<usize>();
+
+/// `ntdll!NtGetNextThread`, which walks the threads of a process one handle at a
+/// time. Unlike a Toolhelp snapshot it allocates nothing, so it is usable while
+/// the other threads are suspended.
+type NtGetNextThreadFn = unsafe extern "system" fn(
+    process: HANDLE,
+    thread: HANDLE,
+    access: u32,
+    attributes: u32,
+    flags: u32,
+    new_thread: *mut HANDLE,
+) -> i32;
 
 /// A retired executable region awaiting release, stored as integers so the
 /// quarantine is `Send`.
@@ -85,11 +127,12 @@ pub(crate) fn retire(ptr: *mut u8, size: usize) {
 
 /// Releases every quarantined stub that no thread is currently executing inside.
 ///
-/// Suspends the other threads once, reads each instruction pointer and a window of
-/// each stack, and frees only the regions nothing references; the rest stay
-/// quarantined for a later pass. Best-effort: if a transaction currently holds the
-/// process-wide lock (including this thread mid-commit), the pass is skipped and
-/// the regions simply remain quarantined.
+/// Suspends the other threads once, reads each instruction pointer and each whole
+/// stack, and frees only the regions nothing references; the rest stay quarantined
+/// for a later pass, as does everything if any thread could not be inspected.
+/// Best-effort: if a transaction currently holds the process-wide lock (including
+/// this thread mid-commit), the pass is skipped and the regions simply remain
+/// quarantined.
 pub fn reclaim() {
     // Cheap early-out: nothing retired since the last pass.
     if lock_quarantine().is_empty() {
@@ -126,44 +169,63 @@ pub fn reclaim() {
 unsafe fn free_quiescent_regions(regions: Vec<Region>) -> Vec<Region> {
     let tids = crate::threads::ThreadEnumerator::enumerate_process_threads();
 
+    // Resolve the thread walker before anything is frozen: `GetModuleHandle`
+    // takes the loader lock, which a suspended thread could own.
+    let next_thread = nt_get_next_thread();
+
     // Reserve up front so no push reallocates (which would take the heap lock)
     // while threads are suspended. Inputs are iterated by reference for the same
     // reason: consuming them would free their buffers inside the frozen window.
-    let mut handles: Vec<HANDLE> = Vec::with_capacity(tids.len());
-    let mut live: Vec<usize> = Vec::with_capacity(tids.len() * (STACK_SCAN_DEPTH + 4) + 4);
+    let capacity = tids.len() + NEW_THREAD_SLACK;
+    let mut handles: Vec<HANDLE> = Vec::with_capacity(capacity);
+    let mut frozen: Vec<u32> = Vec::with_capacity(capacity);
+    let mut busy: Vec<bool> = vec![false; regions.len()];
     let mut still_busy: Vec<Region> = Vec::with_capacity(regions.len());
+
+    // Cleared by anything that leaves a thread uninspected. Regions are freed
+    // only when every thread in the process was accounted for.
+    let mut inspected_all = true;
 
     unsafe {
         // Freeze every other thread.
         for &tid in &tids {
-            let h = OpenThread(
-                THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
-                0,
-                tid,
-            );
+            let h = OpenThread(THREAD_ACCESS, 0, tid);
             if h.is_null() {
+                // A thread that exited between the enumeration and here cannot
+                // reference a stub; any other failure leaves it uninspected.
+                if GetLastError() != ERROR_INVALID_PARAMETER {
+                    inspected_all = false;
+                }
                 continue;
             }
             if SuspendThread(h) == u32::MAX {
+                if !thread_has_exited(h) {
+                    inspected_all = false;
+                }
                 CloseHandle(h);
                 continue;
             }
             handles.push(h);
+            frozen.push(tid);
         }
 
-        // Collect every live code address: each instruction pointer plus a window
-        // of each stack (return addresses left by calls through the stub).
+        // Check every live code address: each instruction pointer plus every
+        // committed stack slot (return addresses left by calls through the stub).
         for &h in &handles {
-            collect_thread_addresses(h, &mut live);
+            if !inspect_thread(h, &regions, &mut busy) {
+                inspected_all = false;
+            }
+        }
+
+        // Threads created after the enumeration above are not in `handles` yet.
+        if !catch_up_new_threads(next_thread, &mut handles, &mut frozen, &regions, &mut busy) {
+            inspected_all = false;
         }
 
         // Free what nothing references; keep the rest. Done while still frozen so
         // a thread cannot jump into a region between the check and the free.
-        for &r in &regions {
-            let busy = live
-                .iter()
-                .any(|&a| a >= r.base && a < r.base.saturating_add(r.size));
-            if busy {
+        for (&r, &is_busy) in regions.iter().zip(busy.iter()) {
+            if is_busy || !inspected_all {
                 still_busy.push(r);
             } else {
                 VirtualFree(r.base as *mut _, 0, MEM_RELEASE);
@@ -180,9 +242,19 @@ unsafe fn free_quiescent_regions(regions: Vec<Region>) -> Vec<Region> {
     still_busy
 }
 
-/// Reads a suspended thread's instruction pointer and a window of its stack into
-/// `live`. Skips silently if the context cannot be read.
-unsafe fn collect_thread_addresses(h_thread: HANDLE, live: &mut Vec<usize>) {
+/// Marks every region `addr` falls inside.
+fn mark(addr: usize, regions: &[Region], busy: &mut [bool]) {
+    for (r, is_busy) in regions.iter().zip(busy.iter_mut()) {
+        if !*is_busy && addr >= r.base && addr < r.base.saturating_add(r.size) {
+            *is_busy = true;
+        }
+    }
+}
+
+/// Reads a suspended thread's instruction pointer and whole stack, marking the
+/// regions either references. Returns `false` if the thread could not be
+/// inspected in full, in which case it must not be treated as idle.
+unsafe fn inspect_thread(h_thread: HANDLE, regions: &[Region], busy: &mut [bool]) -> bool {
     unsafe {
         #[repr(align(16))]
         struct AlignedContext(CONTEXT);
@@ -190,7 +262,7 @@ unsafe fn collect_thread_addresses(h_thread: HANDLE, live: &mut Vec<usize>) {
         ctx.0.ContextFlags = CONTEXT_FLAGS;
 
         if GetThreadContext(h_thread, &mut ctx.0) == 0 {
-            return;
+            return false;
         }
 
         #[cfg(target_arch = "x86_64")]
@@ -198,29 +270,172 @@ unsafe fn collect_thread_addresses(h_thread: HANDLE, live: &mut Vec<usize>) {
         #[cfg(target_arch = "x86")]
         let (ip, sp) = (ctx.0.Eip as usize, ctx.0.Esp as usize);
 
-        live.push(ip);
+        mark(ip, regions, busy);
+        scan_stack(sp, regions, busy)
+    }
+}
 
-        // Walk the top of the stack, stopping at the end of the committed region.
+/// Walks a suspended thread's stack from its stack pointer up to the end of the
+/// stack allocation, marking the regions any slot points into.
+///
+/// The upper bound is the end of the reservation holding the stack pointer -
+/// equivalent to the thread's `NT_TIB::StackBase`, but readable with
+/// `VirtualQuery` alone, without a TEB lookup per thread. Only committed,
+/// readable pages are read; uncommitted or guarded ones are skipped.
+///
+/// Returns `false` if the walk could not be completed.
+unsafe fn scan_stack(sp: usize, regions: &[Region], busy: &mut [bool]) -> bool {
+    unsafe {
         let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-        if VirtualQuery(
-            sp as *const _,
-            &mut mbi,
-            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
-        ) == 0
-        {
-            return;
-        }
-        let stack_top = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+        let size = std::mem::size_of::<MEMORY_BASIC_INFORMATION>();
 
-        for i in 0..STACK_SCAN_DEPTH {
-            let slot = sp + i * std::mem::size_of::<usize>();
-            if slot + std::mem::size_of::<usize>() > stack_top {
+        if VirtualQuery(sp as *const _, &mut mbi, size) == 0 {
+            return false;
+        }
+        let stack_allocation = mbi.AllocationBase as usize;
+
+        let mut scanned = 0usize;
+        let mut addr = sp;
+        loop {
+            if VirtualQuery(addr as *const _, &mut mbi, size) == 0 {
+                return false;
+            }
+            // Past the end of the stack reservation.
+            if mbi.AllocationBase as usize != stack_allocation {
+                return true;
+            }
+            let region_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+            if region_end <= addr {
+                return true;
+            }
+
+            if mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0 {
+                let mut slot = addr.next_multiple_of(WORD);
+                while slot.saturating_add(WORD) <= region_end {
+                    scanned += WORD;
+                    if scanned > MAX_STACK_SCAN_BYTES {
+                        return false;
+                    }
+                    let mut value: usize = 0;
+                    std::ptr::copy_nonoverlapping(slot as *const usize, &mut value, 1);
+                    mark(value, regions, busy);
+                    slot += WORD;
+                }
+            }
+
+            addr = region_end;
+        }
+    }
+}
+
+/// True if the thread behind `h_thread` has already exited, so it can hold no
+/// reference to a retired stub.
+unsafe fn thread_has_exited(h_thread: HANDLE) -> bool {
+    unsafe {
+        let mut code: u32 = 0;
+        GetExitCodeThread(h_thread, &mut code) != 0 && code != THREAD_STILL_ACTIVE
+    }
+}
+
+/// Cached pointer to `ntdll!NtGetNextThread`, resolved once.
+fn nt_get_next_thread() -> Option<NtGetNextThreadFn> {
+    static ADDR: OnceLock<Option<usize>> = OnceLock::new();
+    let addr = *ADDR.get_or_init(|| unsafe {
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+        if ntdll.is_null() {
+            return None;
+        }
+        GetProcAddress(ntdll, c"NtGetNextThread".as_ptr().cast()).map(|p| p as usize)
+    });
+    addr.map(|a| unsafe { std::mem::transmute::<usize, NtGetNextThreadFn>(a) })
+}
+
+/// Freezes and inspects any thread the pre-suspend enumeration missed, which a
+/// Toolhelp snapshot cannot find again without allocating.
+///
+/// Walks the process's threads with the allocation-free `NtGetNextThread`, and
+/// for every thread that is neither this one nor already frozen, suspends and
+/// inspects it, then restarts the walk in case it spawned more. Returns `false`
+/// if a thread could not be caught up, so nothing may be freed.
+unsafe fn catch_up_new_threads(
+    next_thread: Option<NtGetNextThreadFn>,
+    handles: &mut Vec<HANDLE>,
+    frozen: &mut Vec<u32>,
+    regions: &[Region],
+    busy: &mut [bool],
+) -> bool {
+    let Some(next_thread) = next_thread else {
+        // Before Windows 8 there is no allocation-free thread walk, and
+        // enumerating again here would risk the heap lock a suspended thread may
+        // own. A thread created after the enumeration stays uninspected there.
+        return true;
+    };
+
+    unsafe {
+        let process = GetCurrentProcess();
+        let current = GetCurrentThreadId();
+
+        for _ in 0..WALK_ROUNDS {
+            let mut restart = false;
+            let mut cursor: HANDLE = std::ptr::null_mut();
+
+            loop {
+                let mut found: HANDLE = std::ptr::null_mut();
+                let status = next_thread(process, cursor, THREAD_ACCESS, 0, 0, &mut found);
+                // The cursor is only needed until the call that follows it.
+                if !cursor.is_null() {
+                    CloseHandle(cursor);
+                    cursor = std::ptr::null_mut();
+                }
+                if status != 0 || found.is_null() {
+                    break;
+                }
+
+                let tid = GetThreadId(found);
+                if tid == current || tid == 0 || frozen.contains(&tid) {
+                    cursor = found;
+                    continue;
+                }
+
+                // A thread created after the enumeration. Keep its handle in
+                // `handles` so it is resumed with the rest, and walk again: it
+                // may have spawned threads of its own.
+                restart = true;
+                // Never grow either buffer here: a push that reallocates would
+                // take the heap lock a suspended thread may hold.
+                if handles.len() == handles.capacity() || frozen.len() == frozen.capacity() {
+                    CloseHandle(found);
+                    return false;
+                }
+                if SuspendThread(found) == u32::MAX {
+                    let exited = thread_has_exited(found);
+                    CloseHandle(found);
+                    if !exited {
+                        return false;
+                    }
+                    // Already gone, so it references nothing. Remember it so the
+                    // next walk does not stop on it again.
+                    frozen.push(tid);
+                    break;
+                }
+                handles.push(found);
+                frozen.push(tid);
+                if !inspect_thread(found, regions, busy) {
+                    return false;
+                }
                 break;
             }
-            let mut value: usize = 0;
-            std::ptr::copy_nonoverlapping(slot as *const usize, &mut value, 1);
-            live.push(value);
+
+            if !cursor.is_null() {
+                CloseHandle(cursor);
+            }
+            if !restart {
+                return true;
+            }
         }
+
+        // Threads kept appearing; try again on a later pass.
+        false
     }
 }
 
