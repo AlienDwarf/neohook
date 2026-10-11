@@ -148,6 +148,16 @@ pub unsafe fn enumerate_exports(h_module: HMODULE) -> Result<Vec<ExportInfo>, Pe
     let names_rva = dir.AddressOfNames as usize;
     let name_ordinals_rva = dir.AddressOfNameOrdinals as usize;
 
+    // The counts come from the image, so every table must fit inside it before
+    // anything is sized from them.
+    let tables_fit = array_fits(&image, functions_rva, number_of_functions, 4)
+        && (number_of_names == 0
+            || (array_fits(&image, names_rva, number_of_names, 4)
+                && array_fits(&image, name_ordinals_rva, number_of_names, 2)));
+    if !tables_fit {
+        return Ok(exports);
+    }
+
     // Build a map from function-table index -> export name by walking the
     // parallel AddressOfNames / AddressOfNameOrdinals arrays.
     let mut names: Vec<Option<String>> = vec![None; number_of_functions];
@@ -186,8 +196,13 @@ pub unsafe fn enumerate_exports(h_module: HMODULE) -> Result<Vec<ExportInfo>, Pe
             None
         };
 
+        // Skip entries whose biased ordinal does not fit in 32 bits.
+        let Some(ordinal) = ordinal_base.checked_add(func_index as u32) else {
+            continue;
+        };
+
         exports.push(ExportInfo {
-            ordinal: ordinal_base + func_index as u32,
+            ordinal,
             name,
             address: (image.base_address + func_rva) as *const u8,
             forwarder,
@@ -277,6 +292,15 @@ pub unsafe fn enumerate_imports(h_module: HMODULE) -> Result<Vec<ImportInfo>, Pe
     }
 
     Ok(imports)
+}
+
+/// Returns `true` if `count` elements of `elem_size` bytes starting at `rva`
+/// lie within the image.
+fn array_fits(image: &pe::ModuleImage, rva: usize, count: usize, elem_size: usize) -> bool {
+    count
+        .checked_mul(elem_size)
+        .and_then(|len| rva.checked_add(len))
+        .is_some_and(|end| end <= image.size)
 }
 
 /// Reads the `index`-th `u32` of an array located at `base_rva`, bounds-checked.
