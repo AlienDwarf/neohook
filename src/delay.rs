@@ -196,10 +196,13 @@ impl DelayHook {
         // loading a library may hold while it waits for our locks.
         register_unload_notification();
 
-        // Transaction lock before the manager, as everywhere else. The other
-        // order deadlocks against a lock holder whose LoadLibrary call waits for
-        // the manager in the LdrLoadDll detour.
-        crate::transaction::with_code_lock(|| unsafe { register_locked(module, func, detour) })
+        // Transaction lock before the manager: installing the LdrLoadDll hook
+        // runs a transaction under the manager. The other order deadlocks
+        // against a transaction whose LoadLibrary call waits for the manager in
+        // the LdrLoadDll detour.
+        crate::transaction::with_transaction_lock(|| unsafe {
+            register_locked(module, func, detour)
+        })
     }
 
     /// Returns whether the underlying module has been loaded and the hook is now
@@ -220,7 +223,9 @@ impl DelayHook {
     }
 
     fn remove(&mut self) {
-        let last = crate::transaction::with_code_lock(|| self.remove_locked());
+        // Only the manager and then the code lock: removing never waits for an
+        // open transaction, so it is safe under the loader lock.
+        let last = self.remove_locked();
         // Outside every lock, as registering is.
         if last {
             unregister_unload_notification();

@@ -683,7 +683,7 @@ impl TransactionCore {
     /// any thread is suspended, otherwise two transactions could suspend each
     /// other and deadlock.
     fn acquire_global_lock(&mut self) {
-        // A thread already inside `with_code_lock` keeps the lock it holds.
+        // A thread already inside `with_transaction_lock` keeps that hold.
         if self.global_lock.is_none() && !owns_transaction_lock() {
             self.global_lock = Some(lock_transaction());
         }
@@ -1458,6 +1458,10 @@ impl TransactionCore {
         }
         crate::cfg::prepare();
 
+        // Writers outside the transaction wait only for the patch phase. Taken
+        // before the first suspension, so no frozen thread can hold it.
+        let code_guard = hold_code_lock();
+
         self.suspend_threads();
 
         let mut failure = None;
@@ -1555,6 +1559,7 @@ impl TransactionCore {
             drop(installed);
             drop(pending);
             drop(reserved);
+            drop(code_guard);
             return Err(DetourError::CommitFailed {
                 index,
                 kind,
@@ -1594,6 +1599,7 @@ impl TransactionCore {
 
         self.cleanup_threads();
         finalize_detaches(&mut detached);
+        drop(code_guard);
         self.is_pending = false;
         Ok(installed)
     }
@@ -2256,22 +2262,19 @@ impl Drop for TransactionCore {
 
 /// Process-wide transaction lock.
 ///
-/// NeoHook serializes the critical section of a transaction (thread suspension
-/// and code patching) so concurrent transactions on different threads cannot
-/// suspend each other or patch overlapping code at the same time. This mirrors
-/// the "one transaction at a time" model used by Microsoft Detours.
+/// NeoHook serializes transactions so concurrent transactions on different
+/// threads cannot suspend each other or patch overlapping code at the same
+/// time. This mirrors the "one transaction at a time" model used by Microsoft
+/// Detours. It is held from the first tracked thread until the commit or abort,
+/// so code that is not itself a transaction never waits for it: writers outside
+/// a transaction only take [`CODE_LOCK`].
 ///
-/// It is also the single lock for every code and table write: lifting a page's
-/// protection, writing and restoring it must not interleave with another such
-/// write on the same page, or one thread restores the protection while the
-/// other is still writing. Writers outside a transaction take it through
-/// [`with_code_lock`].
-///
-/// Lock order: this lock first, then any other crate mutex (gateway registry,
-/// stub quarantine, INT3 slot manager), never the reverse.
+/// Lock order: this lock, then the delay-hook manager, then [`CODE_LOCK`],
+/// then any other crate mutex (gateway registry, stub quarantine, INT3 slot
+/// manager), never the reverse.
 ///
 /// A transaction started on a thread that already holds the lock (inside
-/// [`with_code_lock`]) runs under that hold instead of taking it again.
+/// [`with_transaction_lock`]) runs under that hold instead of taking it again.
 static TRANSACTION_LOCK: Mutex<()> = Mutex::new(());
 
 /// Thread id of the current [`TRANSACTION_LOCK`] holder, or 0 while it is free.
@@ -2317,26 +2320,98 @@ fn lock_transaction() -> TransactionGuard {
     )
 }
 
-/// Runs a code or table write under the transaction lock.
+/// Runs `body` under the transaction lock, for setup that starts transactions
+/// of its own and must order its other locks after this one (delay hooks).
+/// Runs directly on a thread that already holds it.
+pub(crate) fn with_transaction_lock<R>(body: impl FnOnce() -> R) -> R {
+    if owns_transaction_lock() {
+        return body();
+    }
+    let _guard = lock_transaction();
+    body()
+}
+
+/// The single lock for every code and table write.
+///
+/// Lifting a page's protection, writing and restoring it must not interleave
+/// with another such write on the same page, or one thread restores the
+/// protection while the other is still writing. A commit holds it only for its
+/// patch phase - from right before the first thread is suspended until its
+/// detaches are finalized - and every other writer only for the write itself.
+/// No holder waits for the loader lock or the transaction lock, so it can be
+/// taken under the loader lock (`DLL_PROCESS_DETACH`, the `LdrLoadDll` detour).
+static CODE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Thread id of the current [`CODE_LOCK`] holder, or 0 while it is free. Lets a
+/// write made by the holder itself (a detach or rollback inside a commit) run
+/// without taking the lock again.
+static CODE_OWNER: AtomicU32 = AtomicU32::new(0);
+
+/// A held [`CODE_LOCK`] that records its owning thread.
+pub(crate) struct CodeGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl CodeGuard {
+    fn new(guard: std::sync::MutexGuard<'static, ()>) -> Self {
+        CODE_OWNER.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+        Self { _guard: guard }
+    }
+}
+
+impl Drop for CodeGuard {
+    fn drop(&mut self) {
+        // Cleared before the mutex itself is released.
+        CODE_OWNER.store(0, Ordering::Release);
+    }
+}
+
+fn owns_code_lock() -> bool {
+    CODE_OWNER.load(Ordering::Acquire) == unsafe { GetCurrentThreadId() }
+}
+
+/// Takes [`CODE_LOCK`] unless this thread already holds it, recovering from
+/// poisoning (it guards no data).
+fn hold_code_lock() -> Option<CodeGuard> {
+    if owns_code_lock() {
+        return None;
+    }
+    Some(CodeGuard::new(
+        CODE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    ))
+}
+
+/// Takes [`CODE_LOCK`] without waiting. `Some(None)` means this thread already
+/// holds it; `None` that another thread does.
+pub(crate) fn try_hold_code_lock() -> Option<Option<CodeGuard>> {
+    if owns_code_lock() {
+        return Some(None);
+    }
+    match CODE_LOCK.try_lock() {
+        Ok(guard) => Some(Some(CodeGuard::new(guard))),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+            Some(Some(CodeGuard::new(poisoned.into_inner())))
+        }
+    }
+}
+
+/// Runs a code or table write under [`CODE_LOCK`].
 ///
 /// When this thread already holds the lock (a commit detaching or rolling back
 /// hooks inside its suspend window) `write` runs directly, so it neither
 /// deadlocks nor waits on a mutex there.
 pub(crate) fn with_code_lock<R>(write: impl FnOnce() -> R) -> R {
-    if owns_transaction_lock() {
-        return write();
-    }
-    let _guard = lock_transaction();
+    let _guard = hold_code_lock();
     write()
 }
 
 /// Like [`with_code_lock`], but returns `None` instead of waiting while another
 /// thread holds the lock.
 pub(crate) fn try_with_code_lock<R>(write: impl FnOnce() -> R) -> Option<R> {
-    if owns_transaction_lock() {
-        return Some(write());
-    }
-    let _guard = try_lock_transaction()?;
+    let _guard = try_hold_code_lock()?;
     Some(write())
 }
 

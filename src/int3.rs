@@ -231,8 +231,8 @@ impl Int3Hook {
             None
         };
 
-        // The transaction lock serializes the byte write with every other code
-        // write on the page; it is taken before the slot manager.
+        // The code lock serializes the byte write with every other code write
+        // on the page; it is taken before the slot manager.
         crate::transaction::with_code_lock(|| unsafe { Self::arm(target, detour, gateway) })
     }
 
@@ -249,7 +249,7 @@ impl Int3Hook {
     }
 
     /// Publishes a slot for `target` and patches its entry byte. The caller holds
-    /// the transaction lock.
+    /// the code lock.
     unsafe fn arm(
         target: *const u8,
         detour: *const u8,
@@ -344,7 +344,7 @@ impl Int3Hook {
         }
         self.active = false;
 
-        // Transaction lock first, then the slot manager (see `install`).
+        // Code lock first, then the slot manager (see `install`).
         crate::transaction::with_code_lock(|| {
             let mut mgr = lock_manager();
 
