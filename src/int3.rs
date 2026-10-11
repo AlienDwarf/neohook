@@ -282,9 +282,11 @@ impl Int3Hook {
         let original_byte = match original {
             Some(bytes) => bytes[0],
             None => {
-                // Roll back the published slot.
+                // Roll back the published slot, and the handler if it was
+                // registered for this hook alone.
                 SLOT_TARGET[slot].store(0, Ordering::Release);
                 SLOT_DETOUR[slot].store(0, Ordering::Release);
+                release_idle_handler(&mut mgr);
                 return Err(Int3HookError::PatchFailed);
             }
         };
@@ -361,7 +363,7 @@ impl Int3Hook {
     /// the detour before publishing a target. Clearing the detour here could
     /// instead clobber the detour of an install that has already reused the
     /// slot. The address is not recorded as retired: no code remains there to
-    /// re-run.
+    /// re-run. The handler is not removed here; see [`release_unused_handler`].
     pub(crate) fn forget(mut self) {
         if self.active {
             self.active = false;
@@ -472,6 +474,12 @@ fn release_idle_handler(mgr: &mut Int3Manager) {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
+}
+
+/// Removes the vectored handler if no hook uses it any more, for hooks that
+/// went away through [`Int3Hook::forget`], which cannot take the locks.
+pub(crate) fn release_unused_handler() {
+    crate::transaction::with_code_lock(|| release_idle_handler(&mut lock_manager()));
 }
 
 /// Whether the vectored handler is registered.

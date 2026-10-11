@@ -226,6 +226,9 @@ impl DelayHook {
         // Outside every lock, as registering is.
         if last {
             unregister_unload_notification();
+            // A hook whose module was unloaded was only forgotten, which
+            // leaves the INT3 handler to the last delay hook.
+            crate::int3::release_unused_handler();
         }
     }
 
