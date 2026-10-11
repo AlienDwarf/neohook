@@ -40,7 +40,7 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 
 - **RIP / EIP Redirection** - If a thread's instruction pointer falls within the bytes being overwritten, it is relocated.
 
-- **Stack Scanning** - Scans the top 512 stack slots per thread for return addresses pointing into the patch area and rewrites them to the trampoline equivalent.
+- **Stack Scanning** - Scans each thread's whole committed stack for return addresses pointing into the patch area and rewrites them to the trampoline equivalent.
 
 - **Instruction Relocation** - Uses [`iced-x86`](https://github.com/icedland/iced) to accurately decode, relocate, and re-encode.
 
@@ -1245,6 +1245,7 @@ neohook/
 │   ├── eat.rs          - EatHook: EAT parsing and export RVA rewriting (+ near stub)
 │   ├── veh.rs          - VehHook: hardware-breakpoint hooking via a vectored handler
 │   ├── int3.rs         - Int3Hook: INT3 software-breakpoint hooking via a vectored handler
+│   ├── inflight.rs     - Checks for traps still being dispatched before a handler is removed
 │   ├── gateway.rs      - Call-original gateway builder for VEH / INT3 hooks
 │   ├── midhook.rs      - MidHook: mid-function detours + register-context bridge
 │   ├── pe.rs           - Shared bounds-checked PE parsing primitives
