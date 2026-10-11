@@ -233,7 +233,7 @@ impl MidHook {
     /// as for [`crate::DetourTransaction::attach`].
     ///
     /// # Errors
-    /// - [`DetourError::InvalidParameter`] if `target` or `handler` is null.
+    /// - [`DetourError::InvalidParameter`] if `target` is null.
     /// - [`DetourError::AllocationFailed`] if no stub/trampoline memory could be
     ///   reserved near the target.
     /// - [`DetourError::RelocationFailed`] if the bytes at `target` could not be

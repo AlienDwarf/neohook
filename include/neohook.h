@@ -211,7 +211,7 @@ typedef struct HookContext {
  * indefinitely or unwind across the FFI boundary.
  *
  * The handler uses the C calling convention (`__cdecl` on x86), like the rest
- * of the C ABI.
+ * of the C ABI. Pass `NULL` and installation fails.
  */
 typedef void (*MidHookHandler)(struct HookContext *context);
 
@@ -872,7 +872,8 @@ int32_t detours_veh_unhook(struct VehHook *hook);
  *
  * # Safety
  * `target` must point at the start of a real instruction in executable memory,
- * and `handler` must be a valid context-handler function pointer.
+ * and `handler`, when non-null, must be a valid context-handler function
+ * pointer.
  */
 struct MidHook *detours_midhook_install(const uint8_t *target, MidHookHandler handler);
 

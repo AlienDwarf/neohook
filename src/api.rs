@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use crate::DetourError;
 use crate::introspect;
+use crate::midhook::HookContext;
 use crate::transaction::{Hook, TransactionCore};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::marker::PhantomData;
@@ -1492,6 +1493,23 @@ pub unsafe extern "C" fn detours_veh_unhook(hook: *mut crate::veh::VehHook) -> i
 
 // ----------------- FFI Entry Points: mid-function detours --------------------
 
+/// A handler invoked at a mid-function hook site with a pointer to the captured
+/// [`HookContext`].
+///
+/// The handler runs with every general-purpose register, the flags, all XMM
+/// registers and `MXCSR` snapshotted and restored around it, so it may freely
+/// clobber registers and modify the context block in place. It must not block
+/// indefinitely or unwind across the FFI boundary.
+///
+/// The handler uses the C calling convention (`__cdecl` on x86), like the rest
+/// of the C ABI. Pass `NULL` and installation fails.
+// The nullable C-ABI form of `crate::MidHookHandler`, which build.rs renames to
+// `MidHookHandler` in the header (so the non-nullable alias must never appear
+// in an FFI signature). The pointer is spelled out rather than
+// `Option<MidHookHandler>` because cbindgen cannot see through
+// `Option<SomeAlias>` and would emit an opaque struct.
+pub type DetoursMidHookHandler = Option<unsafe extern "C" fn(context: *mut HookContext)>;
+
 /// Installs a mid-function / arbitrary-address detour redirecting `target` to
 /// the context handler `handler`.
 ///
@@ -1506,13 +1524,17 @@ pub unsafe extern "C" fn detours_veh_unhook(hook: *mut crate::veh::VehHook) -> i
 ///
 /// # Safety
 /// `target` must point at the start of a real instruction in executable memory,
-/// and `handler` must be a valid context-handler function pointer.
+/// and `handler`, when non-null, must be a valid context-handler function
+/// pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn detours_midhook_install(
     target: *const u8,
-    handler: crate::midhook::MidHookHandler,
+    handler: DetoursMidHookHandler,
 ) -> *mut crate::midhook::MidHook {
     ffi_guard(std::ptr::null_mut(), || {
+        let Some(handler) = handler else {
+            return std::ptr::null_mut();
+        };
         if target.is_null() {
             return std::ptr::null_mut();
         }

@@ -683,7 +683,7 @@ fn ffi_midhook_install_runs_handler_and_unhooks() {
     MID_RAN.store(false, Ordering::SeqCst);
     let handler: MidHookHandler = mid_handler;
     unsafe {
-        let hook = detours_midhook_install(mid_target as *const u8, handler);
+        let hook = detours_midhook_install(mid_target as *const u8, Some(handler));
         assert!(!hook.is_null());
 
         let _ = mid_target(41);
@@ -699,7 +699,7 @@ fn ffi_midhook_install_runs_handler_and_unhooks() {
         );
 
         // Null guards.
-        assert!(detours_midhook_install(ptr::null(), handler).is_null());
+        assert!(detours_midhook_install(ptr::null(), Some(handler)).is_null());
         assert_eq!(detours_midhook_unhook(ptr::null_mut()), 0);
     }
 }
