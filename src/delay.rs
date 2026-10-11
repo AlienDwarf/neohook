@@ -33,13 +33,13 @@
 //!
 //! When the hooked module is unloaded, the hook drops back to pending (and is
 //! installed again on the next load) without writing to the old address. Unloads
-//! are observed through `LdrRegisterDllNotification`; the notification stays
-//! registered for the life of the process once the first delay hook exists.
+//! are observed through `LdrRegisterDllNotification`; the notification is
+//! registered with the first delay hook and unregistered with the last.
 
 use std::ffi::{CString, c_void};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-use std::sync::{Mutex, Once, TryLockError};
+use std::sync::{Mutex, TryLockError};
 
 use windows_sys::Win32::Foundation::HMODULE;
 use windows_sys::Win32::System::LibraryLoader::{
@@ -100,7 +100,8 @@ static UNLOAD_MISSED: AtomicBool = AtomicBool::new(false);
 /// lock re-validates installed hooks as if an unload had been missed.
 static UNLOAD_NOTIFIED: AtomicBool = AtomicBool::new(false);
 
-static REGISTER_UNLOAD_NOTIFICATION: Once = Once::new();
+/// Cookie of the registered unload notification, or null.
+static NOTIFICATION_COOKIE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 /// `LDR_DLL_NOTIFICATION_REASON_UNLOADED`.
 const LDR_DLL_NOTIFICATION_REASON_UNLOADED: u32 = 2;
@@ -123,6 +124,9 @@ type LdrDllNotificationFn =
 /// PVOID, PVOID*)`.
 type LdrRegisterDllNotificationFn =
     unsafe extern "system" fn(u32, LdrDllNotificationFn, *mut c_void, *mut *mut c_void) -> i32;
+
+/// `NTSTATUS NTAPI LdrUnregisterDllNotification(PVOID)`.
+type LdrUnregisterDllNotificationFn = unsafe extern "system" fn(*mut c_void) -> i32;
 
 /// `STATUS_INTERNAL_ERROR`, returned if the detour runs without a trampoline.
 const STATUS_INTERNAL_ERROR: i32 = 0xC000_00E5_u32 as i32;
@@ -214,10 +218,15 @@ impl DelayHook {
     }
 
     fn remove(&mut self) {
-        crate::transaction::with_code_lock(|| self.remove_locked());
+        let last = crate::transaction::with_code_lock(|| self.remove_locked());
+        // Outside every lock, as registering is.
+        if last {
+            unregister_unload_notification();
+        }
     }
 
-    fn remove_locked(&mut self) {
+    /// Removes the request; returns whether it was the last one.
+    fn remove_locked(&mut self) -> bool {
         let mut mgr = lock_manager();
         if let Some(pos) = mgr.pending.iter().position(|p| p.id == self.id) {
             let pending = mgr.pending.remove(pos);
@@ -231,6 +240,7 @@ impl DelayHook {
         {
             let _ = hook.unhook();
         }
+        mgr.pending.is_empty()
     }
 }
 
@@ -314,24 +324,62 @@ fn module_base_of(addr: *const u8) -> Option<usize> {
     (ok != 0 && !module.is_null()).then_some(module as usize)
 }
 
-/// Registers [`on_dll_notification`] once per process. It is never
-/// unregistered: it holds no resources, does nothing without installed delay
-/// hooks, and keeping it avoids racing an unregister against a running
-/// callback.
+/// Registers [`on_dll_notification`] unless it already is.
+///
+/// Lock-free: a register racing the unregister of the last hook can end up
+/// with a pending hook but no notification, which [`lock_manager`] covers by
+/// re-validating every installed hook while none is registered; the next
+/// register restores it.
 fn register_unload_notification() {
-    REGISTER_UNLOAD_NOTIFICATION.call_once(|| {
-        let Some(register) = crate::find_function("ntdll.dll", "LdrRegisterDllNotification") else {
-            return;
-        };
-        // SAFETY: the export has the documented signature.
-        let register =
-            unsafe { std::mem::transmute::<*const u8, LdrRegisterDllNotificationFn>(register) };
-        let mut cookie = std::ptr::null_mut();
-        let status = unsafe { register(0, on_dll_notification, std::ptr::null_mut(), &mut cookie) };
-        if status >= 0 {
-            UNLOAD_NOTIFIED.store(true, Ordering::Release);
-        }
-    });
+    if !NOTIFICATION_COOKIE.load(Ordering::Acquire).is_null() {
+        return;
+    }
+    let Some(register) = crate::find_function("ntdll.dll", "LdrRegisterDllNotification") else {
+        return;
+    };
+    // SAFETY: the export has the documented signature.
+    let register =
+        unsafe { std::mem::transmute::<*const u8, LdrRegisterDllNotificationFn>(register) };
+    let mut cookie = std::ptr::null_mut();
+    let status = unsafe { register(0, on_dll_notification, std::ptr::null_mut(), &mut cookie) };
+    if status < 0 || cookie.is_null() {
+        return;
+    }
+    if NOTIFICATION_COOKIE
+        .compare_exchange(
+            std::ptr::null_mut(),
+            cookie,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        UNLOAD_NOTIFIED.store(true, Ordering::Release);
+    } else {
+        // Another thread registered one meanwhile.
+        unsafe { unregister_cookie(cookie) };
+    }
+}
+
+/// Unregisters [`on_dll_notification`], so a module holding neohook can be
+/// unloaded once its last delay hook is gone. The loader waits for a running
+/// callback before it returns.
+fn unregister_unload_notification() {
+    UNLOAD_NOTIFIED.store(false, Ordering::Release);
+    let cookie = NOTIFICATION_COOKIE.swap(std::ptr::null_mut(), Ordering::AcqRel);
+    if !cookie.is_null() {
+        unsafe { unregister_cookie(cookie) };
+    }
+}
+
+unsafe fn unregister_cookie(cookie: *mut c_void) {
+    let Some(unregister) = crate::find_function("ntdll.dll", "LdrUnregisterDllNotification") else {
+        return;
+    };
+    // SAFETY: the export has the documented signature.
+    let unregister =
+        unsafe { std::mem::transmute::<*const u8, LdrUnregisterDllNotificationFn>(unregister) };
+    unsafe { unregister(cookie) };
 }
 
 /// Loader notification: on an unload, drops the hooks whose target lies in the
