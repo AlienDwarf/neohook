@@ -168,3 +168,30 @@ fn attach_eat_rejects_forwarder_export() {
         "forwarder export {name} should be rejected"
     );
 }
+
+#[test]
+fn enumerate_exports_reports_a_hooked_export() {
+    // On x86 the detour usually lies below the module, so the rewritten RVA
+    // wraps around the 32-bit address space; listing the exports must follow
+    // it, not overflow.
+    let module = kernel32();
+    let mut tx = TransactionCore::begin();
+    tx.update_all_threads();
+    tx.attach_eat(module, "GetTickCount", get_tick_count_detour as *const u8)
+        .expect("attach_eat");
+    let hooks = tx.commit().expect("commit");
+
+    let exports = unsafe { enumerate_exports(module) }.expect("kernel32 exports");
+    let listed = exports
+        .iter()
+        .find(|e| e.name.as_deref() == Some("GetTickCount"))
+        .map(|e| e.address);
+    let resolved = unsafe { resolve(module, "GetTickCount") } as *const u8;
+    drop(hooks);
+
+    assert_eq!(
+        listed,
+        Some(resolved),
+        "the listed address is where GetProcAddress resolves the hooked export"
+    );
+}

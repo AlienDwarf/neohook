@@ -1218,6 +1218,271 @@ pub unsafe extern "C" fn detours_imports_free(handle: *mut c_void) {
     }
 }
 
+// --- hook detection -------------------------------------------------------------
+
+/// [`DetoursDetectedHook::kind`]: a jump the module's file does not have.
+pub const DETOURS_DETECTED_INLINE_JUMP: u8 = 0;
+/// [`DetoursDetectedHook::kind`]: an `int3` the module's file does not have.
+pub const DETOURS_DETECTED_BREAKPOINT: u8 = 1;
+/// [`DetoursDetectedHook::kind`]: a hardware execution breakpoint (VEH hook).
+pub const DETOURS_DETECTED_HARDWARE_BREAKPOINT: u8 = 2;
+/// [`DetoursDetectedHook::kind`]: changed bytes that are not a known jump.
+pub const DETOURS_DETECTED_MODIFIED_CODE: u8 = 3;
+/// [`DetoursDetectedHook::kind`]: a redirected import slot.
+pub const DETOURS_DETECTED_IMPORT_REDIRECT: u8 = 4;
+/// [`DetoursDetectedHook::kind`]: a redirected export table entry.
+pub const DETOURS_DETECTED_EXPORT_REDIRECT: u8 = 5;
+
+// The C constants are literals so cbindgen can emit them; keep them in step
+// with the Rust enum.
+const _: () = {
+    use crate::DetectedHookKind as K;
+    assert!(K::InlineJump as u8 == DETOURS_DETECTED_INLINE_JUMP);
+    assert!(K::Breakpoint as u8 == DETOURS_DETECTED_BREAKPOINT);
+    assert!(K::HardwareBreakpoint as u8 == DETOURS_DETECTED_HARDWARE_BREAKPOINT);
+    assert!(K::ModifiedCode as u8 == DETOURS_DETECTED_MODIFIED_CODE);
+    assert!(K::ImportRedirect as u8 == DETOURS_DETECTED_IMPORT_REDIRECT);
+    assert!(K::ExportRedirect as u8 == DETOURS_DETECTED_EXPORT_REDIRECT);
+};
+
+/// One detected hook, filled in by the `detours_check_*` functions and
+/// `detours_detected_hooks_get`. Allocated by the caller; the strings are
+/// copied in, truncated if they do not fit.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DetoursDetectedHook {
+    /// What kind of hook it is, one of `DETOURS_DETECTED_*`.
+    pub kind: u8,
+    /// The modified location: the first changed byte, the import slot, or the
+    /// export table entry.
+    pub address: *const u8,
+    /// Where the hook leads, or null if that cannot be told.
+    pub destination: *const u8,
+    /// The function concerned (`"Name"`, or `"DLL!Name"` for an import),
+    /// NUL-terminated; empty if unknown.
+    pub function: [c_char; 256],
+    /// The file name of the module holding `destination`, NUL-terminated;
+    /// empty if it lies in private memory or is unknown.
+    pub destination_module: [c_char; 260],
+}
+
+impl DetoursDetectedHook {
+    fn from_hook(hook: &crate::DetectedHook) -> Self {
+        fn copy<const N: usize>(text: Option<&str>) -> [c_char; N] {
+            let mut out = [0 as c_char; N];
+            if let Some(text) = text {
+                for (dst, &src) in out.iter_mut().zip(text.as_bytes()).take(N - 1) {
+                    *dst = src as c_char;
+                }
+            }
+            out
+        }
+        Self {
+            kind: hook.kind as u8,
+            address: hook.address,
+            destination: hook.destination.unwrap_or(std::ptr::null()),
+            function: copy(hook.function.as_deref()),
+            destination_module: copy(hook.destination_module.as_deref()),
+        }
+    }
+}
+
+/// Writes a check's result to `out`: `1` for a hook, `0` for clean, `-1` for an
+/// error.
+unsafe fn report_check(
+    result: Result<Option<crate::DetectedHook>, crate::DetectError>,
+    out: *mut DetoursDetectedHook,
+) -> i32 {
+    match result {
+        Ok(Some(hook)) => {
+            unsafe { out.write(DetoursDetectedHook::from_hook(&hook)) };
+            1
+        }
+        Ok(None) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// Checks whether the function at `func` is hooked (see
+/// `neohook::check_function`).
+///
+/// Returns `1` and fills `out` if a hook was found, `0` if the function matches
+/// its module's file, and `-1` if `func` or `out` is null, `func` is not inside
+/// a loaded module, or the module's file cannot be read.
+///
+/// # Safety
+/// `func` must stay mapped for the duration of the call, and `out` must point
+/// at writable storage for a `DetoursDetectedHook`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_check_function(
+    func: *const u8,
+    out: *mut DetoursDetectedHook,
+) -> i32 {
+    if out.is_null() {
+        return -1;
+    }
+    ffi_guard(-1, || unsafe {
+        report_check(crate::check_function(func), out)
+    })
+}
+
+/// Checks whether the export `func` of `module` (loaded if it is not already
+/// present) is hooked, inline or in the export table.
+///
+/// Returns `1` and fills `out` if a hook was found, `0` if not, and `-1` if an
+/// argument is null or not valid UTF-8, the export cannot be found, or the
+/// module's file cannot be read.
+///
+/// # Safety
+/// `module` and `func` must be valid NUL-terminated C strings, and `out` must
+/// point at writable storage for a `DetoursDetectedHook`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_check_export(
+    module: *const c_char,
+    func: *const c_char,
+    out: *mut DetoursDetectedHook,
+) -> i32 {
+    if module.is_null() || func.is_null() || out.is_null() {
+        return -1;
+    }
+    let Ok(module) = (unsafe { CStr::from_ptr(module) }).to_str() else {
+        return -1;
+    };
+    let Ok(func) = (unsafe { CStr::from_ptr(func) }).to_str() else {
+        return -1;
+    };
+    ffi_guard(-1, || unsafe {
+        report_check(crate::check_export(module, func), out)
+    })
+}
+
+/// Scans the loaded module `module` for hooks: its exported functions, its
+/// export table and its import table.
+///
+/// Returns an opaque handle to be queried with `detours_detected_hooks_len()`
+/// / `detours_detected_hooks_get()` and released with
+/// `detours_detected_hooks_free()`, or null if `module` is null, not valid
+/// UTF-8, not loaded, or its file cannot be read.
+///
+/// # Safety
+/// `module` must be a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_scan_module_hooks(module: *const c_char) -> *mut c_void {
+    if module.is_null() {
+        return std::ptr::null_mut();
+    }
+    let Ok(module) = (unsafe { CStr::from_ptr(module) }).to_str() else {
+        return std::ptr::null_mut();
+    };
+    ffi_guard(std::ptr::null_mut(), || {
+        match crate::scan_module_hooks(module) {
+            Ok(hooks) => Box::into_raw(Box::new(hooks)) as *mut c_void,
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
+}
+
+/// Returns the number of hooks in a handle from `detours_scan_module_hooks()`.
+///
+/// Returns `0` if `handle` is null.
+///
+/// # Safety
+/// `handle` must be a valid handle returned by `detours_scan_module_hooks()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_detected_hooks_len(handle: *mut c_void) -> usize {
+    if handle.is_null() {
+        return 0;
+    }
+    unsafe { &*(handle as *const Vec<crate::DetectedHook>) }.len()
+}
+
+/// Copies the hook at `idx` of a handle from `detours_scan_module_hooks()`
+/// into `out`.
+///
+/// Returns `1` on success, or `0` if `handle` or `out` is null or `idx` is out
+/// of range.
+///
+/// # Safety
+/// `handle` must be a valid handle returned by `detours_scan_module_hooks()`,
+/// and `out` must point at writable storage for a `DetoursDetectedHook`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_detected_hooks_get(
+    handle: *mut c_void,
+    idx: usize,
+    out: *mut DetoursDetectedHook,
+) -> i32 {
+    if handle.is_null() || out.is_null() {
+        return 0;
+    }
+    let hooks = unsafe { &*(handle as *const Vec<crate::DetectedHook>) };
+    match hooks.get(idx) {
+        Some(hook) => {
+            unsafe { out.write(DetoursDetectedHook::from_hook(hook)) };
+            1
+        }
+        None => 0,
+    }
+}
+
+/// Releases a handle returned by `detours_scan_module_hooks()`. A null handle
+/// is ignored.
+///
+/// # Safety
+/// `handle` must be null or a handle returned by `detours_scan_module_hooks()`
+/// that has not been freed yet.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_detected_hooks_free(handle: *mut c_void) {
+    if !handle.is_null() {
+        drop(unsafe { Box::from_raw(handle as *mut Vec<crate::DetectedHook>) });
+    }
+}
+
+#[cfg(test)]
+mod detect_ffi_tests {
+    use super::*;
+    use crate::{DetectedHook, DetectedHookKind};
+
+    #[test]
+    fn from_hook_copies_and_truncates_strings() {
+        let long = "x".repeat(400);
+        let hook = DetectedHook {
+            kind: DetectedHookKind::ImportRedirect,
+            address: 0x1000 as *const u8,
+            function: Some(long.clone()),
+            destination: None,
+            destination_module: Some("detour.dll".to_string()),
+        };
+        let c = DetoursDetectedHook::from_hook(&hook);
+        assert_eq!(c.kind, DETOURS_DETECTED_IMPORT_REDIRECT);
+        assert_eq!(c.address, 0x1000 as *const u8);
+        assert!(c.destination.is_null());
+        let module = unsafe { CStr::from_ptr(c.destination_module.as_ptr()) };
+        assert_eq!(module.to_str().unwrap(), "detour.dll");
+        let function = unsafe { CStr::from_ptr(c.function.as_ptr()) };
+        assert_eq!(
+            function.to_bytes().len(),
+            255,
+            "truncated, still terminated"
+        );
+    }
+
+    #[test]
+    fn missing_strings_are_empty() {
+        let hook = DetectedHook {
+            kind: DetectedHookKind::HardwareBreakpoint,
+            address: 0x2000 as *const u8,
+            function: None,
+            destination: Some(0x3000 as *const u8),
+            destination_module: None,
+        };
+        let c = DetoursDetectedHook::from_hook(&hook);
+        assert_eq!(c.kind, DETOURS_DETECTED_HARDWARE_BREAKPOINT);
+        assert_eq!(c.destination, 0x3000 as *const u8);
+        assert_eq!(c.function[0], 0);
+        assert_eq!(c.destination_module[0], 0);
+    }
+}
+
 /// Resolves an exported function by name within a module, loading the module if
 /// it is not already present.
 ///
