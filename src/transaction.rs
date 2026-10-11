@@ -4,7 +4,7 @@ use crate::DetourError;
 use crate::HookKind;
 use crate::alloc::{Trampoline, TrampolineAlloc};
 use crate::disasm;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use windows_sys::Win32::Foundation::*;
@@ -240,6 +240,9 @@ pub struct InlineHook {
     patch_bytes: Vec<u8>,
     /// Whether the detour jump is currently installed at the target.
     enabled: bool,
+    /// Whether the commit published this hook's patched range, which
+    /// [`Self::release`] withdraws again once the target is restored.
+    published: bool,
 }
 
 impl InlineHook {
@@ -301,6 +304,7 @@ impl InlineHook {
     pub fn unhook(mut self) -> Result<(), DetourError> {
         with_code_lock(|| {
             self.perform_unhook()?;
+            self.release();
             unregister_managed_gateway(self.trampoline.ptr);
             Ok::<(), DetourError>(())
         })?;
@@ -360,11 +364,25 @@ impl InlineHook {
         Ok(())
     }
 
-    fn detach_finalize(&mut self) {
-        if self.enabled {
-            let _ = self.disable();
+    /// Withdraws what the commit published for this hook once its target holds
+    /// the original bytes again. Runs under the transaction lock, never inside
+    /// a suspend window.
+    fn release(&mut self) {
+        if !self.published {
+            return;
         }
-        unregister_managed_gateway(self.trampoline.ptr);
+        self.published = false;
+        unregister_live_patch(self.target);
+    }
+
+    fn detach_finalize(&mut self) {
+        with_code_lock(|| {
+            if self.enabled {
+                let _ = self.disable();
+            }
+            self.release();
+            unregister_managed_gateway(self.trampoline.ptr);
+        });
         self.active = false;
         self.enabled = false;
     }
@@ -377,6 +395,7 @@ impl Drop for InlineHook {
                 // auto unhook when dropped, best effort, ignore errors
                 let _ = self.perform_unhook();
             }
+            self.release();
             unregister_managed_gateway(self.trampoline.ptr);
         });
     }
@@ -929,6 +948,18 @@ impl TransactionCore {
                 .map_err(|_| DetourError::InvalidParameter)
         }?;
 
+        // The stolen bytes must not overlap another inline hook, queued here or
+        // already installed: one jump would be written over the other, or the
+        // live jump relocated into this trampoline. `commit` checks installed
+        // hooks again under the transaction lock.
+        let overlaps_pending = self.pending_hooks.iter().any(|pending| {
+            matches!(pending, PendingHook::Inline(existing)
+                if ranges_overlap(existing.target as usize, existing.stolen_len, target as usize, stolen_len))
+        });
+        if overlaps_pending || overlaps_live_patch(target, stolen_len) {
+            return Err(DetourError::InvalidParameter);
+        }
+
         // MANAGED GATEWAYS FOR HOOK CHAINING
         let tramp_capacity: usize = 128;
         let trampoline_handle = unsafe {
@@ -1350,9 +1381,15 @@ impl TransactionCore {
             let slot = match hook {
                 PendingHook::Inline(data) => {
                     inline_count += 1;
-                    inline_patch_bytes(data)
-                        .map(Reserved::Patch)
-                        .map_err(|e| (HookKind::Inline, e))
+                    // Another transaction may have hooked these bytes since
+                    // `attach`; the lock held now keeps the answer current.
+                    if overlaps_live_patch(data.target, data.stolen_len) {
+                        Err((HookKind::Inline, DetourError::InvalidParameter))
+                    } else {
+                        inline_patch_bytes(data)
+                            .map(Reserved::Patch)
+                            .map_err(|e| (HookKind::Inline, e))
+                    }
                 }
                 PendingHook::VtableInstance { vtable_len, .. } => {
                     crate::vtable::ClonedVtable::new(*vtable_len)
@@ -1522,12 +1559,14 @@ impl TransactionCore {
 
         // Publish the new gateways while the transaction lock is still held, so
         // the next transaction already sees them.
-        for hook in &installed {
+        for hook in &mut installed {
             if let Hook::Inline(inline) = hook {
                 if matches!(inline.target_kind, TargetKind::ManagedGateway) {
                     unregister_managed_gateway(inline.target);
                 }
                 register_managed_gateway(inline.trampoline.ptr);
+                register_live_patch(inline.target, inline.stolen_len);
+                inline.published = true;
             }
         }
 
@@ -1949,6 +1988,7 @@ impl TransactionCore {
             target_kind: std::mem::replace(&mut data.target_kind, TargetKind::Normal),
             patch_bytes: std::mem::take(patch),
             enabled: true,
+            published: false,
         }))
     }
 
@@ -2507,6 +2547,39 @@ fn is_managed_gateway(ptr: *mut u8) -> bool {
         .lock()
         .map(|s| s.contains(&(ptr as usize)))
         .unwrap_or(false)
+}
+
+/// Code ranges patched by installed inline hooks, as start -> length. Updated
+/// only outside the suspend window, under the transaction lock.
+fn live_patches() -> &'static Mutex<HashMap<usize, usize>> {
+    static PATCHES: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+    PATCHES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_live_patch(target: *mut u8, len: usize) {
+    let _ = live_patches().lock().map(|mut m| {
+        m.insert(target as usize, len);
+    });
+}
+
+fn unregister_live_patch(target: *mut u8) {
+    let _ = live_patches().lock().map(|mut m| {
+        m.remove(&(target as usize));
+    });
+}
+
+fn overlaps_live_patch(target: *mut u8, len: usize) -> bool {
+    live_patches()
+        .lock()
+        .map(|m| {
+            m.iter()
+                .any(|(&start, &patched)| ranges_overlap(start, patched, target as usize, len))
+        })
+        .unwrap_or(false)
+}
+
+fn ranges_overlap(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
+    a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
 }
 
 #[cfg(target_arch = "x86_64")]
