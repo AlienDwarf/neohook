@@ -546,6 +546,46 @@ mod tests {
         RETIRED[next].store(0, Ordering::Release);
     }
 
+    /// Runs the handler on a single-step at `addr` with a raw DR6 and one
+    /// debug register programmed, returning the verdict and the context.
+    fn handle_trap_with(addr: usize, dr6: DrWord, slot: usize, dr: DrWord) -> (i32, CONTEXT) {
+        let mut ctx: AlignedContext = unsafe { std::mem::zeroed() };
+        ctx.0.Dr6 = dr6;
+        program_slot(&mut ctx.0, slot, dr as usize, true);
+        let mut record: EXCEPTION_RECORD = unsafe { std::mem::zeroed() };
+        record.ExceptionCode = STATUS_SINGLE_STEP;
+        record.ExceptionAddress = addr as *mut _;
+        let mut pointers = EXCEPTION_POINTERS {
+            ExceptionRecord: &mut record,
+            ContextRecord: &mut ctx.0,
+        };
+        let verdict = unsafe { veh_handler(&mut pointers) };
+        (verdict, ctx.0)
+    }
+
+    #[test]
+    fn handler_leaves_foreign_hardware_breakpoints_alone() {
+        // Another component's execution breakpoint in DR2, at an address
+        // neohook never armed.
+        let addr = 0x7FFE_7890usize;
+        let (verdict, ctx) = handle_trap_with(addr, 1 << 2, 2, addr as DrWord);
+        assert_eq!(verdict, EXCEPTION_CONTINUE_SEARCH, "foreign breakpoint");
+        assert_eq!(ctx.Dr2, addr as DrWord, "foreign DR2 left armed");
+        assert_ne!(ctx.Dr7 & (1 << 4), 0, "foreign DR7 enable left set");
+    }
+
+    #[test]
+    fn handler_leaves_foreign_single_steps_on_removed_targets_alone() {
+        // A trap-flag single step (DR6.BS) that happens to land on the address
+        // of a removed hook belongs to whoever set the trap flag.
+        let addr = 0x7FFE_ABC0usize;
+        let next = RETIRED_NEXT.fetch_add(1, Ordering::Relaxed) % RETIRED_COUNT;
+        RETIRED[next].store(addr, Ordering::Release);
+        let (verdict, _) = handle_stale_trap(addr, 0x4000, 0);
+        RETIRED[next].store(0, Ordering::Release);
+        assert_eq!(verdict, EXCEPTION_CONTINUE_SEARCH, "trap-flag single step");
+    }
+
     #[test]
     fn handler_leaves_foreign_single_steps_alone() {
         let (verdict, _) = handle_stale_trap(0x7FFE_4560, 0, 0);
