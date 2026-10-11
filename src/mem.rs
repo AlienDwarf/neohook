@@ -23,9 +23,111 @@ fn detour_page_protect_adjust_execute(old_protect: u32, new_protect: u32) -> u32
     }
 }
 
-/// Changes the protection of a region of memory,
-/// ensuring that if the original protection included execute permissions,
-/// the new protection will also include execute permissions.
+const PAGE_SIZE: usize = 0x1000;
+
+/// Most pages one [`PageProtections`] batch tracks. A code patch spans at most
+/// two pages; longer writes are processed in batches of this many pages.
+const MAX_BATCH_PAGES: usize = 8;
+
+/// Changes the protection of the page containing `page` to `new_protect`,
+/// keeping execute permission if that page had it. Returns the page's previous
+/// protection.
+unsafe fn protect_page_same_execute(page: usize, new_protect: u32) -> Option<u32> {
+    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    unsafe {
+        if VirtualQuery(
+            page as _,
+            &mut mbi,
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        ) == 0
+        {
+            return None;
+        }
+        let adjusted = detour_page_protect_adjust_execute(mbi.Protect, new_protect);
+        let mut old = 0u32;
+        if VirtualProtect(page as _, 1, adjusted, &mut old) == 0 {
+            return None;
+        }
+        Some(old)
+    }
+}
+
+/// The saved protections of up to [`MAX_BATCH_PAGES`] consecutive pages, kept
+/// on the stack so it is usable inside the commit suspend window.
+struct PageProtections {
+    first_page: usize,
+    count: usize,
+    old: [u32; MAX_BATCH_PAGES],
+}
+
+impl PageProtections {
+    /// Changes every page of `[start, start + len)` (`len > 0`, at most
+    /// [`MAX_BATCH_PAGES`] pages) to `new_protect`, preserving each page's own
+    /// execute permission. On failure the pages already changed are restored.
+    unsafe fn change(start: usize, len: usize, new_protect: u32) -> Option<Self> {
+        let first_page = start & !(PAGE_SIZE - 1);
+        let last_page = (start + len - 1) & !(PAGE_SIZE - 1);
+        let pages = (last_page - first_page) / PAGE_SIZE + 1;
+        debug_assert!(pages <= MAX_BATCH_PAGES);
+
+        let mut saved = Self {
+            first_page,
+            count: 0,
+            old: [0; MAX_BATCH_PAGES],
+        };
+        for i in 0..pages.min(MAX_BATCH_PAGES) {
+            match unsafe { protect_page_same_execute(first_page + i * PAGE_SIZE, new_protect) } {
+                Some(old) => {
+                    saved.old[i] = old;
+                    saved.count = i + 1;
+                }
+                None => {
+                    unsafe { saved.restore() };
+                    return None;
+                }
+            }
+        }
+        Some(saved)
+    }
+
+    /// Restores every saved page to its own previous protection. Returns
+    /// `false` if any page could not be restored.
+    unsafe fn restore(&self) -> bool {
+        let mut ok = true;
+        for (i, &old) in self.old[..self.count].iter().enumerate() {
+            let mut tmp = 0u32;
+            let page = self.first_page + i * PAGE_SIZE;
+            ok &= unsafe { VirtualProtect(page as _, 1, old, &mut tmp) } != 0;
+        }
+        ok
+    }
+}
+
+/// Splits `[start, start + len)` into consecutive chunks of at most
+/// [`MAX_BATCH_PAGES`] pages and calls `f(chunk_start, chunk_len)` for each,
+/// stopping at the first chunk for which `f` returns `false`. The caller must
+/// ensure `start + len` does not overflow.
+fn for_each_page_batch(start: usize, len: usize, mut f: impl FnMut(usize, usize) -> bool) -> bool {
+    let end = start + len;
+    let mut chunk = start;
+    while chunk < end {
+        let batch_end = (chunk & !(PAGE_SIZE - 1))
+            .saturating_add(MAX_BATCH_PAGES * PAGE_SIZE)
+            .min(end);
+        if !f(chunk, batch_end - chunk) {
+            return false;
+        }
+        chunk = batch_end;
+    }
+    true
+}
+
+/// Changes the protection of a region of memory page by page, so that every
+/// page whose original protection included execute permission keeps it.
+///
+/// `old_protect_out` receives the previous protection of the **first** page,
+/// as with `VirtualProtect`. A range whose pages had different protections
+/// cannot be restored from that single value.
 ///
 /// # Safety
 /// The caller must ensure that `address` is a valid pointer
@@ -35,26 +137,62 @@ pub unsafe fn virtual_protect_same_execute(
     new_protect: u32,
     old_protect_out: *mut u32,
 ) -> BOOL {
-    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-
-    unsafe {
-        if VirtualQuery(
-            address as _,
-            &mut mbi,
-            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
-        ) == 0
-        {
-            return 0;
-        }
-
-        let adjusted_protect = detour_page_protect_adjust_execute(mbi.Protect, new_protect);
-        VirtualProtect(address as _, size, adjusted_protect, old_protect_out)
+    let start = address as usize;
+    if size == 0 || start.checked_add(size).is_none() {
+        return 0;
     }
+
+    let mut first_old = None;
+    let ok = for_each_page_batch(start, size, |chunk, chunk_len| {
+        match unsafe { PageProtections::change(chunk, chunk_len, new_protect) } {
+            Some(saved) => {
+                first_old.get_or_insert(saved.old[0]);
+                true
+            }
+            None => false,
+        }
+    });
+    if let Some(old) = first_old
+        && !old_protect_out.is_null()
+    {
+        unsafe { *old_protect_out = old };
+    }
+    ok as BOOL
+}
+
+/// Copies `len` bytes from `src` to `target` (first saving the previous bytes
+/// to `orig` if it is non-null). Each touched page is made writable with its
+/// own execute permission preserved and gets its own protection back
+/// afterwards; the instruction cache is flushed. Allocation-free and
+/// lock-free, so it is usable inside the commit suspend window.
+unsafe fn write_pages(target: *mut u8, src: *const u8, orig: *mut u8, len: usize) -> bool {
+    let start = target as usize;
+    if start.checked_add(len).is_none() {
+        return false;
+    }
+
+    for_each_page_batch(start, len, |chunk, chunk_len| unsafe {
+        let Some(saved) = PageProtections::change(chunk, chunk_len, PAGE_READWRITE) else {
+            return false;
+        };
+        let offset = chunk - start;
+        if !orig.is_null() {
+            std::ptr::copy_nonoverlapping(chunk as *const u8, orig.add(offset), chunk_len);
+        }
+        std::ptr::copy_nonoverlapping(src.add(offset), chunk as *mut u8, chunk_len);
+
+        // Flush instruction cache so CPUs reload from RAM instead of L1/L2/L3
+        FlushInstructionCache(GetCurrentProcess(), chunk as _, chunk_len);
+
+        saved.restore();
+        true
+    })
 }
 
 /// Writes `len` bytes from `src` into `target` and returns the bytes that were
-/// there before, or `None` on failure. Execute permission is preserved while the
-/// protection is temporarily lifted, and the instruction cache is flushed.
+/// there before, or `None` on failure. Execute permission is preserved per page
+/// while the protection is temporarily lifted, every page gets its own
+/// protection back, and the instruction cache is flushed.
 ///
 /// Despite the name, the write is **not synchronized** with other threads: it is
 /// a plain `VirtualProtect` + copy + `FlushInstructionCache` and suspends nothing.
@@ -70,34 +208,17 @@ pub unsafe fn write_memory_atomic(target: *mut u8, src: *const u8, len: usize) -
         return None;
     }
 
-    let mut old_protect: u32 = 0;
-    unsafe {
-        // FIRST, change the protection to allow writing (while preserving execute permissions if they were present)
-        if virtual_protect_same_execute(target, len, PAGE_READWRITE, &mut old_protect) == 0 {
-            return None;
-        }
-
-        // NOW we can safely read
-        let mut orig = vec![0u8; len];
-        std::ptr::copy_nonoverlapping(target as *const u8, orig.as_mut_ptr(), len);
-
-        // Perform the write
-        std::ptr::copy_nonoverlapping(src, target, len);
-
-        // Flush instruction cache so CPUs reload from RAM instead of L1/L2/L3
-        FlushInstructionCache(GetCurrentProcess(), target as _, len);
-
-        // Restore original protection
-        let mut tmp = 0u32;
-        VirtualProtect(target as _, len, old_protect, &mut tmp);
-
+    let mut orig = vec![0u8; len];
+    if unsafe { write_pages(target, src, orig.as_mut_ptr(), len) } {
         Some(orig)
+    } else {
+        None
     }
 }
 
 /// Writes `len` bytes from `src` into `target` without allocating, preserving
-/// execute permission and flushing the instruction cache. Returns `true` on
-/// success.
+/// execute permission per page, restoring each page's own protection and
+/// flushing the instruction cache. Returns `true` on success.
 ///
 /// Like [`write_memory_atomic`] this does no thread synchronization of its own,
 /// but because it never touches the heap it is safe to call while other threads
@@ -110,19 +231,7 @@ pub(crate) unsafe fn write_code_bytes(target: *mut u8, src: *const u8, len: usiz
         return false;
     }
 
-    let mut old_protect: u32 = 0;
-    unsafe {
-        if virtual_protect_same_execute(target, len, PAGE_READWRITE, &mut old_protect) == 0 {
-            return false;
-        }
-
-        std::ptr::copy_nonoverlapping(src, target, len);
-        FlushInstructionCache(GetCurrentProcess(), target as _, len);
-
-        let mut tmp = 0u32;
-        VirtualProtect(target as _, len, old_protect, &mut tmp);
-    }
-    true
+    unsafe { write_pages(target, src, std::ptr::null_mut(), len) }
 }
 
 #[cfg(test)]
