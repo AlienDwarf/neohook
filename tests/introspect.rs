@@ -6,8 +6,11 @@ use neohook::{
     enumerate_exports, enumerate_imports, enumerate_modules, find_function,
     find_function_by_ordinal, get_entry_point, get_module_handle, get_module_size,
 };
-use windows_sys::Win32::Foundation::HMODULE;
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
 
 fn kernel32() -> HMODULE {
     get_module_handle("kernel32.dll").expect("kernel32.dll should be loaded")
@@ -102,4 +105,41 @@ fn introspection_rejects_invalid_module() {
     assert!(unsafe { enumerate_exports(fake) }.is_err());
     assert!(unsafe { enumerate_imports(fake) }.is_err());
     assert!(get_entry_point(fake).is_none());
+}
+
+#[test]
+fn enumerate_modules_is_never_empty_while_modules_load() {
+    // Snapshots fail transiently while another thread changes the module list.
+    let stop = Arc::new(AtomicBool::new(false));
+    let churn = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let dlls: Vec<Vec<u16>> = ["version.dll", "winmm.dll", "msimg32.dll"]
+                .iter()
+                .map(|d| d.encode_utf16().chain(std::iter::once(0)).collect())
+                .collect();
+            while !stop.load(Ordering::Relaxed) {
+                for dll in &dlls {
+                    let h = unsafe { LoadLibraryW(dll.as_ptr()) };
+                    if !h.is_null() {
+                        unsafe { FreeLibrary(h) };
+                    }
+                }
+            }
+        })
+    };
+
+    let start = Instant::now();
+    let mut calls = 0;
+    let mut empty = 0;
+    while calls < 5000 && start.elapsed() < Duration::from_millis(2500) {
+        if enumerate_modules().is_empty() {
+            empty += 1;
+        }
+        calls += 1;
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    churn.join().expect("churn thread");
+    assert_eq!(empty, 0, "{empty} of {calls} snapshots were empty");
 }
