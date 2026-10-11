@@ -1465,6 +1465,7 @@ impl TransactionCore {
         // Writers outside the transaction wait only for the patch phase. Taken
         // before the first suspension, so no frozen thread can hold it.
         let code_guard = hold_code_lock();
+        let freeze_guard = crate::threads::hold_freeze_lock();
 
         self.suspend_threads();
 
@@ -1559,6 +1560,7 @@ impl TransactionCore {
             rollback_detaches(&mut detached);
             self.rollback(&mut installed);
             self.cleanup_threads();
+            drop(freeze_guard);
             // Threads run again: dismantle what the failed commit built.
             drop(installed);
             drop(pending);
@@ -1586,6 +1588,7 @@ impl TransactionCore {
         });
 
         self.resume_threads();
+        drop(freeze_guard);
 
         // Publish the new gateways while the transaction lock is still held, so
         // the next transaction already sees them.

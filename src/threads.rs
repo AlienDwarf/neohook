@@ -1,8 +1,67 @@
 // Copyright (c) 2026 NeoHook Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, MutexGuard, TryLockError};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
 use windows_sys::Win32::System::Threading::*;
+
+/// Serializes every pass that suspends the other threads of the process: a
+/// commit's patch phase, a reclaim pass, the watchdog's rewrite, arming or
+/// disarming a VEH breakpoint and the in-flight check before an exception
+/// handler is removed.
+///
+/// Two threads that each suspend "every other thread" at the same time can
+/// suspend each other, and then nothing resumes either of them or the rest of
+/// the process. Taken last, after every other crate lock; its holder takes no
+/// other lock while threads are suspended.
+static FREEZE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Thread id of the [`FREEZE_LOCK`] holder, or 0.
+static FREEZE_OWNER: AtomicU32 = AtomicU32::new(0);
+
+/// A held [`FREEZE_LOCK`], or nothing if this thread already held it.
+pub(crate) struct FreezeGuard {
+    guard: Option<MutexGuard<'static, ()>>,
+}
+
+impl Drop for FreezeGuard {
+    fn drop(&mut self) {
+        if self.guard.is_some() {
+            // Cleared before the mutex itself is released.
+            FREEZE_OWNER.store(0, Ordering::Release);
+        }
+    }
+}
+
+fn owns_freeze_lock() -> bool {
+    FREEZE_OWNER.load(Ordering::Acquire) == unsafe { GetCurrentThreadId() }
+}
+
+fn freeze_guard(guard: MutexGuard<'static, ()>) -> FreezeGuard {
+    FREEZE_OWNER.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+    FreezeGuard { guard: Some(guard) }
+}
+
+/// Takes [`FREEZE_LOCK`], waiting for another thread's pass to finish.
+pub(crate) fn hold_freeze_lock() -> FreezeGuard {
+    if owns_freeze_lock() {
+        return FreezeGuard { guard: None };
+    }
+    freeze_guard(FREEZE_LOCK.lock().unwrap_or_else(|p| p.into_inner()))
+}
+
+/// Takes [`FREEZE_LOCK`] without waiting; `None` while another thread holds it.
+pub(crate) fn try_hold_freeze_lock() -> Option<FreezeGuard> {
+    if owns_freeze_lock() {
+        return Some(FreezeGuard { guard: None });
+    }
+    match FREEZE_LOCK.try_lock() {
+        Ok(guard) => Some(freeze_guard(guard)),
+        Err(TryLockError::WouldBlock) => None,
+        Err(TryLockError::Poisoned(p)) => Some(freeze_guard(p.into_inner())),
+    }
+}
 
 /// Provides functionality to enumerate threads
 pub(crate) struct ThreadEnumerator;

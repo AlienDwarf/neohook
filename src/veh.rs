@@ -487,6 +487,8 @@ fn lock_manager() -> std::sync::MutexGuard<'static, VehManager> {
 /// Arms (or disarms) breakpoint `slot` for `address` on the calling thread and
 /// every other thread in the process.
 fn set_breakpoint_on_all_threads(slot: usize, address: usize, enable: bool) {
+    // Suspends each thread in turn, so it must not race another such pass.
+    let _freeze = crate::threads::hold_freeze_lock();
     // The calling thread cannot be suspended; update it directly.
     unsafe { set_debug_register(GetCurrentThread(), slot, address, enable) };
 

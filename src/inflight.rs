@@ -57,6 +57,7 @@ const WORD: usize = std::mem::size_of::<usize>();
 /// keeping the handler. Allocates nothing while threads are suspended, and
 /// `is_trap_address` must not either.
 pub(crate) fn exceptions_in_flight(code: i32, is_trap_address: impl Fn(usize) -> bool) -> bool {
+    let _freeze = crate::threads::hold_freeze_lock();
     let tids = crate::threads::ThreadEnumerator::enumerate_process_threads();
     // Reserved before the first suspension.
     let mut handles: Vec<HANDLE> = Vec::with_capacity(tids.len());

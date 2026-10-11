@@ -167,6 +167,10 @@ pub fn reclaim() {
 /// "allocate while a thread is suspended" heap-lock deadlock, every buffer is
 /// reserved before the first thread is suspended.
 unsafe fn free_quiescent_regions(regions: Vec<Region>) -> Vec<Region> {
+    // Another thread is suspending the process right now: try again later.
+    let Some(_freeze) = crate::threads::try_hold_freeze_lock() else {
+        return regions;
+    };
     let tids = crate::threads::ThreadEnumerator::enumerate_process_threads();
 
     // Resolve the thread walker before anything is frozen: `GetModuleHandle`
