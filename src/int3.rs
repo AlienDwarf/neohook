@@ -528,6 +528,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn handler_is_removed_with_the_last_hook() {
+        // A module that unloads after unhooking must not leave the handler
+        // registered, or the next exception in the process calls unmapped code.
+        #[inline(never)]
+        extern "system" fn last() -> u32 {
+            std::hint::black_box(21)
+        }
+        let t = last as *const () as *const u8;
+        let d = detour as *const () as *const u8;
+        let hook = unsafe { Int3Hook::install(t, d) }.expect("install");
+        assert_ne!(lock_manager().handler, 0, "handler registered while hooked");
+        hook.unhook().unwrap();
+        assert_eq!(
+            lock_manager().handler,
+            0,
+            "handler removed with the last hook"
+        );
+    }
+
     #[inline(never)]
     extern "system" fn t_a() -> u32 {
         std::hint::black_box(1)

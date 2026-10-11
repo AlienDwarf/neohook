@@ -612,6 +612,22 @@ mod tests {
         assert_eq!(verdict, EXCEPTION_CONTINUE_SEARCH);
     }
 
+    #[test]
+    fn handler_is_removed_with_the_last_hook() {
+        // A module that unloads after unhooking must not leave the handler
+        // registered, or the next exception in the process calls unmapped code.
+        let t = slot_target_e as *const () as *const u8;
+        let d = slot_detour as *const () as *const u8;
+        let hook = unsafe { VehHook::install(t, d) }.expect("install");
+        assert_ne!(lock_manager().handler, 0, "handler registered while hooked");
+        hook.unhook().unwrap();
+        assert_eq!(
+            lock_manager().handler,
+            0,
+            "handler removed with the last hook"
+        );
+    }
+
     extern "system" fn slot_target_a() -> u32 {
         std::hint::black_box(1)
     }
