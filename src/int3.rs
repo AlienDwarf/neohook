@@ -360,6 +360,23 @@ impl Int3Hook {
             SLOT_DETOUR[self.slot].store(0, Ordering::Release);
         });
     }
+
+    /// Drops the hook without touching the target: for a target whose module
+    /// was unloaded, where the old address may now hold unrelated memory.
+    ///
+    /// Only the slot's target is cleared, which takes no lock, so this is safe
+    /// under the loader lock. Leaving the stale detour in place is harmless: a
+    /// slot is live only through its target, and the next install overwrites
+    /// the detour before publishing a target. Clearing the detour here could
+    /// instead clobber the detour of an install that has already reused the
+    /// slot. The address is not recorded as retired: no code remains there to
+    /// re-run.
+    pub(crate) fn forget(mut self) {
+        if self.active {
+            self.active = false;
+            SLOT_TARGET[self.slot].store(0, Ordering::Release);
+        }
+    }
 }
 
 impl Drop for Int3Hook {
