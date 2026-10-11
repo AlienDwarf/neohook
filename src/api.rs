@@ -2062,6 +2062,203 @@ pub extern "C" fn detours_reclaim() {
     })
 }
 
+// --- signature inference -----------------------------------------------------
+
+/// Most arguments a [`DetoursSignature`] holds; more are reported through
+/// `truncated`.
+pub const DETOURS_MAX_SIGNATURE_ARGS: usize = 32;
+
+/// [`DetoursSignature::convention`]: the x64 Windows convention.
+pub const DETOURS_CONVENTION_WIN64: u8 = 0;
+/// [`DetoursSignature::convention`]: x86, stack arguments removed by the caller.
+pub const DETOURS_CONVENTION_CDECL: u8 = 1;
+/// [`DetoursSignature::convention`]: x86, stack arguments removed by the callee.
+pub const DETOURS_CONVENTION_STDCALL: u8 = 2;
+/// [`DetoursSignature::convention`]: x86, first two arguments in `ecx` / `edx`.
+pub const DETOURS_CONVENTION_FASTCALL: u8 = 3;
+/// [`DetoursSignature::convention`]: x86, `this` in `ecx`.
+pub const DETOURS_CONVENTION_THISCALL: u8 = 4;
+
+/// Argument or return kind: 8-bit integer.
+pub const DETOURS_VALUE_KIND_INT8: u8 = 0;
+/// Argument or return kind: 16-bit integer.
+pub const DETOURS_VALUE_KIND_INT16: u8 = 1;
+/// Argument or return kind: 32-bit integer.
+pub const DETOURS_VALUE_KIND_INT32: u8 = 2;
+/// Argument or return kind: 64-bit integer (on x64 possibly a pointer that is
+/// never dereferenced).
+pub const DETOURS_VALUE_KIND_INT64: u8 = 3;
+/// Argument or return kind: a pointer, used as an address.
+pub const DETOURS_VALUE_KIND_POINTER: u8 = 4;
+/// Argument or return kind: 32-bit floating point.
+pub const DETOURS_VALUE_KIND_FLOAT: u8 = 5;
+/// Argument or return kind: 64-bit floating point.
+pub const DETOURS_VALUE_KIND_DOUBLE: u8 = 6;
+/// Argument or return kind: present, but nothing reveals its type.
+pub const DETOURS_VALUE_KIND_UNKNOWN: u8 = 7;
+
+// The C constants are literals so cbindgen can emit them; keep them in step
+// with the Rust enums.
+const _: () = {
+    assert!(crate::CallingConvention::Win64 as u8 == DETOURS_CONVENTION_WIN64);
+    assert!(crate::CallingConvention::Cdecl as u8 == DETOURS_CONVENTION_CDECL);
+    assert!(crate::CallingConvention::Stdcall as u8 == DETOURS_CONVENTION_STDCALL);
+    assert!(crate::CallingConvention::Fastcall as u8 == DETOURS_CONVENTION_FASTCALL);
+    assert!(crate::CallingConvention::Thiscall as u8 == DETOURS_CONVENTION_THISCALL);
+    assert!(crate::ValueKind::Int8 as u8 == DETOURS_VALUE_KIND_INT8);
+    assert!(crate::ValueKind::Int16 as u8 == DETOURS_VALUE_KIND_INT16);
+    assert!(crate::ValueKind::Int32 as u8 == DETOURS_VALUE_KIND_INT32);
+    assert!(crate::ValueKind::Int64 as u8 == DETOURS_VALUE_KIND_INT64);
+    assert!(crate::ValueKind::Pointer as u8 == DETOURS_VALUE_KIND_POINTER);
+    assert!(crate::ValueKind::Float as u8 == DETOURS_VALUE_KIND_FLOAT);
+    assert!(crate::ValueKind::Double as u8 == DETOURS_VALUE_KIND_DOUBLE);
+    assert!(crate::ValueKind::Unknown as u8 == DETOURS_VALUE_KIND_UNKNOWN);
+};
+
+/// One inferred argument, as returned by [`detours_infer_signature`].
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DetoursArgGuess {
+    /// The rough type of the argument, one of `DETOURS_VALUE_KIND_*`.
+    pub kind: u8,
+    /// `1` if the argument is on the stack, `0` if it is in a register.
+    pub on_stack: u8,
+    /// The register name (`"rcx"`, `"xmm1"`, `"ecx"`), NUL-terminated; empty
+    /// for a stack argument.
+    pub register_name: [c_char; 8],
+    /// Byte offset from the stack pointer at entry, for a stack argument.
+    pub stack_offset: u32,
+    /// How sure the analysis is about this argument, from 0.0 to 1.0.
+    pub confidence: f32,
+}
+
+/// An inferred signature, filled in by [`detours_infer_signature`]. Allocated
+/// by the caller; it holds no pointers and needs no release.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DetoursSignature {
+    /// The calling convention the code matches, one of `DETOURS_CONVENTION_*`.
+    pub convention: u8,
+    /// `1` if the function returns a value, `0` for `void`.
+    pub has_return: u8,
+    /// The rough type of the return value, one of `DETOURS_VALUE_KIND_*`;
+    /// meaningless when `has_return` is 0.
+    pub returns: u8,
+    /// `0` if a path could not be followed to its end, so arguments used only
+    /// there may be missing.
+    pub complete: u8,
+    /// `1` if the function has more than [`DETOURS_MAX_SIGNATURE_ARGS`]
+    /// arguments and only the first ones are in `args`.
+    pub truncated: u8,
+    /// Bytes the function removes from the stack on return (`ret N`), x86 only.
+    pub stack_cleanup: u32,
+    /// Number of valid entries in `args`.
+    pub arg_count: u32,
+    /// The arguments, in declaration order.
+    pub args: [DetoursArgGuess; DETOURS_MAX_SIGNATURE_ARGS],
+}
+
+impl DetoursSignature {
+    fn from_guess(guess: &crate::SignatureGuess) -> Self {
+        let empty = DetoursArgGuess {
+            kind: DETOURS_VALUE_KIND_UNKNOWN,
+            on_stack: 0,
+            register_name: [0; 8],
+            stack_offset: 0,
+            confidence: 0.0,
+        };
+        let mut out = Self {
+            convention: guess.convention as u8,
+            has_return: guess.returns.is_some() as u8,
+            returns: guess.returns.unwrap_or(crate::ValueKind::Unknown) as u8,
+            complete: guess.complete as u8,
+            truncated: (guess.args.len() > DETOURS_MAX_SIGNATURE_ARGS) as u8,
+            stack_cleanup: guess.stack_cleanup,
+            arg_count: guess.args.len().min(DETOURS_MAX_SIGNATURE_ARGS) as u32,
+            args: [empty; DETOURS_MAX_SIGNATURE_ARGS],
+        };
+        for (slot, arg) in out.args.iter_mut().zip(&guess.args) {
+            slot.kind = arg.kind as u8;
+            slot.confidence = arg.confidence;
+            match arg.location {
+                crate::ArgLocation::Register(name) => {
+                    // Names are at most 5 bytes; the rest stays NUL.
+                    for (dst, &src) in slot.register_name.iter_mut().zip(name.as_bytes()) {
+                        *dst = src as c_char;
+                    }
+                }
+                crate::ArgLocation::Stack(offset) => {
+                    slot.on_stack = 1;
+                    slot.stack_offset = offset;
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Infers the argument count and types, return type and calling convention of
+/// the function at `func` from its machine code, writing the result to `out`.
+///
+/// The result is a best-effort estimate; see `neohook::infer_signature` for
+/// what the analysis can and cannot see.
+///
+/// Returns `1` on success, or `0` if `func` or `out` is null or the code is
+/// not readable.
+///
+/// # Safety
+/// `func` must point at the start of a function in mapped memory, and `out` at
+/// writable storage for a `DetoursSignature`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_infer_signature(
+    func: *const u8,
+    out: *mut DetoursSignature,
+) -> i32 {
+    if func.is_null() || out.is_null() {
+        return 0;
+    }
+    ffi_guard(0, || match unsafe { crate::infer_signature(func) } {
+        Ok(guess) => {
+            unsafe { out.write(DetoursSignature::from_guess(&guess)) };
+            1
+        }
+        Err(_) => 0,
+    })
+}
+
+/// Like [`detours_infer_signature`], for the export `func` of `module` (loaded
+/// if it is not already present).
+///
+/// Returns `1` on success, or `0` if an argument is null or not valid UTF-8,
+/// the export cannot be resolved, or its code is not readable.
+///
+/// # Safety
+/// `module` and `func` must be valid NUL-terminated C strings, and `out` must
+/// point at writable storage for a `DetoursSignature`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn detours_infer_signature_by_name(
+    module: *const c_char,
+    func: *const c_char,
+    out: *mut DetoursSignature,
+) -> i32 {
+    if module.is_null() || func.is_null() || out.is_null() {
+        return 0;
+    }
+    let Ok(module) = (unsafe { CStr::from_ptr(module) }).to_str() else {
+        return 0;
+    };
+    let Ok(func) = (unsafe { CStr::from_ptr(func) }).to_str() else {
+        return 0;
+    };
+    ffi_guard(0, || match crate::infer_signature_by_name(module, func) {
+        Ok(guess) => {
+            unsafe { out.write(DetoursSignature::from_guess(&guess)) };
+            1
+        }
+        Err(_) => 0,
+    })
+}
+
 #[cfg(test)]
 mod attach_export_tests {
     use super::*;

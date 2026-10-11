@@ -89,6 +89,7 @@ const GP_ARG_REGS: [usize; 2] = [1, 2];
 const REG_SLOTS: usize = GP_ARG_REGS.len();
 
 /// The calling convention the code matches.
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CallingConvention {
     /// The x64 Windows convention (`rcx`, `rdx`, `r8`, `r9`, then the stack).
@@ -104,6 +105,7 @@ pub enum CallingConvention {
 }
 
 /// The rough type of an argument or return value.
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ValueKind {
     /// 8-bit integer (`bool`, `char`, `u8`).
@@ -166,7 +168,8 @@ pub struct SignatureGuess {
 pub enum SignatureError {
     /// A null function pointer was supplied.
     NullPointer,
-    /// The module or export could not be found ([`infer_signature_by_name`]).
+    /// The module could not be loaded or does not have the export
+    /// ([`infer_signature_by_name`]).
     NotFound,
     /// The function's code is not readable.
     UnreadableCode,
@@ -211,12 +214,13 @@ pub unsafe fn infer_signature(func: *const u8) -> Result<SignatureGuess, Signatu
     Ok(analysis.finish())
 }
 
-/// Infers the signature of the export `func` of the loaded module `module`.
+/// Infers the signature of the export `func` of `module`, loading the module
+/// if it is not already present (as [`crate::find_function`] does).
 ///
 /// # Errors
 ///
-/// [`SignatureError::NotFound`] if the module is not loaded or does not export
-/// `func`, otherwise as [`infer_signature`].
+/// [`SignatureError::NotFound`] if the module cannot be loaded or does not
+/// export `func`, otherwise as [`infer_signature`].
 pub fn infer_signature_by_name(module: &str, func: &str) -> Result<SignatureGuess, SignatureError> {
     let address = crate::find_function(module, func).ok_or(SignatureError::NotFound)?;
     // SAFETY: an export of a loaded module is mapped code.
