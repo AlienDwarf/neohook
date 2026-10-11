@@ -243,6 +243,14 @@ pub fn rva_to_mut_ptr<T>(image: &ModuleImage, rva: usize) -> Option<*mut T> {
 /// Reads a NUL-terminated ASCII/UTF-8 string located at `rva`, bounded by the
 /// end of the image.
 pub fn read_c_string_from_rva(image: &ModuleImage, rva: usize) -> Option<String> {
+    let bytes = c_str_bytes_from_rva(image, rva)?;
+    String::from_utf8(bytes.to_vec()).ok()
+}
+
+/// Returns the bytes of the NUL-terminated string at `rva`, without the
+/// terminator, or `None` if it is not terminated inside the image. Allocates
+/// nothing, so it is usable inside the commit suspend window.
+pub(crate) fn c_str_bytes_from_rva(image: &ModuleImage, rva: usize) -> Option<&[u8]> {
     if rva == 0 || rva >= image.size {
         return None;
     }
@@ -255,8 +263,7 @@ pub fn read_c_string_from_rva(image: &ModuleImage, rva: usize) -> Option<String>
         let byte = unsafe { *(cur as *const u8) };
         if byte == 0 {
             let len = cur.checked_sub(start)?;
-            let bytes = unsafe { std::slice::from_raw_parts(start as *const u8, len) };
-            return String::from_utf8(bytes.to_vec()).ok();
+            return Some(unsafe { std::slice::from_raw_parts(start as *const u8, len) });
         }
         cur = cur.checked_add(1)?;
     }

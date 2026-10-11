@@ -247,12 +247,14 @@ unsafe fn find_import_thunk(
             return Err(not_found);
         }
 
-        // Read the DLL name from the Name RVA
-        let dll_name = pe::read_c_string_from_rva(&image.image, desc.Name as usize)
+        // Read the DLL name from the Name RVA. Names are compared as raw bytes:
+        // building a `String` would allocate, and this also runs inside the
+        // commit suspend window.
+        let dll_name = pe::c_str_bytes_from_rva(&image.image, desc.Name as usize)
             .ok_or(InternalIatHookError::MalformedImportDirectory)?;
 
         // Compare the DLL name with the target DLL name (case-insensitive)
-        if dll_name.eq_ignore_ascii_case(target_dll) {
+        if dll_name.eq_ignore_ascii_case(target_dll.as_bytes()) {
             // Here we found the DLL. Now we look for target func
             match unsafe { find_thunk_in_descriptor(image, &desc, target_func) } {
                 Ok(thunk) => return Ok(thunk),
@@ -309,7 +311,7 @@ unsafe fn find_thunk_in_descriptor(
                 .ok_or(InternalIatHookError::MalformedImportDirectory)?;
 
             // If the name matches we retourn the pointer to the IAT slot
-            if func_name == target_func {
+            if func_name == target_func.as_bytes() {
                 return Ok(thunk);
             }
         }
@@ -326,10 +328,10 @@ unsafe fn find_thunk_in_descriptor(
     Err(InternalIatHookError::TargetNotFound)
 }
 
-fn read_import_name(image: &PeImage, import_by_name_rva: usize) -> Option<String> {
+fn read_import_name(image: &PeImage, import_by_name_rva: usize) -> Option<&[u8]> {
     // IMAGE_IMPORT_BY_NAME = WORD Hint; BYTE Name[];
     let name_rva = import_by_name_rva.checked_add(std::mem::size_of::<u16>())?;
-    pe::read_c_string_from_rva(image, name_rva)
+    pe::c_str_bytes_from_rva(image, name_rva)
 }
 
 #[cfg(target_arch = "x86")]
