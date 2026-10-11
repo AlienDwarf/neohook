@@ -1671,6 +1671,10 @@ impl TransactionCore {
                         1,
                     );
 
+                    if !Self::is_plausible_return_address(data, stack_value) {
+                        continue;
+                    }
+
                     if let Some(new_return_addr) =
                         Self::map_redirect_address_exact(data, stack_value)?
                     {
@@ -2043,6 +2047,80 @@ impl TransactionCore {
         );
 
         println!("----------------------------------\n");
+    }
+
+    /// Returns whether a stack word pointing into `data`'s stolen range can be a
+    /// return address: it must not be the entry itself, and the original bytes
+    /// must hold a `call` (`E8 rel32` or `FF /2`) ending exactly at it.
+    ///
+    /// Runs inside the suspend window and allocates nothing. Bytes inside the
+    /// stolen range come from the saved original bytes; bytes before the target
+    /// are read live, but only from the target's own (committed) page.
+    fn is_plausible_return_address(data: &InlineData, value: usize) -> bool {
+        const MAX_CALL_LEN: usize = 7;
+
+        let target_start = data.target as usize;
+        if value <= target_start || value >= target_start + data.stolen_len {
+            return false;
+        }
+
+        // window[k] is the byte at value - k, for k in 1..=available.
+        let mut window = [0u8; MAX_CALL_LEN + 1];
+        let mut available = 0;
+        let page_start = target_start & !0xFFF;
+        for (k, byte) in window.iter_mut().enumerate().skip(1) {
+            let Some(addr) = value.checked_sub(k) else {
+                break;
+            };
+            *byte = if addr >= target_start {
+                match data.orig_bytes.get(addr - target_start) {
+                    Some(&b) => b,
+                    None => break,
+                }
+            } else if addr >= page_start {
+                unsafe { std::ptr::read_volatile(addr as *const u8) }
+            } else {
+                break;
+            };
+            available = k;
+        }
+
+        // call rel32
+        if available >= 5 && window[5] == 0xE8 {
+            return true;
+        }
+
+        // call r/m (FF /2): the opcode at value - len, ModRM (and SIB) after it.
+        for len in 2..=available {
+            if window[len] != 0xFF {
+                continue;
+            }
+            let modrm = window[len - 1];
+            if (modrm >> 3) & 7 != 2 {
+                continue;
+            }
+            let rm = modrm & 7;
+            let encoded_len = match modrm >> 6 {
+                0b11 => 2,
+                0b00 if rm == 5 => 6,
+                0b00 if rm == 4 => {
+                    if len < 3 {
+                        continue;
+                    }
+                    if window[len - 2] & 7 == 5 { 7 } else { 3 }
+                }
+                0b00 => 2,
+                0b01 if rm == 4 => 4,
+                0b01 => 3,
+                _ if rm == 4 => 7,
+                _ => 6,
+            };
+            if encoded_len == len {
+                return true;
+            }
+        }
+
+        false
     }
 
     fn map_redirect_address_exact(
