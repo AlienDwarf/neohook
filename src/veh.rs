@@ -65,6 +65,16 @@ const CONTEXT_DEBUG: u32 = CONTEXT_DEBUG_REGISTERS_X86;
 static SLOT_TARGET: [AtomicUsize; SLOT_COUNT] = [const { AtomicUsize::new(0) }; SLOT_COUNT];
 static SLOT_DETOUR: [AtomicUsize; SLOT_COUNT] = [const { AtomicUsize::new(0) }; SLOT_COUNT];
 
+/// The address neohook last armed in each debug register, kept after the hook
+/// is removed. A breakpoint the handler did not arm itself - another
+/// component's, in a slot neohook never used or at a different address - is
+/// never touched.
+static SLOT_ARMED: [AtomicUsize; SLOT_COUNT] = [const { AtomicUsize::new(0) }; SLOT_COUNT];
+
+/// DR6 bit set by a trap-flag single step (`BS`), as opposed to a debug
+/// register hit.
+const DR6_SINGLE_STEP: DrWord = 0x4000;
+
 /// Ring of recently removed targets, so the handler can still recognise a late
 /// trap from a thread whose stale breakpoint fired just before it was cleared.
 const RETIRED_COUNT: usize = 16;
@@ -244,6 +254,7 @@ impl VehHook {
         // as live only once `SLOT_TARGET` is non-zero, so the detour is always
         // visible by then.
         SLOT_DETOUR[slot].store(detour_addr, Ordering::Release);
+        SLOT_ARMED[slot].store(target_addr, Ordering::Release);
         SLOT_TARGET[slot].store(target_addr, Ordering::Release);
 
         // Arm the breakpoint on every thread now that the slot is published.
@@ -355,13 +366,17 @@ unsafe extern "system" fn veh_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
 
     // No live hook at this address. If DR6 says one of our breakpoint slots
     // fired here, the thread still carries a stale arming from a removed (or
-    // replaced) hook: re-sync that slot in the context and resume.
+    // replaced) hook: re-sync that slot in the context and resume. A slot only
+    // counts as ours if neohook armed this very address in it.
     let ctx = unsafe { &mut *context };
     let hits = ctx.Dr6 & 0xF;
     let mut handled = false;
     for (slot, slot_target) in SLOT_TARGET.iter().enumerate() {
         let fired = hits & ((1 as DrWord) << slot) != 0;
-        if !fired || debug_address(ctx, slot) != fault_addr as DrWord {
+        if !fired
+            || debug_address(ctx, slot) != fault_addr as DrWord
+            || SLOT_ARMED[slot].load(Ordering::Acquire) != fault_addr
+        {
             continue;
         }
         let live = slot_target.load(Ordering::Acquire);
@@ -370,15 +385,20 @@ unsafe extern "system" fn veh_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     }
     // The trap can also be captured after an unhook already rewrote the
     // thread's debug registers, so DR6 is empty or the fired slot no longer
-    // holds the address. Recognise those by the address of a recently removed
-    // hook, and re-sync every slot DR6 reports.
+    // holds the address, or after the slot was re-armed for another target.
+    // Recognise those by the address of a recently removed hook, and re-sync
+    // any fired slot that still holds it. A trap-flag single step is never one
+    // of ours.
     if !handled
+        && ctx.Dr6 & DR6_SINGLE_STEP == 0
         && RETIRED
             .iter()
             .any(|retired| retired.load(Ordering::Acquire) == fault_addr)
     {
         for (slot, slot_target) in SLOT_TARGET.iter().enumerate() {
-            if hits & ((1 as DrWord) << slot) != 0 {
+            if hits & ((1 as DrWord) << slot) != 0
+                && debug_address(ctx, slot) == fault_addr as DrWord
+            {
                 let live = slot_target.load(Ordering::Acquire);
                 program_slot(ctx, slot, live, live != 0);
             }
