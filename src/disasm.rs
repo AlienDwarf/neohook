@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use iced_x86::{
     BlockEncoder, BlockEncoderOptions, Code, Decoder, DecoderOptions, FlowControl, Instruction,
-    InstructionBlock, Mnemonic,
+    InstructionBlock, MemoryOperand, Mnemonic, OpKind, Register,
 };
 
 #[derive(Debug, Clone)]
@@ -16,14 +16,17 @@ pub(crate) struct RelocationMapping {
 /// committed memory region that contains it.
 ///
 /// Returns 0 if the region cannot be queried or is not readable, so callers can
-/// avoid dereferencing unmapped memory.
+/// avoid dereferencing unmapped memory. A `PAGE_GUARD` page also counts as not
+/// readable: reading it would consume the guard and raise
+/// `STATUS_GUARD_PAGE_VIOLATION`.
 ///
 /// # Safety
 /// `address` only needs to be a value to query; it is never dereferenced here.
 pub(crate) unsafe fn readable_bytes_from(address: *const u8) -> usize {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
-        PAGE_EXECUTE_WRITECOPY, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+        PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+        PAGE_WRITECOPY, VirtualQuery,
     };
 
     const READABLE: u32 = PAGE_READONLY
@@ -45,7 +48,10 @@ pub(crate) unsafe fn readable_bytes_from(address: *const u8) -> usize {
         return 0;
     }
 
-    if mbi.State != MEM_COMMIT || (mbi.Protect & READABLE) == 0 {
+    if mbi.State != MEM_COMMIT
+        || (mbi.Protect & READABLE) == 0
+        || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0
+    {
         return 0;
     }
 
@@ -85,6 +91,17 @@ impl Disassembler {
         }
     }
 
+    /// Returns `true` for a direct conditional jump (`jcc`, `loop`, `jrcxz`),
+    /// whose target is in this function. An unconditional `jmp` is not counted:
+    /// it is just as often a tail jump into the next function.
+    fn is_conditional_jump(instr: &Instruction) -> bool {
+        instr.flow_control() == FlowControl::ConditionalBranch
+            && matches!(
+                instr.op0_kind(),
+                OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+            )
+    }
+
     /// Returns `true` for alignment padding emitted between functions:
     /// `int3` and (multi-byte) `nop`.
     fn is_padding(instr: &Instruction) -> bool {
@@ -97,7 +114,10 @@ impl Disassembler {
     /// reached before `min_size` bytes are covered, the range may only extend
     /// over `int3` / `nop` padding after it. Otherwise the bytes that follow
     /// belong to other code (typically the next function), overwriting them
-    /// would corrupt it, and an error is returned.
+    /// would corrupt it, and an error is returned. An earlier branch that jumps
+    /// past such an instruction (an early-exit `jcc` over a `ret`) shows that
+    /// the bytes after it are still this function's, so it does not end the
+    /// function there; the relocation retargets that branch.
     ///
     /// # Safety
     /// The caller must ensure that `address` is a valid pointer
@@ -137,6 +157,11 @@ impl Disassembler {
         // Set once an instruction that ends the function has been decoded;
         // from then on only padding may be covered.
         let mut function_ended = false;
+        // Furthest address a conditional jump decoded so far jumps to. Only
+        // targets within the bytes decoded here count: a jump further away is
+        // a conditional tail call into another function, not an early exit.
+        let mut branch_reach = 0u64;
+        let window_end = address as u64 + read_len as u64;
 
         // Decode instructions until we have at least min_size bytes or we run out of instructions to decode
         while decoder.can_decode() && total_bytes < min_size {
@@ -163,7 +188,12 @@ impl Disassembler {
                 return Ok(total_bytes);
             }
 
-            if Self::ends_function(&instruction) {
+            if Self::is_conditional_jump(&instruction)
+                && instruction.near_branch_target() < window_end
+            {
+                branch_reach = branch_reach.max(instruction.near_branch_target());
+            }
+            if Self::ends_function(&instruction) && branch_reach < instruction.next_ip() {
                 function_ended = true;
             }
         }
@@ -172,6 +202,68 @@ impl Disassembler {
             "Error calculating instruction length: not enough instructions to cover min_size"
                 .to_string(),
         )
+    }
+
+    /// Emulates a relative `call` whose target lies inside the stolen range
+    /// `[start, end]` (typically the get-PC idiom `call $+5; pop reg`).
+    ///
+    /// Such a call reads its own return address, so relocating it unchanged
+    /// would push an address inside the trampoline and break the
+    /// position-independent code that uses it. Instead it is replaced by a
+    /// sequence that pushes the **original** return address and jumps to the
+    /// target (the relocated copy if the target was stolen, the original code if
+    /// it is `end`):
+    ///
+    /// - x86: `push imm32; jmp target`
+    /// - x64: `push imm32` (sign-extended low half); `mov dword [rsp+4], hi`;
+    ///   `jmp target`
+    ///
+    /// Neither sequence modifies flags or registers other than the stack
+    /// pointer, matching the `call`. The first instruction keeps the call's IP so
+    /// thread IP redirection maps a thread at the call to the start of the
+    /// sequence. A target strictly inside the range that is not an instruction
+    /// boundary cannot be reproduced and is rejected.
+    ///
+    /// Returns `None` for any other instruction.
+    fn emulate_get_pc_call(
+        instr: &Instruction,
+        decoded: &[Instruction],
+        start: u64,
+        end: u64,
+        jmp_code: Code,
+    ) -> Result<Option<Vec<Instruction>>, String> {
+        if !matches!(instr.code(), Code::Call_rel32_32 | Code::Call_rel32_64) {
+            return Ok(None);
+        }
+        let call_target = instr.near_branch_target();
+        if call_target < start || call_target > end {
+            return Ok(None);
+        }
+        if call_target != end && !decoded.iter().any(|i| i.ip() == call_target) {
+            return Err(
+                "Relocation failed: call into the middle of a relocated instruction".to_string(),
+            );
+        }
+
+        let ret_addr = instr.next_ip();
+        let err = |_| "Relocation failed: cannot emulate call to stolen code".to_string();
+        let mut seq = Vec::with_capacity(3);
+        if instr.code() == Code::Call_rel32_32 {
+            seq.push(Instruction::with1(Code::Pushd_imm32, ret_addr as u32).map_err(err)?);
+        } else {
+            seq.push(Instruction::with1(Code::Pushq_imm32, ret_addr as u32 as i32).map_err(err)?);
+            seq.push(
+                Instruction::with2(
+                    Code::Mov_rm32_imm32,
+                    MemoryOperand::with_base_displ(Register::RSP, 4),
+                    (ret_addr >> 32) as u32,
+                )
+                .map_err(err)?,
+            );
+        }
+        seq[0].set_ip(instr.ip());
+        seq.push(Instruction::with_branch(jmp_code, call_target).map_err(err)?);
+        Ok(Some(seq))
     }
 
     /// Relocates a block of instructions from `target` to `trampoline`,
@@ -204,7 +296,7 @@ impl Disassembler {
         let mut decoder =
             Decoder::with_ip(bitness, code_slice, target as u64, DecoderOptions::NONE);
 
-        let mut instructions = Vec::new();
+        let mut decoded = Vec::new();
         let mut old_instruction_offsets = Vec::new();
 
         while decoder.can_decode() {
@@ -222,10 +314,8 @@ impl Disassembler {
             })?;
 
             old_instruction_offsets.push(old_off);
-            instructions.push(instr);
+            decoded.push(instr);
         }
-
-        let original_instruction_count = instructions.len();
 
         let return_addr = target as u64 + stolen_len as u64;
         let jmp_code = if bitness == 64 {
@@ -233,6 +323,23 @@ impl Disassembler {
         } else {
             Code::Jmp_rel32_32
         };
+
+        // The block handed to the encoder. An original instruction may expand to
+        // several block instructions; `block_index[i]` is the block index of the
+        // first one emitted for original instruction `i`, which carries its
+        // original IP so branches to it (and the offset map) resolve to it.
+        let mut instructions = Vec::with_capacity(decoded.len() + 4);
+        let mut block_index = Vec::with_capacity(decoded.len());
+        for instr in &decoded {
+            block_index.push(instructions.len());
+            if let Some(seq) =
+                Self::emulate_get_pc_call(instr, &decoded, target as u64, return_addr, jmp_code)?
+            {
+                instructions.extend(seq);
+            } else {
+                instructions.push(*instr);
+            }
+        }
 
         let jmp_back = Instruction::with_branch(jmp_code, return_addr)
             .map_err(|_| "Error while creating JMP back".to_string())?;
@@ -246,14 +353,16 @@ impl Disassembler {
         )
         .map_err(|e| format!("Relocation failed: {}", e))?;
 
-        if result.new_instruction_offsets.len() < original_instruction_count {
+        if result.new_instruction_offsets.len() < instructions.len() {
             return Err(
                 "Relocation failed: encoder returned incomplete instruction offsets".to_string(),
             );
         }
 
-        let new_instruction_offsets =
-            result.new_instruction_offsets[..original_instruction_count].to_vec();
+        let new_instruction_offsets: Vec<u32> = block_index
+            .iter()
+            .map(|&i| result.new_instruction_offsets[i])
+            .collect();
 
         // `iced` reports `u32::MAX` for an original instruction it could not place
         // at a tracked offset - e.g. a short-only branch (`jrcxz`/`jcxz`/`loop`)
@@ -288,6 +397,30 @@ impl Disassembler {
 #[cfg(test)]
 mod tests {
     use crate::disasm::Disassembler;
+
+    #[test]
+    fn get_instruction_len_continues_past_a_ret_a_branch_jumps_over() {
+        // stc; jc +1; ret; mov eax, 42; ret
+        let code = [0xF9u8, 0x72, 0x01, 0xC3, 0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3];
+        let len = unsafe { Disassembler::get_instruction_len(code.as_ptr(), 5) };
+        assert_eq!(len, Ok(9));
+        // Without the branch the ret ends the function.
+        let code = [0xF9u8, 0x90, 0x90, 0xC3, 0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3];
+        assert!(unsafe { Disassembler::get_instruction_len(code.as_ptr(), 5) }.is_err());
+    }
+
+    #[test]
+    fn get_instruction_len_stops_at_a_ret_after_a_conditional_tail_call() {
+        // test ecx, ecx; jne +0x1000 (another function); xor eax, eax; ret;
+        // then the next function: mov eax, 42; ret.
+        let mut code = [0xCCu8; 48];
+        code[..17].copy_from_slice(&[
+            0x85, 0xC9, 0x0F, 0x85, 0x00, 0x10, 0x00, 0x00, 0x31, 0xC0, 0xC3, 0xB8, 0x2A, 0x00,
+            0x00, 0x00, 0xC3,
+        ]);
+        // A 14-byte patch would run into the next function.
+        assert!(unsafe { Disassembler::get_instruction_len(code.as_ptr(), 14) }.is_err());
+    }
 
     #[test]
     fn get_instruction_len_on_nops() {
@@ -327,7 +460,9 @@ mod tests {
     fn relocate_preserves_relative_call_target() {
         use iced_x86::{Decoder, DecoderOptions};
 
-        let code = [0xE8, 0x00, 0x00, 0x00, 0x00]; // call next instruction
+        // call $+0x15: a target outside the stolen range stays a call to it.
+        let mut code = [0x90u8; 32];
+        code[..5].copy_from_slice(&[0xE8, 0x10, 0x00, 0x00, 0x00]);
         let mut tramp = [0u8; 64];
 
         unsafe {
@@ -344,7 +479,8 @@ mod tests {
             Decoder::with_ip(bitness, &tramp, tramp.as_ptr() as u64, DecoderOptions::NONE);
 
         let instr = decoder.decode();
-        assert_eq!(instr.near_branch_target(), code.as_ptr() as u64 + 5);
+        assert_eq!(instr.mnemonic(), iced_x86::Mnemonic::Call);
+        assert_eq!(instr.near_branch_target(), code.as_ptr() as u64 + 0x15);
     }
 
     #[test]
@@ -401,6 +537,76 @@ mod tests {
             original_target,
             "RIP-relative operand must still resolve to the same absolute address after relocation"
         );
+    }
+
+    /// Allocates a page of `nop`s ending in `ret` and protects it with
+    /// `protect`.
+    unsafe fn code_page(protect: u32) -> *mut u8 {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualProtect,
+        };
+        unsafe {
+            let page = VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            ) as *mut u8;
+            assert!(!page.is_null(), "setup allocation failed");
+            std::ptr::write_bytes(page, 0x90, 4096);
+            *page.add(4095) = 0xC3;
+            let mut old = 0u32;
+            assert_ne!(VirtualProtect(page as _, 4096, protect, &mut old), 0);
+            page
+        }
+    }
+
+    unsafe fn protect_of(addr: *const u8) -> u32 {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        unsafe {
+            let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let q = VirtualQuery(
+                addr as _,
+                &mut mbi,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            );
+            assert_ne!(q, 0, "VirtualQuery failed");
+            mbi.Protect
+        }
+    }
+
+    /// Reading a guard page consumes its guard (and raises
+    /// STATUS_GUARD_PAGE_VIOLATION), so guard and no-access pages must not be
+    /// reported as readable, and hooking into one must fail without touching it.
+    #[test]
+    fn guard_and_noaccess_pages_are_not_readable() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_RELEASE, PAGE_EXECUTE_READ, PAGE_GUARD, PAGE_NOACCESS, VirtualFree,
+        };
+        extern "C" fn detour() {}
+        for protect in [PAGE_EXECUTE_READ | PAGE_GUARD, PAGE_NOACCESS] {
+            unsafe {
+                let page = code_page(protect);
+                assert_eq!(
+                    super::readable_bytes_from(page),
+                    0,
+                    "protection {protect:#x} must not count as readable"
+                );
+                assert!(Disassembler::get_instruction_len(page, 5).is_err());
+
+                let mut tx = crate::DetourTransaction::begin();
+                let res = tx.attach(page, detour as *const u8);
+                tx.abort();
+                assert!(res.is_err(), "attach must fail cleanly, got {res:?}");
+
+                assert_eq!(
+                    protect_of(page),
+                    protect,
+                    "the page protection (guard bit) must be untouched"
+                );
+                assert_ne!(VirtualFree(page as _, 0, MEM_RELEASE), 0);
+            }
+        }
     }
 
     #[test]
@@ -646,7 +852,7 @@ mod tests {
         // instruction; those are covered by the no-crash / valid-re-decode
         // invariants in the fuzzer rather than this single-instruction check.
         let mut cases: Vec<Vec<u8>> = vec![
-            vec![0xE8, 0x00, 0x00, 0x00, 0x00], // call rel32 ($+5)
+            vec![0xE8, 0x10, 0x00, 0x00, 0x00], // call rel32 ($+0x15)
             vec![0xE9, 0x40, 0x00, 0x00, 0x00], // jmp rel32
             vec![0xEB, 0x10],                   // jmp rel8
         ];
@@ -691,6 +897,64 @@ mod tests {
                 "relocation changed the absolute target for {code:02X?}"
             );
         }
+    }
+
+    /// Relocates `call $+5; pop eax/rax; ret` (`stolen_len` bytes of it) from
+    /// an executable page into a trampoline on the next page, runs the
+    /// trampoline and returns `(source, value it returned, mapping, tramp)`.
+    fn run_relocated_get_pc(
+        stolen_len: usize,
+    ) -> (usize, usize, super::RelocationMapping, Vec<u8>) {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const CODE: [u8; 7] = [0xE8, 0x00, 0x00, 0x00, 0x00, 0x58, 0xC3];
+        unsafe {
+            let base = VirtualAlloc(
+                std::ptr::null(),
+                0x2000,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            ) as *mut u8;
+            assert!(!base.is_null(), "setup allocation failed");
+            std::ptr::write_bytes(base, 0xCC, 0x2000);
+            std::ptr::copy_nonoverlapping(CODE.as_ptr(), base, CODE.len());
+            let tramp = base.add(0x1000);
+
+            let map = Disassembler::relocate(base, tramp, stolen_len).expect("relocation failed");
+            let run: extern "C" fn() -> usize = std::mem::transmute(tramp);
+            let got = run();
+            let bytes = std::slice::from_raw_parts(tramp, map.written_len).to_vec();
+            assert_ne!(VirtualFree(base as _, 0, MEM_RELEASE), 0);
+            (base as usize, got, map, bytes)
+        }
+    }
+
+    /// The get-PC idiom must read the original return address, not one inside
+    /// the trampoline, whether the `pop` was stolen too or not.
+    #[test]
+    fn relocated_get_pc_sees_original_return_address() {
+        for stolen_len in [5, 7] {
+            let (src, got, map, tramp) = run_relocated_get_pc(stolen_len);
+            assert_eq!(got, src + 5, "stolen_len={stolen_len}");
+            assert_eq!(map.new_instruction_offsets[0], 0);
+            if stolen_len == 7 {
+                assert_eq!(map.old_instruction_offsets, vec![0, 5, 6]);
+                assert_eq!(tramp[map.new_instruction_offsets[1] as usize], 0x58);
+                assert_eq!(tramp[map.new_instruction_offsets[2] as usize], 0xC3);
+            }
+        }
+    }
+
+    /// A call into the middle of a stolen instruction cannot be reproduced in
+    /// the trampoline and must be refused.
+    #[test]
+    fn relocate_rejects_call_into_middle_of_stolen_instruction() {
+        // call $+6 (into the imm32 of the following mov eax, imm32)
+        let code = [0xE8u8, 0x01, 0x00, 0x00, 0x00, 0xB8, 0x11, 0x22, 0x33, 0x44];
+        let mut tramp = [0u8; 64];
+        let res = unsafe { Disassembler::relocate(code.as_ptr(), tramp.as_mut_ptr(), code.len()) };
+        assert!(res.is_err(), "got {res:?}");
     }
 
     /// Regression (found by the relocator fuzzer): `jrcxz`/`jcxz`/`loop*` have no

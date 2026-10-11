@@ -25,7 +25,7 @@ typedef struct DetourTransaction DetourTransaction;
  * Unlike VEH hooks (capped at four by the hardware debug registers), the only
  * limit here is the size of the lock-free slot table read by the handler.
  */
-#define MAX_HOOKS 256
+#define INT3_MAX_HOOKS 256
 
 /**
  * A registered delay / on-load hook.
@@ -41,9 +41,9 @@ typedef struct DelayHook DelayHook;
  * An installed INT3 software-breakpoint hook.
  *
  * The hook stays active until it is explicitly removed with [`Self::unhook`]
- * or dropped, at which point the original byte is restored. The vectored
- * handler stays registered so a thread that trapped just before the removal
- * is still resumed safely.
+ * or dropped, at which point the original byte is restored. A thread that
+ * trapped just before the removal is still resumed safely; the vectored
+ * handler is removed with the last hook once no such thread remains.
  */
 typedef struct Int3Hook Int3Hook;
 
@@ -60,9 +60,9 @@ typedef struct MidHook MidHook;
  * An installed VEH (hardware-breakpoint) hook.
  *
  * The hook stays active until it is explicitly removed with [`Self::unhook`]
- * or dropped, at which point the breakpoint is cleared on every thread. The
- * vectored handler stays registered so it can disarm any thread that still
- * traps on the stale breakpoint.
+ * or dropped, at which point the breakpoint is cleared on every thread. A
+ * thread that still traps on the stale breakpoint is disarmed by the vectored
+ * handler, which is removed with the last hook once no such thread remains.
  */
 typedef struct VehHook VehHook;
 
@@ -104,9 +104,8 @@ typedef struct Xmm {
  * The field order matches the order in which the stub saves the state, so the
  * pointer passed to the handler aliases this layout exactly. A handler may read
  * any field to observe the live value, or write any field to change the
- * register before the original instructions resume. `rsp` is captured for
- * inspection but writing it has no effect (the stack pointer is managed by the
- * stub).
+ * register before the original instructions resume. `rsp` is not captured -
+ * there is no `rsp` field, because the stack pointer is managed by the stub.
  *
  * `xmm` holds `XMM0`..`XMM15` in order, and `mxcsr` holds the SSE
  * control/status word. The x87 stack registers are not captured (see the
@@ -211,7 +210,7 @@ typedef struct HookContext {
  * indefinitely or unwind across the FFI boundary.
  *
  * The handler uses the C calling convention (`__cdecl` on x86), like the rest
- * of the C ABI.
+ * of the C ABI. Pass `NULL` and installation fails.
  */
 typedef void (*MidHookHandler)(struct HookContext *context);
 
@@ -296,15 +295,23 @@ uint8_t *detours_transaction_attach(DetourTransaction *tx, uint8_t *target, cons
  * transaction commits.
  *
  * On success, the selected hook is removed from `handle` during commit. The
- * handle remains valid and any other hooks stored in it remain active.
+ * handle remains valid and any other hooks stored in it remain active. Indices
+ * are stable: the detached hook leaves an empty slot behind, so every other
+ * index keeps naming the same hook and `detours_handle_len()` does not change.
+ * Every `detours_handle_*` accessor treats an empty slot like an out-of-range
+ * index, and it cannot be detached again.
  *
  * Returns `1` if the detach was queued, or `0` if `tx`/`handle` is null, the
- * transaction is no longer pending, or `idx` is out of bounds.
+ * transaction is no longer pending, or `idx` is out of bounds or names an
+ * already detached hook.
  *
  * # Safety
  * `tx` must be a valid transaction pointer returned by
  * `detours_transaction_begin()`. `handle` must be a valid handle returned by
- * `detours_transaction_commit()`.
+ * `detours_transaction_commit()`, and it must stay valid until `tx` is
+ * committed or aborted: freeing it in between (for example with
+ * `detours_handle_unhook_and_free`) leaves the queued detach pointing at freed
+ * memory.
  */
 int32_t detours_transaction_detach(DetourTransaction *tx, void *handle, uintptr_t idx);
 
@@ -326,7 +333,12 @@ int32_t detours_transaction_detach(DetourTransaction *tx, void *handle, uintptr_
 void *detours_transaction_commit(DetourTransaction *tx);
 
 /**
- * Returns the number of installed hooks stored in an opaque hook handle.
+ * Returns the number of hook slots in an opaque hook handle.
+ *
+ * This is the number of hooks the handle was committed with. Detaching a hook
+ * with `detours_transaction_detach()` empties its slot without shrinking the
+ * handle, so indices stay valid; the `detours_handle_*` accessors treat an
+ * emptied slot like an out-of-range index.
  *
  * Returns `0` if `handle` is null.
  *
@@ -342,7 +354,8 @@ uintptr_t detours_handle_len(void *handle);
  * For inline hooks, this is the trampoline entry managed by NeoHook.
  * For IAT hooks, this is the original imported function pointer.
  *
- * Returns null if `handle` is null or if `idx` is out of bounds.
+ * Returns null if `handle` is null, if `idx` is out of bounds or if the hook
+ * at `idx` was detached.
  *
  * # Safety
  * `handle` must be a valid handle previously returned by
@@ -358,8 +371,8 @@ const uint8_t *detours_handle_get_original_ptr(void *handle, uintptr_t idx);
  * installed; enabling re-applies the detour. This is cheaper than a full
  * unhook/rehook cycle.
  *
- * Returns `1` on success, `0` if `handle` is null, `idx` is out of bounds, or
- * the toggle failed.
+ * Returns `1` on success, `0` if `handle` is null, `idx` is out of bounds,
+ * the hook at `idx` was detached, or the toggle failed.
  *
  * # Safety
  * `handle` must be a valid handle previously returned by
@@ -369,7 +382,8 @@ int32_t detours_handle_set_enabled(void *handle, uintptr_t idx, int32_t enabled)
 
 /**
  * Returns `1` if the hook at `idx` is currently enabled, `0` otherwise (also
- * `0` if `handle` is null or `idx` is out of bounds).
+ * `0` if `handle` is null, `idx` is out of bounds or the hook at `idx` was
+ * detached).
  *
  * # Safety
  * `handle` must be a valid handle previously returned by
@@ -872,7 +886,8 @@ int32_t detours_veh_unhook(struct VehHook *hook);
  *
  * # Safety
  * `target` must point at the start of a real instruction in executable memory,
- * and `handler` must be a valid context-handler function pointer.
+ * and `handler`, when non-null, must be a valid context-handler function
+ * pointer.
  */
 struct MidHook *detours_midhook_install(const uint8_t *target, MidHookHandler handler);
 

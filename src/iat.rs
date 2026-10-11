@@ -95,7 +95,6 @@ struct ModuleImage {
     /// Validated base/size view, shared with the generic PE helpers.
     image: PeImage,
     import_dir_rva: usize,
-    import_dir_size: usize,
 }
 
 pub struct IatHook;
@@ -206,17 +205,15 @@ unsafe fn parse_loaded_module(h_module: HMODULE) -> Result<ModuleImage, Internal
     // already bounds the data directory lookup below to the image size.
     let image = pe::parse_module_image(h_module)?;
 
-    // Get the Import Directory entry from the Data Directory. `data_directory`
-    // returns `None` when the directory is absent, empty, or extends beyond the
-    // image bounds, all of which mean there is no usable import table.
-    let (import_dir_rva, import_dir_size) =
-        pe::data_directory(&image, IMAGE_DIRECTORY_ENTRY_IMPORT as usize)
-            .ok_or(InternalIatHookError::NoImportDirectory)?;
+    // Get the Import Directory RVA from the Data Directory. Its `Size` is not
+    // used: the loader walks descriptors up to the zero terminator, so an
+    // understated size must not hide later DLLs.
+    let import_dir_rva = pe::data_directory_rva(&image, IMAGE_DIRECTORY_ENTRY_IMPORT as usize)
+        .ok_or(InternalIatHookError::NoImportDirectory)?;
 
     Ok(ModuleImage {
         image,
         import_dir_rva,
-        import_dir_size,
     })
 }
 
@@ -233,18 +230,9 @@ unsafe fn find_import_thunk(
     // Its error is reported only if no later descriptor has the import.
     let mut not_found = InternalIatHookError::TargetNotFound;
 
-    // Calculate the end RVA of the import directory
-    let desc_end = image
-        .import_dir_rva
-        .checked_add(image.import_dir_size)
-        .ok_or(InternalIatHookError::MalformedImportDirectory)?;
-
-    // Loop through the IMAGE_IMPORT_DESCRIPTORs until we find the target DLL or reach the end
-    while desc_rva
-        .checked_add(std::mem::size_of::<IMAGE_IMPORT_DESCRIPTOR>())
-        .ok_or(InternalIatHookError::MalformedImportDirectory)?
-        <= desc_end
-    {
+    // Loop through the IMAGE_IMPORT_DESCRIPTORs until we find the target DLL or
+    // reach the zero terminator. A descriptor outside the image ends the walk.
+    loop {
         // Get a pointer to the current IMAGE_IMPORT_DESCRIPTOR
         let import_desc = pe::rva_to_ptr::<IMAGE_IMPORT_DESCRIPTOR>(&image.image, desc_rva)
             .ok_or(InternalIatHookError::MalformedImportDirectory)?;
@@ -259,12 +247,14 @@ unsafe fn find_import_thunk(
             return Err(not_found);
         }
 
-        // Read the DLL name from the Name RVA
-        let dll_name = pe::read_c_string_from_rva(&image.image, desc.Name as usize)
+        // Read the DLL name from the Name RVA. Names are compared as raw bytes:
+        // building a `String` would allocate, and this also runs inside the
+        // commit suspend window.
+        let dll_name = pe::c_str_bytes_from_rva(&image.image, desc.Name as usize)
             .ok_or(InternalIatHookError::MalformedImportDirectory)?;
 
         // Compare the DLL name with the target DLL name (case-insensitive)
-        if dll_name.eq_ignore_ascii_case(target_dll) {
+        if dll_name.eq_ignore_ascii_case(target_dll.as_bytes()) {
             // Here we found the DLL. Now we look for target func
             match unsafe { find_thunk_in_descriptor(image, &desc, target_func) } {
                 Ok(thunk) => return Ok(thunk),
@@ -278,8 +268,6 @@ unsafe fn find_import_thunk(
             .checked_add(std::mem::size_of::<IMAGE_IMPORT_DESCRIPTOR>())
             .ok_or(InternalIatHookError::MalformedImportDirectory)?;
     }
-
-    Err(InternalIatHookError::MalformedImportDirectory)
 }
 
 /// Searches the import name table of one descriptor for `target_func` and
@@ -323,7 +311,7 @@ unsafe fn find_thunk_in_descriptor(
                 .ok_or(InternalIatHookError::MalformedImportDirectory)?;
 
             // If the name matches we retourn the pointer to the IAT slot
-            if func_name == target_func {
+            if func_name == target_func.as_bytes() {
                 return Ok(thunk);
             }
         }
@@ -340,10 +328,10 @@ unsafe fn find_thunk_in_descriptor(
     Err(InternalIatHookError::TargetNotFound)
 }
 
-fn read_import_name(image: &PeImage, import_by_name_rva: usize) -> Option<String> {
+fn read_import_name(image: &PeImage, import_by_name_rva: usize) -> Option<&[u8]> {
     // IMAGE_IMPORT_BY_NAME = WORD Hint; BYTE Name[];
     let name_rva = import_by_name_rva.checked_add(std::mem::size_of::<u16>())?;
-    pe::read_c_string_from_rva(image, name_rva)
+    pe::c_str_bytes_from_rva(image, name_rva)
 }
 
 #[cfg(target_arch = "x86")]

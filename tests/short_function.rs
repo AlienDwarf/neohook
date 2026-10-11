@@ -64,6 +64,23 @@ mod tests {
         )
     }
 
+    /// An early-exit prologue: `stc; jc 1f; ret; 1: mov eax, 42; ret`. The
+    /// `ret` comes before the patch size is covered, but the branch jumps past
+    /// it, so the code after the `ret` still belongs to this function.
+    #[unsafe(naked)]
+    extern "C" fn early_ret_with_branch_past_it() -> u32 {
+        naked_asm!(
+            "stc",
+            "jc 2f",
+            "ret",
+            "2:",
+            "mov eax, 42",
+            "ret",
+            "mov eax, 9",
+            "ret",
+        )
+    }
+
     extern "C" fn detour_ret() -> u32 {
         std::hint::black_box(7)
     }
@@ -108,6 +125,37 @@ mod tests {
         );
         assert_eq!(neighbour(), 42, "the following function must still work");
         assert_eq!(tiny_then_neighbour(), 0);
+    }
+
+    #[test]
+    fn early_ret_with_a_branch_past_it_can_be_hooked() {
+        let target = early_ret_with_branch_past_it as *mut u8;
+        let before = snapshot(target, 10);
+        assert_eq!(early_ret_with_branch_past_it(), 42);
+
+        let mut tx = DetourTransaction::begin();
+        let original = tx
+            .attach(target, detour_ret as *const u8)
+            .expect("a ret that a branch jumps past does not end the function");
+        let hooks = tx.commit().expect("commit failed");
+
+        let original: RetFn = unsafe { std::mem::transmute(original) };
+        assert_eq!(
+            early_ret_with_branch_past_it(),
+            7,
+            "target must be detoured"
+        );
+        assert_eq!(original(), 42, "trampoline must take the relocated branch");
+
+        for hook in hooks {
+            hook.unhook().expect("unhook failed");
+        }
+        assert_eq!(
+            snapshot(target, 10),
+            before,
+            "unhook must restore the bytes"
+        );
+        assert_eq!(early_ret_with_branch_past_it(), 42);
     }
 
     #[test]

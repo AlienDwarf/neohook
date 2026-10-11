@@ -3,39 +3,14 @@
 use std::ffi::CString;
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::LibraryLoader::*;
-use windows_sys::Win32::System::SystemServices::*;
-
-// --- Architecture-specific imports ---
-#[cfg(target_arch = "x86")]
-use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS32 as IMAGE_NT_HEADERS;
-
-#[cfg(target_arch = "x86_64")]
-use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64 as IMAGE_NT_HEADERS;
 
 pub fn get_module_size(h_module: HMODULE) -> u32 {
-    // Reworked function. Now we read the PE headers to get the size of the module instead of using VirtualQuery,
-    // which can be unreliable for modules with non-standard memory layouts (e.g., due to ASLR, rebasing, or custom section alignments).
-
-    // safety check
-    if h_module.is_null() {
-        return 0;
-    }
-
-    let dos_header = h_module as *const IMAGE_DOS_HEADER;
-
-    // validation: Is this a valid PE Module?
-    unsafe {
-        if (*dos_header).e_magic != IMAGE_DOS_SIGNATURE {
-            return 0;
-        }
-    }
-
-    // Go to nt header
-    let nt_headers =
-        unsafe { (h_module as usize + (*dos_header).e_lfanew as usize) as *const IMAGE_NT_HEADERS };
-
-    // Now we can read the SizeOfImage from the optional header to get the size
-    (unsafe { *nt_headers }).OptionalHeader.SizeOfImage
+    // Read SizeOfImage from the PE headers instead of using VirtualQuery, which
+    // can be unreliable for modules with non-standard memory layouts. The shared
+    // parser validates the headers first, so a non-module address yields 0.
+    crate::pe::parse_module_image(h_module)
+        .map(|image| image.size as u32)
+        .unwrap_or(0)
 }
 
 pub fn find_function(module_name: &str, function_name: &str) -> Option<*const u8> {

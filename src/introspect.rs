@@ -22,6 +22,10 @@ const IMAGE_ORDINAL_FLAG: usize = 0x8000_0000;
 #[cfg(target_arch = "x86_64")]
 const IMAGE_ORDINAL_FLAG: usize = 1usize << 63;
 
+// How many times `enumerate_modules` retries a snapshot that raced a module
+// load or unload.
+const SNAPSHOT_ATTEMPTS: usize = 10;
+
 /// A module loaded in the current process.
 #[derive(Clone, Debug)]
 pub struct ModuleInfo {
@@ -67,8 +71,15 @@ pub fn enumerate_modules() -> Vec<ModuleInfo> {
 
     // Snapshot the modules of the current process (pid 0 == self). Both the
     // native and 32-bit module lists are requested so a WoW64 process sees all
-    // of its modules.
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, 0) };
+    // of its modules. The snapshot fails with ERROR_BAD_LENGTH while another
+    // thread is loading or unloading a module, so retry a bounded number of times.
+    let mut snapshot = INVALID_HANDLE_VALUE;
+    for _ in 0..SNAPSHOT_ATTEMPTS {
+        snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, 0) };
+        if snapshot != INVALID_HANDLE_VALUE || unsafe { GetLastError() } != ERROR_BAD_LENGTH {
+            break;
+        }
+    }
     if snapshot == INVALID_HANDLE_VALUE {
         return modules;
     }
@@ -148,6 +159,16 @@ pub unsafe fn enumerate_exports(h_module: HMODULE) -> Result<Vec<ExportInfo>, Pe
     let names_rva = dir.AddressOfNames as usize;
     let name_ordinals_rva = dir.AddressOfNameOrdinals as usize;
 
+    // The counts come from the image, so every table must fit inside it before
+    // anything is sized from them.
+    let tables_fit = array_fits(&image, functions_rva, number_of_functions, 4)
+        && (number_of_names == 0
+            || (array_fits(&image, names_rva, number_of_names, 4)
+                && array_fits(&image, name_ordinals_rva, number_of_names, 2)));
+    if !tables_fit {
+        return Ok(exports);
+    }
+
     // Build a map from function-table index -> export name by walking the
     // parallel AddressOfNames / AddressOfNameOrdinals arrays.
     let mut names: Vec<Option<String>> = vec![None; number_of_functions];
@@ -186,8 +207,13 @@ pub unsafe fn enumerate_exports(h_module: HMODULE) -> Result<Vec<ExportInfo>, Pe
             None
         };
 
+        // Skip entries whose biased ordinal does not fit in 32 bits.
+        let Some(ordinal) = ordinal_base.checked_add(func_index as u32) else {
+            continue;
+        };
+
         exports.push(ExportInfo {
-            ordinal: ordinal_base + func_index as u32,
+            ordinal,
             name,
             address: (image.base_address + func_rva) as *const u8,
             forwarder,
@@ -211,8 +237,9 @@ pub unsafe fn enumerate_imports(h_module: HMODULE) -> Result<Vec<ImportInfo>, Pe
 
     let mut imports = Vec::new();
 
-    let Some((import_rva, _import_size)) =
-        pe::data_directory(&image, IMAGE_DIRECTORY_ENTRY_IMPORT as usize)
+    // The descriptor array ends at its zero terminator, not at the directory
+    // `Size`; each descriptor read below is bounded by the image instead.
+    let Some(import_rva) = pe::data_directory_rva(&image, IMAGE_DIRECTORY_ENTRY_IMPORT as usize)
     else {
         return Ok(imports);
     };
@@ -277,6 +304,15 @@ pub unsafe fn enumerate_imports(h_module: HMODULE) -> Result<Vec<ImportInfo>, Pe
     }
 
     Ok(imports)
+}
+
+/// Returns `true` if `count` elements of `elem_size` bytes starting at `rva`
+/// lie within the image.
+fn array_fits(image: &pe::ModuleImage, rva: usize, count: usize, elem_size: usize) -> bool {
+    count
+        .checked_mul(elem_size)
+        .and_then(|len| rva.checked_add(len))
+        .is_some_and(|end| end <= image.size)
 }
 
 /// Reads the `index`-th `u32` of an array located at `base_rva`, bounds-checked.

@@ -102,3 +102,31 @@ fn reused_call_site_rejects_a_second_live_hook() {
     drop(hooks);
     assert_eq!(first(6, 7), 13, "first hook removed");
 }
+
+#[test]
+fn reused_call_site_rejects_a_second_hook_while_the_first_is_disabled() {
+    let _serial = serial();
+
+    let first: BinOp = first_target;
+    let second: BinOp = second_target;
+
+    let mut hooks = hook_plus_1000(first_target).expect("first install");
+    hooks[0].disable().expect("disable");
+    assert_eq!(first(6, 7), 13, "disabled hook runs the original");
+
+    // The disabled hook is still installed and owns the call site's state.
+    let second_install = hook_plus_1000(second_target);
+    let rejected = second_install.is_err();
+    drop(second_install);
+
+    hooks[0].enable().expect("enable");
+    let first_result = first(6, 7);
+    drop(hooks);
+
+    assert!(rejected, "a call site can only drive one installed hook");
+    assert_eq!(
+        first_result, 1013,
+        "the re-enabled first hook must still forward to first_target"
+    );
+    assert_eq!(second(6, 7), 42);
+}

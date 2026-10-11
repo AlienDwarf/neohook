@@ -20,6 +20,7 @@ mod disasm;
 mod eat;
 mod gateway;
 mod iat;
+mod inflight;
 mod int3;
 mod introspect;
 mod mem;
@@ -319,6 +320,13 @@ macro_rules! detour_helper {
 ///
 /// assert_eq!(add(2, 3), 50);
 /// ```
+/// Whether an inline hook is installed at `target`, enabled or not. Used by
+/// [`detour_closure!`]; not part of the public API.
+#[doc(hidden)]
+pub fn __inline_hook_installed_at(target: *const u8) -> bool {
+    crate::transaction::live_patch_starts_at(target)
+}
+
 #[macro_export]
 macro_rules! detour_closure {
     (
@@ -364,13 +372,13 @@ macro_rules! detour_closure {
         let __boxed: ::std::boxed::Box<__ClosureBox> =
             ::std::boxed::Box::new(::std::boxed::Box::new($closure));
         let __target = $target as *mut u8;
+        // Where `attach` will patch: it follows the same jump thunks.
+        let __patched = unsafe { $crate::detour_code_from_pointer(__target as *const u8) };
 
-        // One shim serves one hook. If the previous target still resolves to
-        // the shim, that hook is live and its state must not be replaced.
-        let __shim_code = unsafe { $crate::detour_code_from_pointer(__shim as *const u8) };
+        // One shim serves one hook. While the previous hook is installed -
+        // enabled or disabled - its state must not be replaced.
         let __prev = __TARGET.load(::std::sync::atomic::Ordering::Acquire);
-        if !__prev.is_null() && unsafe { $crate::detour_code_from_pointer(__prev) } == __shim_code
-        {
+        if !__prev.is_null() && $crate::__inline_hook_installed_at(__prev) {
             ::std::result::Result::Err($crate::DetourError::InvalidParameter)
         } else {
             let mut __session = $crate::DetourTransaction::begin();
@@ -384,7 +392,10 @@ macro_rules! detour_closure {
                         ::std::sync::atomic::Ordering::Release,
                     );
                     __ORIG.store(__tramp, ::std::sync::atomic::Ordering::Release);
-                    __TARGET.store(__target, ::std::sync::atomic::Ordering::Release);
+                    __TARGET.store(
+                        __patched as *mut u8,
+                        ::std::sync::atomic::Ordering::Release,
+                    );
                     __session.commit()
                 }
                 ::std::result::Result::Err(__e) => ::std::result::Result::Err(__e),
@@ -479,8 +490,10 @@ macro_rules! detour_trace {
 /// Where [`detour_trace!`] needs the full signature (and in return gives typed
 /// arguments *and* the return value), `trace_raw!` needs only the target. It
 /// hooks the entry with a [`MidHook`], reads the argument registers from the
-/// captured [`HookContext`] (`rcx`/`rdx`/`r8`/`r9` on x86_64; the stack slots
-/// above the return address on x86), formats them as hex, and emits a record to
+/// captured [`HookContext`] (`rcx`/`rdx`/`r8`/`r9` on x86_64; on x86, where the
+/// arguments live on the stack and are not reachable from the context, it dumps
+/// `eax`/`ecx`/`edx`/`ebx`/`esi`/`edi` instead, which are **not** the call
+/// arguments), formats them as hex, and emits a record to
 /// the same process-wide [`trace`] sink. Because it captures state *at entry*,
 /// there is no return value - the record's return field is the literal
 /// `<entry>`.

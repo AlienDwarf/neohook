@@ -80,8 +80,9 @@ static RETIRED: [AtomicUsize; RETIRED_LEN] = [const { AtomicUsize::new(0) }; RET
 /// Serializes installs/unhooks and owns the registered handler.
 struct Int3Manager {
     /// Handle from `AddVectoredExceptionHandler`, stored as `usize` so the
-    /// state is `Send`. Zero until the first install. The handler is never
-    /// removed: a thread may still be on its way into it after an unhook.
+    /// state is `Send`. Zero while no handler is registered. It is removed with
+    /// the last hook, once no thread is still dispatching a trap of a removed
+    /// hook (see [`crate::inflight`]).
     handler: usize,
     /// Next [`RETIRED`] index to overwrite.
     retired_next: usize,
@@ -137,9 +138,9 @@ impl std::error::Error for Int3HookError {}
 /// An installed INT3 software-breakpoint hook.
 ///
 /// The hook stays active until it is explicitly removed with [`Self::unhook`]
-/// or dropped, at which point the original byte is restored. The vectored
-/// handler stays registered so a thread that trapped just before the removal
-/// is still resumed safely.
+/// or dropped, at which point the original byte is restored. A thread that
+/// trapped just before the removal is still resumed safely; the vectored
+/// handler is removed with the last hook once no such thread remains.
 #[derive(Debug)]
 pub struct Int3Hook {
     target: *const u8,
@@ -230,25 +231,13 @@ impl Int3Hook {
             None
         };
 
-        // The transaction lock serializes the byte write with every other code
-        // write on the page; it is taken before the slot manager.
+        // The code lock serializes the byte write with every other code write
+        // on the page; it is taken before the slot manager.
         crate::transaction::with_code_lock(|| unsafe { Self::arm(target, detour, gateway) })
     }
 
-    /// Like [`Self::install`], but returns `None` without changing anything
-    /// instead of waiting while another thread holds the transaction lock.
-    pub(crate) unsafe fn try_install(
-        target: *const u8,
-        detour: *const u8,
-    ) -> Option<Result<Self, Int3HookError>> {
-        if target.is_null() || detour.is_null() {
-            return Some(Err(Int3HookError::InvalidParameter));
-        }
-        crate::transaction::try_with_code_lock(|| unsafe { Self::arm(target, detour, None) })
-    }
-
     /// Publishes a slot for `target` and patches its entry byte. The caller holds
-    /// the transaction lock.
+    /// the code lock.
     unsafe fn arm(
         target: *const u8,
         detour: *const u8,
@@ -293,9 +282,11 @@ impl Int3Hook {
         let original_byte = match original {
             Some(bytes) => bytes[0],
             None => {
-                // Roll back the published slot.
+                // Roll back the published slot, and the handler if it was
+                // registered for this hook alone.
                 SLOT_TARGET[slot].store(0, Ordering::Release);
                 SLOT_DETOUR[slot].store(0, Ordering::Release);
+                release_idle_handler(&mut mgr);
                 return Err(Int3HookError::PatchFailed);
             }
         };
@@ -343,7 +334,7 @@ impl Int3Hook {
         }
         self.active = false;
 
-        // Transaction lock first, then the slot manager (see `install`).
+        // Code lock first, then the slot manager (see `install`).
         crate::transaction::with_code_lock(|| {
             let mut mgr = lock_manager();
 
@@ -358,7 +349,26 @@ impl Int3Hook {
             unsafe { write_memory_atomic(self.target as *mut u8, &self.original_byte, 1) };
             SLOT_TARGET[self.slot].store(0, Ordering::Release);
             SLOT_DETOUR[self.slot].store(0, Ordering::Release);
+
+            release_idle_handler(&mut mgr);
         });
+    }
+
+    /// Drops the hook without touching the target: for a target whose module
+    /// was unloaded, where the old address may now hold unrelated memory.
+    ///
+    /// Only the slot's target is cleared, which takes no lock, so this is safe
+    /// under the loader lock. Leaving the stale detour in place is harmless: a
+    /// slot is live only through its target, and the next install overwrites
+    /// the detour before publishing a target. Clearing the detour here could
+    /// instead clobber the detour of an install that has already reused the
+    /// slot. The address is not recorded as retired: no code remains there to
+    /// re-run. The handler is not removed here; see [`release_unused_handler`].
+    pub(crate) fn forget(mut self) {
+        if self.active {
+            self.active = false;
+            SLOT_TARGET[self.slot].store(0, Ordering::Release);
+        }
     }
 }
 
@@ -425,6 +435,57 @@ unsafe extern "system" fn int3_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     }
 
     EXCEPTION_CONTINUE_SEARCH
+}
+
+/// How often removing the handler re-checks for threads still dispatching a
+/// trap, one millisecond apart, before leaving it to a later unhook.
+const RELEASE_ATTEMPTS: usize = 5;
+
+/// Removes the vectored handler once no hook is live and no thread is still
+/// dispatching a trap of a removed hook, so the module holding it can be
+/// unloaded. If a thread stays inside the dispatch, the handler is kept and
+/// the next unhook tries again.
+fn release_idle_handler(mgr: &mut Int3Manager) {
+    if mgr.handler == 0
+        || SLOT_TARGET
+            .iter()
+            .any(|target| target.load(Ordering::Acquire) != 0)
+    {
+        return;
+    }
+    let is_retired = |addr: usize| {
+        addr != 0
+            && RETIRED
+                .iter()
+                .any(|retired| retired.load(Ordering::Acquire) == addr)
+    };
+    for attempt in 0..RELEASE_ATTEMPTS {
+        if !crate::inflight::exceptions_in_flight(STATUS_BREAKPOINT, is_retired, false) {
+            unsafe { RemoveVectoredExceptionHandler(mgr.handler as *mut _) };
+            mgr.handler = 0;
+            // No thread can reach the old handler any more.
+            for retired in &RETIRED {
+                retired.store(0, Ordering::Release);
+            }
+            mgr.retired_next = 0;
+            return;
+        }
+        if attempt + 1 < RELEASE_ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
+/// Removes the vectored handler if no hook uses it any more, for hooks that
+/// went away through [`Int3Hook::forget`], which cannot take the locks.
+pub(crate) fn release_unused_handler() {
+    crate::transaction::with_code_lock(|| release_idle_handler(&mut lock_manager()));
+}
+
+/// Whether the vectored handler is registered.
+#[cfg(test)]
+pub(crate) fn handler_registered() -> bool {
+    lock_manager().handler != 0
 }
 
 /// Returns the detour of the live slot hooking `addr`, if any.
@@ -508,6 +569,26 @@ mod tests {
         assert_eq!(
             verdict, EXCEPTION_CONTINUE_SEARCH,
             "foreign int3 is passed on"
+        );
+    }
+
+    #[test]
+    fn handler_is_removed_with_the_last_hook() {
+        // A module that unloads after unhooking must not leave the handler
+        // registered, or the next exception in the process calls unmapped code.
+        #[inline(never)]
+        extern "system" fn last() -> u32 {
+            std::hint::black_box(21)
+        }
+        let t = last as *const () as *const u8;
+        let d = detour as *const () as *const u8;
+        let hook = unsafe { Int3Hook::install(t, d) }.expect("install");
+        assert_ne!(lock_manager().handler, 0, "handler registered while hooked");
+        hook.unhook().unwrap();
+        assert_eq!(
+            lock_manager().handler,
+            0,
+            "handler removed with the last hook"
         );
     }
 

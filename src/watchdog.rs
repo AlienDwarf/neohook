@@ -519,6 +519,14 @@ unsafe fn restore_quiescent(targets: &[(usize, &[u8])], restored: &mut [bool]) {
     let Some(_guard) = crate::transaction::try_lock_transaction() else {
         return;
     };
+    // The rewrite is a code write like any other; taken before any thread is
+    // suspended.
+    let Some(_code) = crate::transaction::try_hold_code_lock() else {
+        return;
+    };
+    let Some(_freeze) = crate::threads::try_hold_freeze_lock() else {
+        return;
+    };
 
     // Excludes the calling (watchdog) thread.
     let tids = crate::threads::ThreadEnumerator::enumerate_process_threads();

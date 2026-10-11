@@ -54,14 +54,23 @@ impl TrampolineAlloc {
             let safety_buffer = 1024 * 1024 + size; // 1MB + size of trampoline to ensure we have enough space (should be more than enough for almost every trampoline)
             let range = (i32::MAX as usize).saturating_sub(safety_buffer);
 
-            // We define a search range of ±2GB around the target address
-            let min_addr = (target as usize).saturating_sub(range);
-            let max_addr = (target as usize).saturating_add(range);
-
-            // Get System Info to know the allocation granularity
+            // Get System Info to know the allocation granularity and the
+            // usable address range
             let mut si: SYSTEM_INFO = unsafe { std::mem::zeroed() };
             unsafe { GetSystemInfo(&mut si) };
             let alloc_granularity = si.dwAllocationGranularity as usize;
+
+            // We define a search range of ±2GB around the target address,
+            // clamped to the usable address space. The lower bound is never 0:
+            // `VirtualAlloc(0, ..)` means "anywhere", which would place the
+            // trampoline out of rel32 range of a target near the bottom.
+            let min_addr = (target as usize)
+                .saturating_sub(range)
+                .max(si.lpMinimumApplicationAddress as usize)
+                .max(alloc_granularity);
+            let max_addr = (target as usize)
+                .saturating_add(range)
+                .min(si.lpMaximumApplicationAddress as usize);
 
             // Walk every free region in the ±2GB window and remember the aligned
             // start *closest to the target* in each. A trampoline placed as near
@@ -129,9 +138,15 @@ impl TrampolineAlloc {
                         PAGE_EXECUTE_READWRITE,
                     )
                 };
-                if !allocated.is_null() {
+                if allocated.is_null() {
+                    continue;
+                }
+                // Only accept the allocation if it really is inside the window.
+                let start = allocated as usize;
+                if start >= min_addr && start.saturating_add(size) <= max_addr {
                     return Some(allocated as *mut u8);
                 }
+                unsafe { VirtualFree(allocated, 0, MEM_RELEASE) };
             }
 
             None
@@ -160,7 +175,9 @@ fn align_down(addr: usize, align: usize) -> usize {
 /// region_end)` that is closest to `target`, while leaving room for `size`
 /// bytes and staying inside the `[min_addr, max_addr]` reachability window.
 ///
-/// Returns `None` if the region cannot host the trampoline within range.
+/// Never returns an address below `align` (in particular never 0, which
+/// `VirtualAlloc` treats as "anywhere"). Returns `None` if the region cannot
+/// host the trampoline within range.
 #[cfg(target_arch = "x86_64")]
 fn nearest_aligned_candidate(
     region_start: usize,
@@ -174,7 +191,7 @@ fn nearest_aligned_candidate(
     // Highest start that still fits `size` bytes in the region and the window.
     let region_hi = region_end.checked_sub(size)?;
     let window_hi = max_addr.checked_sub(size)?;
-    let lo = region_start.max(min_addr);
+    let lo = region_start.max(min_addr).max(align.max(1));
     let hi = region_hi.min(window_hi);
     if lo > hi {
         return None;
@@ -488,6 +505,63 @@ mod tests {
             let free_ok = VirtualFree(target as _, 0, MEM_RELEASE);
             assert_ne!(free_ok, 0, "failed to free target allocation");
         }
+    }
+
+    /// A target near the bottom of the address space makes the ±2 GB window
+    /// start at 0. Address 0 must never be chosen: `VirtualAlloc(0, ..)` means
+    /// "anywhere" and lands the trampoline out of rel32 range.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn alloc_nearby_low_target_stays_within_rel32_range() {
+        unsafe {
+            let mut target = ptr::null_mut();
+            for base in (0x10000usize..0x100_0000).step_by(0x10000) {
+                target = VirtualAlloc(base as _, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+                    as *mut u8;
+                if !target.is_null() {
+                    break;
+                }
+            }
+            if target.is_null() {
+                eprintln!("no free low page to test with; skipping");
+                return;
+            }
+
+            let tramp = TrampolineAlloc::alloc_nearby(target, 64);
+            let free_ok = VirtualFree(target as _, 0, MEM_RELEASE);
+            let tramp = tramp.expect("expected a nearby trampoline");
+            let distance = (tramp as usize).abs_diff(target as usize);
+            assert_ne!(VirtualFree(tramp as _, 0, MEM_RELEASE), 0);
+            assert_ne!(free_ok, 0, "failed to free target allocation");
+            assert!(
+                distance <= i32::MAX as usize,
+                "trampoline {tramp:p} too far from low target {target:p}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn nearest_aligned_candidate_edge_cases() {
+        use super::nearest_aligned_candidate as cand;
+        const G: usize = 0x10000;
+        const MAX: usize = 0x8000_0000;
+
+        // Free region at the very bottom with a window starting at 0: never 0.
+        assert_eq!(cand(0, G, G, 64, 0, MAX, G), None);
+        assert_eq!(cand(0, 4 * G, 4 * G, 64, 0, MAX, G), Some(3 * G));
+        // Target inside the region: the aligned start at or around it.
+        assert_eq!(cand(G, 8 * G, 3 * G + 5, 64, 0, MAX, G), Some(3 * G));
+        // Target above the region: the highest aligned start that fits.
+        assert_eq!(cand(G, 4 * G, 10 * G, 64, 0, MAX, G), Some(3 * G));
+        // Target below the region: its first aligned start.
+        assert_eq!(cand(2 * G + 1, 8 * G, 0, 64, 0, MAX, G), Some(3 * G));
+        // Region narrower than one alignment step with no aligned start in it.
+        assert_eq!(cand(G + 1, 2 * G - 1, G, 64, 0, MAX, G), None);
+        // Region entirely outside the window.
+        assert_eq!(cand(MAX, MAX + 4 * G, MAX, 64, 0, MAX, G), None);
+        // Size larger than the region.
+        assert_eq!(cand(G, 2 * G, G, 2 * G, 0, MAX, G), None);
     }
 
     #[test]

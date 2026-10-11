@@ -65,6 +65,16 @@ const CONTEXT_DEBUG: u32 = CONTEXT_DEBUG_REGISTERS_X86;
 static SLOT_TARGET: [AtomicUsize; SLOT_COUNT] = [const { AtomicUsize::new(0) }; SLOT_COUNT];
 static SLOT_DETOUR: [AtomicUsize; SLOT_COUNT] = [const { AtomicUsize::new(0) }; SLOT_COUNT];
 
+/// The address neohook last armed in each debug register, kept after the hook
+/// is removed. A breakpoint the handler did not arm itself - another
+/// component's, in a slot neohook never used or at a different address - is
+/// never touched.
+static SLOT_ARMED: [AtomicUsize; SLOT_COUNT] = [const { AtomicUsize::new(0) }; SLOT_COUNT];
+
+/// DR6 bit set by a trap-flag single step (`BS`), as opposed to a debug
+/// register hit.
+const DR6_SINGLE_STEP: DrWord = 0x4000;
+
 /// Ring of recently removed targets, so the handler can still recognise a late
 /// trap from a thread whose stale breakpoint fired just before it was cleared.
 const RETIRED_COUNT: usize = 16;
@@ -74,13 +84,19 @@ static RETIRED_NEXT: AtomicUsize = AtomicUsize::new(0);
 /// Serializes installs/unhooks and owns the registered handler.
 struct VehManager {
     /// Handle from `AddVectoredExceptionHandler`, stored as `usize` so the
-    /// state is `Send`. Zero until the first install. The handler is never
-    /// removed: a thread can still trap on a stale breakpoint after its hook is
-    /// gone, and the handler is what disarms it.
+    /// state is `Send`. Zero while no handler is registered. It is removed with
+    /// the last hook, once no thread is still dispatching a trap of one of
+    /// neohook's breakpoints (see [`crate::inflight`]).
     handler: usize,
+    /// Set once a disarm could not reach every thread: a thread may still
+    /// carry a stale breakpoint, so the handler is never removed.
+    keep_handler: bool,
 }
 
-static MANAGER: Mutex<VehManager> = Mutex::new(VehManager { handler: 0 });
+static MANAGER: Mutex<VehManager> = Mutex::new(VehManager {
+    handler: 0,
+    keep_handler: false,
+});
 
 /// Errors produced while installing or removing a VEH hook.
 #[derive(Debug)]
@@ -123,9 +139,9 @@ impl std::error::Error for VehHookError {}
 /// An installed VEH (hardware-breakpoint) hook.
 ///
 /// The hook stays active until it is explicitly removed with [`Self::unhook`]
-/// or dropped, at which point the breakpoint is cleared on every thread. The
-/// vectored handler stays registered so it can disarm any thread that still
-/// traps on the stale breakpoint.
+/// or dropped, at which point the breakpoint is cleared on every thread. A
+/// thread that still traps on the stale breakpoint is disarmed by the vectored
+/// handler, which is removed with the last hook once no such thread remains.
 #[derive(Debug)]
 pub struct VehHook {
     target: *const u8,
@@ -244,10 +260,11 @@ impl VehHook {
         // as live only once `SLOT_TARGET` is non-zero, so the detour is always
         // visible by then.
         SLOT_DETOUR[slot].store(detour_addr, Ordering::Release);
+        SLOT_ARMED[slot].store(target_addr, Ordering::Release);
         SLOT_TARGET[slot].store(target_addr, Ordering::Release);
 
         // Arm the breakpoint on every thread now that the slot is published.
-        set_breakpoint_on_all_threads(slot, target_addr, true);
+        let _ = set_breakpoint_on_all_threads(slot, target_addr, true);
 
         Ok(Self {
             target,
@@ -292,18 +309,64 @@ impl VehHook {
         }
         self.active = false;
 
-        let _mgr = lock_manager();
+        let mut mgr = lock_manager();
 
         // Disarm the breakpoint everywhere before retiring the slot so a late
         // trap still finds a valid detour rather than an empty slot. A thread
         // that is mid-dispatch can still get the old debug registers restored
         // on resume; the handler disarms those when they trap.
-        set_breakpoint_on_all_threads(self.slot, 0, false);
+        if !set_breakpoint_on_all_threads(self.slot, 0, false) {
+            // A thread may keep the stale breakpoint; only the handler can
+            // disarm it, so it must stay.
+            mgr.keep_handler = true;
+        }
         SLOT_TARGET[self.slot].store(0, Ordering::Release);
         SLOT_DETOUR[self.slot].store(0, Ordering::Release);
 
         let next = RETIRED_NEXT.fetch_add(1, Ordering::Relaxed) % RETIRED_COUNT;
         RETIRED[next].store(self.target as usize, Ordering::Release);
+
+        release_idle_handler(&mut mgr);
+    }
+}
+
+/// How often removing the handler re-checks for threads still dispatching a
+/// trap, one millisecond apart, before leaving it to a later unhook.
+const RELEASE_ATTEMPTS: usize = 5;
+
+/// Removes the vectored handler once no hook is live and no thread is still
+/// dispatching a trap of one of neohook's breakpoints, so the module holding
+/// it can be unloaded. The unhooks disarmed every thread; a thread could only
+/// get a stale breakpoint back from a context restored by a dispatch that is
+/// still running, which is what the check looks for. If a thread stays inside
+/// the dispatch, the handler is kept and the next unhook tries again.
+fn release_idle_handler(mgr: &mut VehManager) {
+    if mgr.handler == 0
+        || mgr.keep_handler
+        || SLOT_TARGET
+            .iter()
+            .any(|target| target.load(Ordering::Acquire) != 0)
+    {
+        return;
+    }
+    let is_ours = |addr: usize| {
+        addr != 0
+            && (RETIRED
+                .iter()
+                .any(|retired| retired.load(Ordering::Acquire) == addr)
+                || SLOT_ARMED
+                    .iter()
+                    .any(|armed| armed.load(Ordering::Acquire) == addr))
+    };
+    for attempt in 0..RELEASE_ATTEMPTS {
+        if !crate::inflight::exceptions_in_flight(STATUS_SINGLE_STEP, is_ours, true) {
+            unsafe { RemoveVectoredExceptionHandler(mgr.handler as *mut _) };
+            mgr.handler = 0;
+            return;
+        }
+        if attempt + 1 < RELEASE_ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 }
 
@@ -355,13 +418,17 @@ unsafe extern "system" fn veh_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
 
     // No live hook at this address. If DR6 says one of our breakpoint slots
     // fired here, the thread still carries a stale arming from a removed (or
-    // replaced) hook: re-sync that slot in the context and resume.
+    // replaced) hook: re-sync that slot in the context and resume. A slot only
+    // counts as ours if neohook armed this very address in it.
     let ctx = unsafe { &mut *context };
     let hits = ctx.Dr6 & 0xF;
     let mut handled = false;
     for (slot, slot_target) in SLOT_TARGET.iter().enumerate() {
         let fired = hits & ((1 as DrWord) << slot) != 0;
-        if !fired || debug_address(ctx, slot) != fault_addr as DrWord {
+        if !fired
+            || debug_address(ctx, slot) != fault_addr as DrWord
+            || SLOT_ARMED[slot].load(Ordering::Acquire) != fault_addr
+        {
             continue;
         }
         let live = slot_target.load(Ordering::Acquire);
@@ -370,15 +437,20 @@ unsafe extern "system" fn veh_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     }
     // The trap can also be captured after an unhook already rewrote the
     // thread's debug registers, so DR6 is empty or the fired slot no longer
-    // holds the address. Recognise those by the address of a recently removed
-    // hook, and re-sync every slot DR6 reports.
+    // holds the address, or after the slot was re-armed for another target.
+    // Recognise those by the address of a recently removed hook, and re-sync
+    // any fired slot that still holds it. A trap-flag single step is never one
+    // of ours.
     if !handled
+        && ctx.Dr6 & DR6_SINGLE_STEP == 0
         && RETIRED
             .iter()
             .any(|retired| retired.load(Ordering::Acquire) == fault_addr)
     {
         for (slot, slot_target) in SLOT_TARGET.iter().enumerate() {
-            if hits & ((1 as DrWord) << slot) != 0 {
+            if hits & ((1 as DrWord) << slot) != 0
+                && debug_address(ctx, slot) == fault_addr as DrWord
+            {
                 let live = slot_target.load(Ordering::Acquire);
                 program_slot(ctx, slot, live, live != 0);
             }
@@ -425,14 +497,23 @@ fn lock_manager() -> std::sync::MutexGuard<'static, VehManager> {
 
 /// Arms (or disarms) breakpoint `slot` for `address` on the calling thread and
 /// every other thread in the process.
-fn set_breakpoint_on_all_threads(slot: usize, address: usize, enable: bool) {
+///
+/// Returns `false` if a live thread could not be updated.
+fn set_breakpoint_on_all_threads(slot: usize, address: usize, enable: bool) -> bool {
+    // Suspends each thread in turn, so it must not race another such pass.
+    let _freeze = crate::threads::hold_freeze_lock();
     // The calling thread cannot be suspended; update it directly.
-    unsafe { set_debug_register(GetCurrentThread(), slot, address, enable) };
+    let mut all = unsafe { set_debug_register(GetCurrentThread(), slot, address, enable) };
 
     for tid in ThreadEnumerator::enumerate_process_threads() {
-        let access = THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME;
+        let access = THREAD_GET_CONTEXT
+            | THREAD_SET_CONTEXT
+            | THREAD_SUSPEND_RESUME
+            | THREAD_QUERY_LIMITED_INFORMATION;
         let h_thread = unsafe { OpenThread(access, 0, tid) };
         if h_thread.is_null() {
+            // A thread that exited meanwhile carries no breakpoint.
+            all &= unsafe { GetLastError() } == ERROR_INVALID_PARAMETER;
             continue;
         }
 
@@ -441,12 +522,16 @@ fn set_breakpoint_on_all_threads(slot: usize, address: usize, enable: bool) {
             // A thread that cannot be suspended is left alone; if it keeps a
             // stale breakpoint, the handler disarms it on its next trap.
             if SuspendThread(h_thread) != u32::MAX {
-                set_debug_register(h_thread, slot, address, enable);
+                all &= set_debug_register(h_thread, slot, address, enable);
                 ResumeThread(h_thread);
+            } else {
+                let mut code = 0u32;
+                all &= GetExitCodeThread(h_thread, &mut code) != 0 && code != STILL_ACTIVE as u32;
             }
             CloseHandle(h_thread);
         }
     }
+    all
 }
 
 /// Programs a single hardware execution breakpoint in one thread's debug
@@ -546,10 +631,66 @@ mod tests {
         RETIRED[next].store(0, Ordering::Release);
     }
 
+    /// Runs the handler on a single-step at `addr` with a raw DR6 and one
+    /// debug register programmed, returning the verdict and the context.
+    fn handle_trap_with(addr: usize, dr6: DrWord, slot: usize, dr: DrWord) -> (i32, CONTEXT) {
+        let mut ctx: AlignedContext = unsafe { std::mem::zeroed() };
+        ctx.0.Dr6 = dr6;
+        program_slot(&mut ctx.0, slot, dr as usize, true);
+        let mut record: EXCEPTION_RECORD = unsafe { std::mem::zeroed() };
+        record.ExceptionCode = STATUS_SINGLE_STEP;
+        record.ExceptionAddress = addr as *mut _;
+        let mut pointers = EXCEPTION_POINTERS {
+            ExceptionRecord: &mut record,
+            ContextRecord: &mut ctx.0,
+        };
+        let verdict = unsafe { veh_handler(&mut pointers) };
+        (verdict, ctx.0)
+    }
+
+    #[test]
+    fn handler_leaves_foreign_hardware_breakpoints_alone() {
+        // Another component's execution breakpoint in DR2, at an address
+        // neohook never armed.
+        let addr = 0x7FFE_7890usize;
+        let (verdict, ctx) = handle_trap_with(addr, 1 << 2, 2, addr as DrWord);
+        assert_eq!(verdict, EXCEPTION_CONTINUE_SEARCH, "foreign breakpoint");
+        assert_eq!(ctx.Dr2, addr as DrWord, "foreign DR2 left armed");
+        assert_ne!(ctx.Dr7 & (1 << 4), 0, "foreign DR7 enable left set");
+    }
+
+    #[test]
+    fn handler_leaves_foreign_single_steps_on_removed_targets_alone() {
+        // A trap-flag single step (DR6.BS) that happens to land on the address
+        // of a removed hook belongs to whoever set the trap flag.
+        let addr = 0x7FFE_ABC0usize;
+        let next = RETIRED_NEXT.fetch_add(1, Ordering::Relaxed) % RETIRED_COUNT;
+        RETIRED[next].store(addr, Ordering::Release);
+        let (verdict, _) = handle_stale_trap(addr, 0x4000, 0);
+        RETIRED[next].store(0, Ordering::Release);
+        assert_eq!(verdict, EXCEPTION_CONTINUE_SEARCH, "trap-flag single step");
+    }
+
     #[test]
     fn handler_leaves_foreign_single_steps_alone() {
         let (verdict, _) = handle_stale_trap(0x7FFE_4560, 0, 0);
         assert_eq!(verdict, EXCEPTION_CONTINUE_SEARCH);
+    }
+
+    #[test]
+    fn handler_is_removed_with_the_last_hook() {
+        // A module that unloads after unhooking must not leave the handler
+        // registered, or the next exception in the process calls unmapped code.
+        let t = slot_target_e as *const () as *const u8;
+        let d = slot_detour as *const () as *const u8;
+        let hook = unsafe { VehHook::install(t, d) }.expect("install");
+        assert_ne!(lock_manager().handler, 0, "handler registered while hooked");
+        hook.unhook().unwrap();
+        assert_eq!(
+            lock_manager().handler,
+            0,
+            "handler removed with the last hook"
+        );
     }
 
     extern "system" fn slot_target_a() -> u32 {

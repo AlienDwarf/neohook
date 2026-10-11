@@ -180,3 +180,52 @@ fn failed_commit_rolls_back_without_touching_the_heap() {
         "rollback allocated or freed while other threads were suspended"
     );
 }
+
+#[inline(never)]
+extern "system" fn iat_detour() -> u32 {
+    black_box(0)
+}
+
+#[test]
+fn iat_commit_and_detach_do_not_touch_the_heap_while_threads_are_suspended() {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+
+    // Called once here so the test binary imports it; nothing else calls it
+    // while the hook is active.
+    let pid = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessId() };
+    assert_ne!(pid, 0);
+    let exe = unsafe { GetModuleHandleW(std::ptr::null()) };
+    assert!(!exe.is_null());
+
+    let mut hooks = Vec::new();
+    let attach_ops = heap_ops_while_frozen(|| {
+        let mut tx = DetourTransaction::begin();
+        tx.update_all_threads();
+        tx.attach_iat(
+            exe,
+            "KERNEL32.dll",
+            "GetCurrentProcessId",
+            iat_detour as *const u8,
+        )
+        .expect("attach_iat");
+        hooks = tx.commit().expect("commit");
+    });
+    assert_eq!(hooks.len(), 1);
+
+    let detach_ops = heap_ops_while_frozen(|| {
+        let mut tx = DetourTransaction::begin();
+        tx.update_all_threads();
+        tx.detach(&mut hooks[0]).expect("detach");
+        tx.commit().expect("detach commit");
+    });
+    drop(hooks);
+
+    assert_eq!(
+        attach_ops, 0,
+        "an IAT commit allocated or freed while other threads were suspended"
+    );
+    assert_eq!(
+        detach_ops, 0,
+        "an IAT detach allocated or freed while other threads were suspended"
+    );
+}

@@ -4,16 +4,20 @@ use crate::DetourError;
 use crate::HookKind;
 use crate::alloc::{Trampoline, TrampolineAlloc};
 use crate::disasm;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, GetThreadContext, SetThreadContext};
 use windows_sys::Win32::System::Threading::*;
 
-/// The number of usize slots to scan on the stack for return addresses.
-/// Default: 512 (corresponds to 4KB / one memory page on x64).
-const STACK_SCAN_DEPTH: usize = 512;
+/// Stack slots per tracked thread a commit reserves for redirected return
+/// addresses, before any thread is suspended. A commit needing more fails.
+const STACK_REDIRECTS_PER_THREAD: usize = 512;
+
+/// Upper bound on the stack bytes read per thread when redirecting return
+/// addresses.
+const MAX_STACK_SCAN_BYTES: usize = 32 * 1024 * 1024;
 
 #[cfg(target_arch = "x86_64")]
 const CONTEXT_FLAGS: u32 = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_ALL_AMD64;
@@ -226,6 +230,11 @@ impl Hook {
 }
 
 /// Helper struct to manage the allocation of trampolines, which are used for inline hooks.
+///
+/// Hooks chained on this hook's gateway may outlive it. Dropping it first
+/// restores the target, so calls run the original function and bypass the
+/// chained hooks; its gateway memory stays allocated until the last of them is
+/// dropped, so their unhook never writes into released memory.
 #[derive(Debug)]
 pub struct InlineHook {
     pub target: *mut u8,
@@ -240,6 +249,9 @@ pub struct InlineHook {
     patch_bytes: Vec<u8>,
     /// Whether the detour jump is currently installed at the target.
     enabled: bool,
+    /// Whether the commit published this hook's patched range, which
+    /// [`Self::release`] withdraws again once the target is restored.
+    published: bool,
 }
 
 impl InlineHook {
@@ -301,6 +313,7 @@ impl InlineHook {
     pub fn unhook(mut self) -> Result<(), DetourError> {
         with_code_lock(|| {
             self.perform_unhook()?;
+            self.release();
             unregister_managed_gateway(self.trampoline.ptr);
             Ok::<(), DetourError>(())
         })?;
@@ -315,56 +328,48 @@ impl InlineHook {
             return Err(DetourError::InvalidParameter);
         }
 
-        unsafe {
-            let mut old = 0u32;
-            // Get current protection and add execute permissions
-            let protect_ok = crate::mem::virtual_protect_same_execute(
-                self.target,
-                self.stolen_len,
-                windows_sys::Win32::System::Memory::PAGE_READWRITE,
-                &mut old,
-            );
-            if protect_ok == 0 {
-                return Err(DetourError::RelocationFailed);
-            }
-
-            // copy the original bytes back to the target function
-            std::ptr::copy_nonoverlapping(self.orig_bytes.as_ptr(), self.target, self.stolen_len);
-
-            // If this hook had overwritten a managed gateway, restoring the original bytes
-            // makes the target a managed gateway again
-            if matches!(self.target_kind, TargetKind::ManagedGateway) {
-                register_managed_gateway(self.target);
-            }
-
-            // CPU-Cache flush so CPU has to read from RAM not from L1 L2 L3 cache
-            let flush_ok = windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache(
-                windows_sys::Win32::System::Threading::GetCurrentProcess(),
-                self.target as _,
-                self.stolen_len,
-            );
-
-            // Restore original protection
-            let restore_ok = windows_sys::Win32::System::Memory::VirtualProtect(
-                self.target as _,
-                self.stolen_len,
-                old,
-                &mut old,
-            );
-
-            // Wait til end even if an error occurs so we try to restore original protection always
-            if flush_ok == 0 || restore_ok == 0 {
-                return Err(DetourError::RelocationFailed);
-            }
+        // Per-page protection save/restore, cache flush, no allocation.
+        let written = unsafe {
+            crate::mem::write_code_bytes(self.target, self.orig_bytes.as_ptr(), self.stolen_len)
+        };
+        if !written {
+            return Err(DetourError::RelocationFailed);
         }
         Ok(())
     }
 
-    fn detach_finalize(&mut self) {
-        if self.enabled {
-            let _ = self.disable();
+    /// Withdraws what the commit published for this hook once its target holds
+    /// the original bytes again. Runs under the transaction lock, never inside
+    /// a suspend window.
+    fn release(&mut self) {
+        if !self.published {
+            return;
         }
-        unregister_managed_gateway(self.trampoline.ptr);
+        self.published = false;
+        unregister_live_patch(self.target);
+
+        // Restoring a managed gateway makes it chainable again, unless its
+        // owner was dropped meanwhile; the last dependent of such a gateway
+        // releases its memory.
+        if matches!(self.target_kind, TargetKind::ManagedGateway) {
+            let (owner_alive, orphan) = remove_gateway_dependent(self.target);
+            if owner_alive {
+                register_managed_gateway(self.target);
+            }
+            if let Some((ptr, size)) = orphan {
+                crate::reclaim::retire(ptr as *mut u8, size);
+            }
+        }
+    }
+
+    fn detach_finalize(&mut self) {
+        with_code_lock(|| {
+            if self.enabled {
+                let _ = self.disable();
+            }
+            self.release();
+            unregister_managed_gateway(self.trampoline.ptr);
+        });
         self.active = false;
         self.enabled = false;
     }
@@ -377,7 +382,14 @@ impl Drop for InlineHook {
                 // auto unhook when dropped, best effort, ignore errors
                 let _ = self.perform_unhook();
             }
+            self.release();
             unregister_managed_gateway(self.trampoline.ptr);
+
+            // Hooks chained on the gateway still restore their bytes into it,
+            // so it is retired by the last of them instead of here.
+            if orphan_chained_gateway(self.trampoline.ptr, self.trampoline.size) {
+                self.trampoline.ptr = std::ptr::null_mut();
+            }
         });
     }
 }
@@ -675,7 +687,7 @@ impl TransactionCore {
     /// any thread is suspended, otherwise two transactions could suspend each
     /// other and deadlock.
     fn acquire_global_lock(&mut self) {
-        // A thread already inside `with_code_lock` keeps the lock it holds.
+        // A thread already inside `with_transaction_lock` keeps that hold.
         if self.global_lock.is_none() && !owns_transaction_lock() {
             self.global_lock = Some(lock_transaction());
         }
@@ -770,6 +782,10 @@ impl TransactionCore {
     /// padding. Patching it would overwrite the code that follows, typically
     /// the next function.
     ///
+    /// Returns `Err(DetourError::InvalidParameter)` if `target` is a managed
+    /// gateway that an installed hook is already chained on; chain onto that
+    /// hook's gateway instead.
+    ///
     /// # Safety
     /// The caller must ensure that `target` and `detour` are valid pointers. NeoHook performs basic validation but does not guarantee that the pointers are valid or that the memory they point to is properly aligned or accessible. Invalid pointers may cause undefined behavior, including crashes.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -793,6 +809,25 @@ impl TransactionCore {
         self.attach_inner(target, detour, false)
     }
 
+    /// Applies the same-target rule to an inline hook already queued on
+    /// `target`: the same detour reuses it, a different one is rejected.
+    fn queued_inline(
+        &self,
+        target: *mut u8,
+        detour: *const u8,
+    ) -> Option<Result<*mut u8, DetourError>> {
+        self.pending_hooks.iter().find_map(|pending| match pending {
+            PendingHook::Inline(existing) if existing.target == target => {
+                Some(if existing.detour == detour {
+                    Ok(existing.trampoline.ptr)
+                } else {
+                    Err(DetourError::InvalidParameter)
+                })
+            }
+            _ => None,
+        })
+    }
+
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn attach_inner(
         &mut self,
@@ -810,7 +845,20 @@ impl TransactionCore {
 
         // If the target function is a managed gateway, we use a special hooking method that does not require disassembly or stolen bytes, as the gateway is designed to be overwritten with a jump to the trampoline. This allows us to hook methods that would otherwise be difficult or impossible to hook.
         // The trampoline will contain a stub that jumps to the original target after executing the detour, allowing for proper chaining of hooks
+        //
+        // A gateway carries at most one chained hook: once one is installed the
+        // gateway holds its jump, and a second hook would either patch it again
+        // or follow that jump into the chained detour. Chain onto the installed
+        // hook's own gateway instead. Within one transaction the same-target
+        // rule below applies.
+        if follow_thunks && is_chained_gateway(target) {
+            return Err(DetourError::InvalidParameter);
+        }
         if follow_thunks && is_managed_gateway(target) {
+            if let Some(queued) = self.queued_inline(target, detour) {
+                return queued;
+            }
+
             let previous_target = unsafe {
                 read_managed_gateway_target(target as *const u8)
                     .ok_or(DetourError::InvalidParameter)?
@@ -890,17 +938,8 @@ impl TransactionCore {
         //   transaction. Reject it - stacking several detours on one function is
         //   done by chaining onto the returned gateway, not by re-attaching the
         //   same target.
-        for pending in &self.pending_hooks {
-            let PendingHook::Inline(existing) = pending else {
-                continue;
-            };
-            if existing.target != target {
-                continue;
-            }
-            if existing.detour == detour {
-                return Ok(existing.trampoline.ptr);
-            }
-            return Err(DetourError::InvalidParameter);
+        if let Some(queued) = self.queued_inline(target, detour) {
+            return queued;
         }
 
         // --- architecture ---
@@ -928,6 +967,18 @@ impl TransactionCore {
             disasm::Disassembler::get_instruction_len(target, required_space)
                 .map_err(|_| DetourError::InvalidParameter)
         }?;
+
+        // The stolen bytes must not overlap another inline hook, queued here or
+        // already installed: one jump would be written over the other, or the
+        // live jump relocated into this trampoline. `commit` checks installed
+        // hooks again under the transaction lock.
+        let overlaps_pending = self.pending_hooks.iter().any(|pending| {
+            matches!(pending, PendingHook::Inline(existing)
+                if ranges_overlap(existing.target as usize, existing.stolen_len, target as usize, stolen_len))
+        });
+        if overlaps_pending || overlaps_live_patch(target, stolen_len) {
+            return Err(DetourError::InvalidParameter);
+        }
 
         // MANAGED GATEWAYS FOR HOOK CHAINING
         let tramp_capacity: usize = 128;
@@ -1271,8 +1322,8 @@ impl TransactionCore {
 
     /// Queues a hook stored inside an FFI handle to be detached on commit.
     ///
-    /// The handle remains valid. On success, the selected hook is removed from
-    /// the handle's hook list and all remaining hooks keep their relative order.
+    /// The handle remains valid. On success, the selected slot is emptied and
+    /// every other hook keeps its index.
     ///
     /// # Safety
     ///
@@ -1292,8 +1343,8 @@ impl TransactionCore {
             return Err(DetourError::InvalidParameter);
         }
 
-        let hooks = unsafe { &*(handle as *mut Vec<Hook>) };
-        if index >= hooks.len() {
+        let hooks = handle as *const crate::api::HandleSlots;
+        if !with_code_lock(|| matches!(unsafe { &*hooks }.get(index), Some(Some(_)))) {
             return Err(DetourError::InvalidParameter);
         }
 
@@ -1350,9 +1401,20 @@ impl TransactionCore {
             let slot = match hook {
                 PendingHook::Inline(data) => {
                     inline_count += 1;
-                    inline_patch_bytes(data)
-                        .map(Reserved::Patch)
-                        .map_err(|e| (HookKind::Inline, e))
+                    // Another transaction may have hooked these bytes since
+                    // `attach`; the lock held now keeps the answer current.
+                    // Two queued hooks must not patch the same bytes either.
+                    let overlaps_queued = pending[..index].iter().any(|earlier| {
+                        matches!(earlier, PendingHook::Inline(other)
+                            if ranges_overlap(other.target as usize, other.stolen_len, data.target as usize, data.stolen_len))
+                    });
+                    if overlaps_queued || overlaps_live_patch(data.target, data.stolen_len) {
+                        Err((HookKind::Inline, DetourError::InvalidParameter))
+                    } else {
+                        inline_patch_bytes(data)
+                            .map(Reserved::Patch)
+                            .map_err(|e| (HookKind::Inline, e))
+                    }
                 }
                 PendingHook::VtableInstance { vtable_len, .. } => {
                     crate::vtable::ClonedVtable::new(*vtable_len)
@@ -1396,9 +1458,35 @@ impl TransactionCore {
             // in this commit can target.
             self.redirected_threads.reserve(self.threads.len());
             self.redirected_stacks
-                .reserve(self.threads.len() * STACK_SCAN_DEPTH);
+                .reserve(self.threads.len() * STACK_REDIRECTS_PER_THREAD);
         }
         crate::cfg::prepare();
+
+        // Writers outside the transaction wait only for the patch phase. Taken
+        // before the first suspension, so no frozen thread can hold it.
+        let code_guard = hold_code_lock();
+
+        // A gateway queued for chaining may have lost its owner since `attach`
+        // (dropping a hook only waits for this lock, not for the transaction):
+        // it is retired and will be freed, so it must not be patched. Checked
+        // under the code lock, which every drop takes, and before any thread is
+        // suspended, since the registry is a mutex.
+        let orphaned = pending.iter().position(|hook| {
+            matches!(hook, PendingHook::Inline(data)
+                if matches!(data.target_kind, TargetKind::ManagedGateway)
+                    && !is_managed_gateway(data.target))
+        });
+        if let Some(index) = orphaned {
+            drop(code_guard);
+            self.cleanup_threads();
+            return Err(DetourError::CommitFailed {
+                index,
+                kind: HookKind::Inline,
+                source: Box::new(DetourError::InvalidParameter),
+            });
+        }
+
+        let freeze_guard = crate::threads::hold_freeze_lock();
 
         self.suspend_threads();
 
@@ -1493,10 +1581,12 @@ impl TransactionCore {
             rollback_detaches(&mut detached);
             self.rollback(&mut installed);
             self.cleanup_threads();
+            drop(freeze_guard);
             // Threads run again: dismantle what the failed commit built.
             drop(installed);
             drop(pending);
             drop(reserved);
+            drop(code_guard);
             return Err(DetourError::CommitFailed {
                 index,
                 kind,
@@ -1519,20 +1609,25 @@ impl TransactionCore {
         });
 
         self.resume_threads();
+        drop(freeze_guard);
 
         // Publish the new gateways while the transaction lock is still held, so
         // the next transaction already sees them.
-        for hook in &installed {
+        for hook in &mut installed {
             if let Hook::Inline(inline) = hook {
                 if matches!(inline.target_kind, TargetKind::ManagedGateway) {
                     unregister_managed_gateway(inline.target);
+                    add_gateway_dependent(inline.target);
                 }
                 register_managed_gateway(inline.trampoline.ptr);
+                register_live_patch(inline.target, inline.stolen_len);
+                inline.published = true;
             }
         }
 
         self.cleanup_threads();
         finalize_detaches(&mut detached);
+        drop(code_guard);
         self.is_pending = false;
         Ok(installed)
     }
@@ -1570,8 +1665,9 @@ impl TransactionCore {
     ///
     /// # Notes
     ///
-    /// - Only a limited of the stack is scanned, as defined by
-    ///   `STACK_SCAN_DEPTH`. Automatically detects when the stack frame ends to avoid invalid access
+    /// - The whole committed stack above the stack pointer is scanned, up to
+    ///   the end of the stack reservation; uncommitted and guard pages are
+    ///   skipped. A return address can sit arbitrarily deep below a call chain.
     /// - This function assumes the thread is already suspended before being passed
     ///   in.
     /// - On x86_64, the instruction pointer and stack pointer are taken from `Rip`
@@ -1648,20 +1744,43 @@ impl TransactionCore {
             #[cfg(target_arch = "x86")]
             let stack_ptr = context.Esp as usize;
 
-            let mut mbi: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION =
-                std::mem::zeroed();
-            if windows_sys::Win32::System::Memory::VirtualQuery(
-                stack_ptr as *const _,
-                &mut mbi,
-                std::mem::size_of::<windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION>(),
-            ) != 0
-            {
-                let stack_segment_top = mbi.BaseAddress as usize + mbi.RegionSize;
+            use windows_sys::Win32::System::Memory::{
+                MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+            };
+            const WORD: usize = std::mem::size_of::<usize>();
+            let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let mbi_size = std::mem::size_of::<MEMORY_BASIC_INFORMATION>();
+            if VirtualQuery(stack_ptr as *const _, &mut mbi, mbi_size) == 0 {
+                return Ok(());
+            }
+            let stack_allocation = mbi.AllocationBase as usize;
+            let mut scanned = 0usize;
+            let mut region = stack_ptr;
+            loop {
+                if VirtualQuery(region as *const _, &mut mbi, mbi_size) == 0
+                    || mbi.AllocationBase as usize != stack_allocation
+                {
+                    break;
+                }
+                let region_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+                if region_end <= region {
+                    break;
+                }
+                let readable =
+                    mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
+                let mut next_slot = region.next_multiple_of(WORD);
+                region = region_end;
+                if !readable {
+                    continue;
+                }
 
-                for i in 0..STACK_SCAN_DEPTH {
-                    let current_stack_addr = stack_ptr + (i * std::mem::size_of::<usize>());
-                    if current_stack_addr + std::mem::size_of::<usize>() > stack_segment_top {
-                        break;
+                while next_slot + WORD <= region_end {
+                    let current_stack_addr = next_slot;
+                    next_slot += WORD;
+                    scanned += WORD;
+                    if scanned > MAX_STACK_SCAN_BYTES {
+                        // A return address deeper than this would be missed.
+                        return Err(DetourError::RelocationFailed);
                     }
 
                     let mut stack_value: usize = 0;
@@ -1670,6 +1789,10 @@ impl TransactionCore {
                         &mut stack_value,
                         1,
                     );
+
+                    if !Self::is_plausible_return_address(data, stack_value) {
+                        continue;
+                    }
 
                     if let Some(new_return_addr) =
                         Self::map_redirect_address_exact(data, stack_value)?
@@ -1945,6 +2068,7 @@ impl TransactionCore {
             target_kind: std::mem::replace(&mut data.target_kind, TargetKind::Normal),
             patch_bytes: std::mem::take(patch),
             enabled: true,
+            published: false,
         }))
     }
 
@@ -2045,6 +2169,80 @@ impl TransactionCore {
         println!("----------------------------------\n");
     }
 
+    /// Returns whether a stack word pointing into `data`'s stolen range can be a
+    /// return address: it must not be the entry itself, and the original bytes
+    /// must hold a `call` (`E8 rel32` or `FF /2`) ending exactly at it.
+    ///
+    /// Runs inside the suspend window and allocates nothing. Bytes inside the
+    /// stolen range come from the saved original bytes; bytes before the target
+    /// are read live, but only from the target's own (committed) page.
+    fn is_plausible_return_address(data: &InlineData, value: usize) -> bool {
+        const MAX_CALL_LEN: usize = 7;
+
+        let target_start = data.target as usize;
+        if value <= target_start || value >= target_start + data.stolen_len {
+            return false;
+        }
+
+        // window[k] is the byte at value - k, for k in 1..=available.
+        let mut window = [0u8; MAX_CALL_LEN + 1];
+        let mut available = 0;
+        let page_start = target_start & !0xFFF;
+        for (k, byte) in window.iter_mut().enumerate().skip(1) {
+            let Some(addr) = value.checked_sub(k) else {
+                break;
+            };
+            *byte = if addr >= target_start {
+                match data.orig_bytes.get(addr - target_start) {
+                    Some(&b) => b,
+                    None => break,
+                }
+            } else if addr >= page_start {
+                unsafe { std::ptr::read_volatile(addr as *const u8) }
+            } else {
+                break;
+            };
+            available = k;
+        }
+
+        // call rel32
+        if available >= 5 && window[5] == 0xE8 {
+            return true;
+        }
+
+        // call r/m (FF /2): the opcode at value - len, ModRM (and SIB) after it.
+        for len in 2..=available {
+            if window[len] != 0xFF {
+                continue;
+            }
+            let modrm = window[len - 1];
+            if (modrm >> 3) & 7 != 2 {
+                continue;
+            }
+            let rm = modrm & 7;
+            let encoded_len = match modrm >> 6 {
+                0b11 => 2,
+                0b00 if rm == 5 => 6,
+                0b00 if rm == 4 => {
+                    if len < 3 {
+                        continue;
+                    }
+                    if window[len - 2] & 7 == 5 { 7 } else { 3 }
+                }
+                0b00 => 2,
+                0b01 if rm == 4 => 4,
+                0b01 => 3,
+                _ if rm == 4 => 7,
+                _ => 6,
+            };
+            if encoded_len == len {
+                return true;
+            }
+        }
+
+        false
+    }
+
     fn map_redirect_address_exact(
         data: &InlineData,
         old_addr: usize,
@@ -2116,22 +2314,19 @@ impl Drop for TransactionCore {
 
 /// Process-wide transaction lock.
 ///
-/// NeoHook serializes the critical section of a transaction (thread suspension
-/// and code patching) so concurrent transactions on different threads cannot
-/// suspend each other or patch overlapping code at the same time. This mirrors
-/// the "one transaction at a time" model used by Microsoft Detours.
+/// NeoHook serializes transactions so concurrent transactions on different
+/// threads cannot suspend each other or patch overlapping code at the same
+/// time. This mirrors the "one transaction at a time" model used by Microsoft
+/// Detours. It is held from the first tracked thread until the commit or abort,
+/// so code that is not itself a transaction never waits for it: writers outside
+/// a transaction only take [`CODE_LOCK`].
 ///
-/// It is also the single lock for every code and table write: lifting a page's
-/// protection, writing and restoring it must not interleave with another such
-/// write on the same page, or one thread restores the protection while the
-/// other is still writing. Writers outside a transaction take it through
-/// [`with_code_lock`].
-///
-/// Lock order: this lock first, then any other crate mutex (gateway registry,
-/// stub quarantine, INT3 slot manager), never the reverse.
+/// Lock order: this lock, then the delay-hook manager, then [`CODE_LOCK`],
+/// then any other crate mutex (gateway registry, stub quarantine, INT3 slot
+/// manager), never the reverse.
 ///
 /// A transaction started on a thread that already holds the lock (inside
-/// [`with_code_lock`]) runs under that hold instead of taking it again.
+/// [`with_transaction_lock`]) runs under that hold instead of taking it again.
 static TRANSACTION_LOCK: Mutex<()> = Mutex::new(());
 
 /// Thread id of the current [`TRANSACTION_LOCK`] holder, or 0 while it is free.
@@ -2177,27 +2372,92 @@ fn lock_transaction() -> TransactionGuard {
     )
 }
 
-/// Runs a code or table write under the transaction lock.
+/// Runs `body` under the transaction lock, for setup that starts transactions
+/// of its own and must order its other locks after this one (delay hooks).
+/// Runs directly on a thread that already holds it.
+pub(crate) fn with_transaction_lock<R>(body: impl FnOnce() -> R) -> R {
+    if owns_transaction_lock() {
+        return body();
+    }
+    let _guard = lock_transaction();
+    body()
+}
+
+/// The single lock for every code and table write.
+///
+/// Lifting a page's protection, writing and restoring it must not interleave
+/// with another such write on the same page, or one thread restores the
+/// protection while the other is still writing. A commit holds it only for its
+/// patch phase - from right before the first thread is suspended until its
+/// detaches are finalized - and every other writer only for the write itself.
+/// No holder waits for the loader lock or the transaction lock, so it can be
+/// taken under the loader lock (`DLL_PROCESS_DETACH`, the `LdrLoadDll` detour).
+static CODE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Thread id of the current [`CODE_LOCK`] holder, or 0 while it is free. Lets a
+/// write made by the holder itself (a detach or rollback inside a commit) run
+/// without taking the lock again.
+static CODE_OWNER: AtomicU32 = AtomicU32::new(0);
+
+/// A held [`CODE_LOCK`] that records its owning thread.
+pub(crate) struct CodeGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl CodeGuard {
+    fn new(guard: std::sync::MutexGuard<'static, ()>) -> Self {
+        CODE_OWNER.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+        Self { _guard: guard }
+    }
+}
+
+impl Drop for CodeGuard {
+    fn drop(&mut self) {
+        // Cleared before the mutex itself is released.
+        CODE_OWNER.store(0, Ordering::Release);
+    }
+}
+
+fn owns_code_lock() -> bool {
+    CODE_OWNER.load(Ordering::Acquire) == unsafe { GetCurrentThreadId() }
+}
+
+/// Takes [`CODE_LOCK`] unless this thread already holds it, recovering from
+/// poisoning (it guards no data).
+fn hold_code_lock() -> Option<CodeGuard> {
+    if owns_code_lock() {
+        return None;
+    }
+    Some(CodeGuard::new(
+        CODE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    ))
+}
+
+/// Takes [`CODE_LOCK`] without waiting. `Some(None)` means this thread already
+/// holds it; `None` that another thread does.
+pub(crate) fn try_hold_code_lock() -> Option<Option<CodeGuard>> {
+    if owns_code_lock() {
+        return Some(None);
+    }
+    match CODE_LOCK.try_lock() {
+        Ok(guard) => Some(Some(CodeGuard::new(guard))),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+            Some(Some(CodeGuard::new(poisoned.into_inner())))
+        }
+    }
+}
+
+/// Runs a code or table write under [`CODE_LOCK`].
 ///
 /// When this thread already holds the lock (a commit detaching or rolling back
 /// hooks inside its suspend window) `write` runs directly, so it neither
 /// deadlocks nor waits on a mutex there.
 pub(crate) fn with_code_lock<R>(write: impl FnOnce() -> R) -> R {
-    if owns_transaction_lock() {
-        return write();
-    }
-    let _guard = lock_transaction();
+    let _guard = hold_code_lock();
     write()
-}
-
-/// Like [`with_code_lock`], but returns `None` instead of waiting while another
-/// thread holds the lock.
-pub(crate) fn try_with_code_lock<R>(write: impl FnOnce() -> R) -> Option<R> {
-    if owns_transaction_lock() {
-        return Some(write());
-    }
-    let _guard = try_lock_transaction()?;
-    Some(write())
 }
 
 /// Tries to take the process-wide transaction lock without blocking.
@@ -2254,8 +2514,11 @@ unsafe fn hook_from_detach_target_mut<'a>(
                 return Err(DetourError::InvalidParameter);
             }
 
-            let hooks = unsafe { &mut *(handle as *mut Vec<Hook>) };
-            hooks.get_mut(index).ok_or(DetourError::InvalidParameter)
+            let hooks = unsafe { &mut *(handle as *mut crate::api::HandleSlots) };
+            hooks
+                .get_mut(index)
+                .and_then(Option::as_mut)
+                .ok_or(DetourError::InvalidParameter)
         }
     }
 }
@@ -2271,8 +2534,6 @@ fn rollback_detaches(detached: &mut Vec<AppliedDetach>) {
 }
 
 fn finalize_detaches(detached: &mut Vec<AppliedDetach>) {
-    let mut handle_detaches = Vec::new();
-
     for detach in detached.iter() {
         match detach.target {
             DetachTarget::HookPtr(hook) => {
@@ -2283,29 +2544,18 @@ fn finalize_detaches(detached: &mut Vec<AppliedDetach>) {
                 }
             }
             DetachTarget::HandleIndex { handle, index } => {
-                handle_detaches.push((handle, index));
+                if handle.is_null() {
+                    continue;
+                }
+
+                // Empty the slot instead of removing it, so the indices of the
+                // handle's other hooks stay the same.
+                let hooks = unsafe { &mut *(handle as *mut crate::api::HandleSlots) };
+                if let Some(mut hook) = hooks.get_mut(index).and_then(Option::take) {
+                    hook.detach_finalize();
+                }
             }
         }
-    }
-
-    handle_detaches.sort_by(|(left_handle, left_index), (right_handle, right_index)| {
-        left_handle
-            .cmp(right_handle)
-            .then_with(|| right_index.cmp(left_index))
-    });
-
-    for (handle, index) in handle_detaches {
-        if handle.is_null() {
-            continue;
-        }
-
-        let hooks = unsafe { &mut *(handle as *mut Vec<Hook>) };
-        if index >= hooks.len() {
-            continue;
-        }
-
-        let mut hook = hooks.remove(index);
-        hook.detach_finalize();
     }
 
     detached.clear();
@@ -2429,6 +2679,116 @@ fn is_managed_gateway(ptr: *mut u8) -> bool {
         .lock()
         .map(|s| s.contains(&(ptr as usize)))
         .unwrap_or(false)
+}
+
+/// Hooks chained on a managed gateway, keyed by the gateway address.
+struct ChainedGateway {
+    /// Installed hooks whose target is this gateway.
+    dependents: usize,
+    /// The gateway's trampoline (address, size) once its owner was dropped,
+    /// retired when the last dependent is released.
+    orphan: Option<(usize, usize)>,
+}
+
+/// Updated only outside the suspend window, under the transaction lock.
+fn chained_gateways() -> &'static Mutex<HashMap<usize, ChainedGateway>> {
+    static CHAINED: OnceLock<Mutex<HashMap<usize, ChainedGateway>>> = OnceLock::new();
+    CHAINED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn add_gateway_dependent(gateway: *mut u8) {
+    let _ = chained_gateways().lock().map(|mut m| {
+        m.entry(gateway as usize)
+            .or_insert(ChainedGateway {
+                dependents: 0,
+                orphan: None,
+            })
+            .dependents += 1;
+    });
+}
+
+/// Drops one dependent of `gateway`. Returns whether the gateway's owner is
+/// still alive, and the orphaned trampoline to retire once the last dependent
+/// is gone.
+fn remove_gateway_dependent(gateway: *mut u8) -> (bool, Option<(usize, usize)>) {
+    let Ok(mut m) = chained_gateways().lock() else {
+        return (false, None);
+    };
+    let Some(entry) = m.get_mut(&(gateway as usize)) else {
+        return (true, None);
+    };
+    let owner_alive = entry.orphan.is_none();
+    entry.dependents = entry.dependents.saturating_sub(1);
+    if entry.dependents > 0 {
+        return (owner_alive, None);
+    }
+    let orphan = entry.orphan;
+    m.remove(&(gateway as usize));
+    (owner_alive, orphan)
+}
+
+/// Whether an installed hook is chained on `gateway`.
+fn is_chained_gateway(gateway: *mut u8) -> bool {
+    chained_gateways()
+        .lock()
+        .map(|m| m.contains_key(&(gateway as usize)))
+        .unwrap_or(false)
+}
+
+/// Hands the trampoline of a dropped hook to the hooks chained on its gateway.
+/// Returns `false` if nothing is chained on it, so the caller retires it.
+fn orphan_chained_gateway(gateway: *mut u8, size: usize) -> bool {
+    chained_gateways()
+        .lock()
+        .map(|mut m| match m.get_mut(&(gateway as usize)) {
+            Some(entry) if entry.dependents > 0 => {
+                entry.orphan = Some((gateway as usize, size));
+                true
+            }
+            _ => false,
+        })
+        .unwrap_or(false)
+}
+
+/// Code ranges patched by installed inline hooks, as start -> length. Updated
+/// only outside the suspend window, under the transaction lock.
+fn live_patches() -> &'static Mutex<HashMap<usize, usize>> {
+    static PATCHES: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+    PATCHES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_live_patch(target: *mut u8, len: usize) {
+    let _ = live_patches().lock().map(|mut m| {
+        m.insert(target as usize, len);
+    });
+}
+
+fn unregister_live_patch(target: *mut u8) {
+    let _ = live_patches().lock().map(|mut m| {
+        m.remove(&(target as usize));
+    });
+}
+
+fn overlaps_live_patch(target: *mut u8, len: usize) -> bool {
+    live_patches()
+        .lock()
+        .map(|m| {
+            m.iter()
+                .any(|(&start, &patched)| ranges_overlap(start, patched, target as usize, len))
+        })
+        .unwrap_or(false)
+}
+
+/// Whether an installed inline hook patches code starting at `target`.
+pub(crate) fn live_patch_starts_at(target: *const u8) -> bool {
+    live_patches()
+        .lock()
+        .map(|m| m.contains_key(&(target as usize)))
+        .unwrap_or(false)
+}
+
+fn ranges_overlap(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
+    a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
 }
 
 #[cfg(target_arch = "x86_64")]
