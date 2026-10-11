@@ -1465,6 +1465,27 @@ impl TransactionCore {
         // Writers outside the transaction wait only for the patch phase. Taken
         // before the first suspension, so no frozen thread can hold it.
         let code_guard = hold_code_lock();
+
+        // A gateway queued for chaining may have lost its owner since `attach`
+        // (dropping a hook only waits for this lock, not for the transaction):
+        // it is retired and will be freed, so it must not be patched. Checked
+        // under the code lock, which every drop takes, and before any thread is
+        // suspended, since the registry is a mutex.
+        let orphaned = pending.iter().position(|hook| {
+            matches!(hook, PendingHook::Inline(data)
+                if matches!(data.target_kind, TargetKind::ManagedGateway)
+                    && !is_managed_gateway(data.target))
+        });
+        if let Some(index) = orphaned {
+            drop(code_guard);
+            self.cleanup_threads();
+            return Err(DetourError::CommitFailed {
+                index,
+                kind: HookKind::Inline,
+                source: Box::new(DetourError::InvalidParameter),
+            });
+        }
+
         let freeze_guard = crate::threads::hold_freeze_lock();
 
         self.suspend_threads();
