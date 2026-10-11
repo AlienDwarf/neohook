@@ -11,9 +11,13 @@ use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, GetThreadContext, SetThreadContext};
 use windows_sys::Win32::System::Threading::*;
 
-/// The number of usize slots to scan on the stack for return addresses.
-/// Default: 512 (corresponds to 4KB / one memory page on x64).
-const STACK_SCAN_DEPTH: usize = 512;
+/// Stack slots per tracked thread a commit reserves for redirected return
+/// addresses, before any thread is suspended. A commit needing more fails.
+const STACK_REDIRECTS_PER_THREAD: usize = 512;
+
+/// Upper bound on the stack bytes read per thread when redirecting return
+/// addresses.
+const MAX_STACK_SCAN_BYTES: usize = 32 * 1024 * 1024;
 
 #[cfg(target_arch = "x86_64")]
 const CONTEXT_FLAGS: u32 = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_ALL_AMD64;
@@ -1454,7 +1458,7 @@ impl TransactionCore {
             // in this commit can target.
             self.redirected_threads.reserve(self.threads.len());
             self.redirected_stacks
-                .reserve(self.threads.len() * STACK_SCAN_DEPTH);
+                .reserve(self.threads.len() * STACK_REDIRECTS_PER_THREAD);
         }
         crate::cfg::prepare();
 
@@ -1637,8 +1641,9 @@ impl TransactionCore {
     ///
     /// # Notes
     ///
-    /// - Only a limited of the stack is scanned, as defined by
-    ///   `STACK_SCAN_DEPTH`. Automatically detects when the stack frame ends to avoid invalid access
+    /// - The whole committed stack above the stack pointer is scanned, up to
+    ///   the end of the stack reservation; uncommitted and guard pages are
+    ///   skipped. A return address can sit arbitrarily deep below a call chain.
     /// - This function assumes the thread is already suspended before being passed
     ///   in.
     /// - On x86_64, the instruction pointer and stack pointer are taken from `Rip`
@@ -1715,20 +1720,42 @@ impl TransactionCore {
             #[cfg(target_arch = "x86")]
             let stack_ptr = context.Esp as usize;
 
-            let mut mbi: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION =
-                std::mem::zeroed();
-            if windows_sys::Win32::System::Memory::VirtualQuery(
-                stack_ptr as *const _,
-                &mut mbi,
-                std::mem::size_of::<windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION>(),
-            ) != 0
-            {
-                let stack_segment_top = mbi.BaseAddress as usize + mbi.RegionSize;
+            use windows_sys::Win32::System::Memory::{
+                MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+            };
+            const WORD: usize = std::mem::size_of::<usize>();
+            let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let mbi_size = std::mem::size_of::<MEMORY_BASIC_INFORMATION>();
+            if VirtualQuery(stack_ptr as *const _, &mut mbi, mbi_size) == 0 {
+                return Ok(());
+            }
+            let stack_allocation = mbi.AllocationBase as usize;
+            let mut scanned = 0usize;
+            let mut region = stack_ptr;
+            loop {
+                if VirtualQuery(region as *const _, &mut mbi, mbi_size) == 0
+                    || mbi.AllocationBase as usize != stack_allocation
+                {
+                    break;
+                }
+                let region_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+                if region_end <= region {
+                    break;
+                }
+                let readable =
+                    mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
+                let mut next_slot = region.next_multiple_of(WORD);
+                region = region_end;
+                if !readable {
+                    continue;
+                }
 
-                for i in 0..STACK_SCAN_DEPTH {
-                    let current_stack_addr = stack_ptr + (i * std::mem::size_of::<usize>());
-                    if current_stack_addr + std::mem::size_of::<usize>() > stack_segment_top {
-                        break;
+                while next_slot + WORD <= region_end {
+                    let current_stack_addr = next_slot;
+                    next_slot += WORD;
+                    scanned += WORD;
+                    if scanned > MAX_STACK_SCAN_BYTES {
+                        return Ok(());
                     }
 
                     let mut stack_value: usize = 0;
