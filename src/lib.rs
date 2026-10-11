@@ -36,6 +36,7 @@ mod symbols;
 mod threads;
 pub mod trace;
 pub(crate) mod transaction;
+mod unwind;
 mod veh;
 mod vtable;
 mod watchdog;

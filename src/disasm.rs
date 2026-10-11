@@ -10,6 +10,10 @@ pub(crate) struct RelocationMapping {
     pub written_len: usize,
     pub old_instruction_offsets: Vec<u32>,
     pub new_instruction_offsets: Vec<u32>,
+    /// Offset of the appended jump back to the original code, which is where
+    /// the stolen instructions end. Read by the x64 unwind data only.
+    #[cfg_attr(target_arch = "x86", allow(dead_code))]
+    pub jmp_back_offset: u32,
 }
 
 /// Returns how many bytes are readable starting at `address`, bounded by the
@@ -390,6 +394,7 @@ impl Disassembler {
             written_len: result.code_buffer.len(),
             old_instruction_offsets,
             new_instruction_offsets,
+            jmp_back_offset: result.new_instruction_offsets[instructions.len() - 1],
         })
     }
 }
