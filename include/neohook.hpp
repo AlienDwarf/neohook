@@ -321,6 +321,12 @@ namespace neohook
             return *this;
         }
 
+        /**
+         * @brief Returns the number of hook slots in this guard.
+         *
+         * Transaction::detach() empties a slot without shrinking the guard, so
+         * indices stay stable; an emptied slot behaves like an out-of-range index.
+         */
         size_t count() const
         {
             return handle_ ? static_cast<size_t>(detours_handle_len(handle_)) : 0;
@@ -445,6 +451,9 @@ namespace neohook
 
         /**
          * @brief Queues one hook from an existing HookGuard to be removed on commit.
+         *
+         * The other hooks in @p guard keep their indices; the removed slot stays
+         * empty and cannot be detached again.
          */
         void detach(HookGuard &guard, size_t index)
         {

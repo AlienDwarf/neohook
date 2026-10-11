@@ -296,10 +296,15 @@ uint8_t *detours_transaction_attach(DetourTransaction *tx, uint8_t *target, cons
  * transaction commits.
  *
  * On success, the selected hook is removed from `handle` during commit. The
- * handle remains valid and any other hooks stored in it remain active.
+ * handle remains valid and any other hooks stored in it remain active. Indices
+ * are stable: the detached hook leaves an empty slot behind, so every other
+ * index keeps naming the same hook and `detours_handle_len()` does not change.
+ * Every `detours_handle_*` accessor treats an empty slot like an out-of-range
+ * index, and it cannot be detached again.
  *
  * Returns `1` if the detach was queued, or `0` if `tx`/`handle` is null, the
- * transaction is no longer pending, or `idx` is out of bounds.
+ * transaction is no longer pending, or `idx` is out of bounds or names an
+ * already detached hook.
  *
  * # Safety
  * `tx` must be a valid transaction pointer returned by
@@ -326,7 +331,12 @@ int32_t detours_transaction_detach(DetourTransaction *tx, void *handle, uintptr_
 void *detours_transaction_commit(DetourTransaction *tx);
 
 /**
- * Returns the number of installed hooks stored in an opaque hook handle.
+ * Returns the number of hook slots in an opaque hook handle.
+ *
+ * This is the number of hooks the handle was committed with. Detaching a hook
+ * with `detours_transaction_detach()` empties its slot without shrinking the
+ * handle, so indices stay valid; the `detours_handle_*` accessors treat an
+ * emptied slot like an out-of-range index.
  *
  * Returns `0` if `handle` is null.
  *
@@ -342,7 +352,8 @@ uintptr_t detours_handle_len(void *handle);
  * For inline hooks, this is the trampoline entry managed by NeoHook.
  * For IAT hooks, this is the original imported function pointer.
  *
- * Returns null if `handle` is null or if `idx` is out of bounds.
+ * Returns null if `handle` is null, if `idx` is out of bounds or if the hook
+ * at `idx` was detached.
  *
  * # Safety
  * `handle` must be a valid handle previously returned by
@@ -358,8 +369,8 @@ const uint8_t *detours_handle_get_original_ptr(void *handle, uintptr_t idx);
  * installed; enabling re-applies the detour. This is cheaper than a full
  * unhook/rehook cycle.
  *
- * Returns `1` on success, `0` if `handle` is null, `idx` is out of bounds, or
- * the toggle failed.
+ * Returns `1` on success, `0` if `handle` is null, `idx` is out of bounds,
+ * the hook at `idx` was detached, or the toggle failed.
  *
  * # Safety
  * `handle` must be a valid handle previously returned by
@@ -369,7 +380,8 @@ int32_t detours_handle_set_enabled(void *handle, uintptr_t idx, int32_t enabled)
 
 /**
  * Returns `1` if the hook at `idx` is currently enabled, `0` otherwise (also
- * `0` if `handle` is null or `idx` is out of bounds).
+ * `0` if `handle` is null, `idx` is out of bounds or the hook at `idx` was
+ * detached).
  *
  * # Safety
  * `handle` must be a valid handle previously returned by

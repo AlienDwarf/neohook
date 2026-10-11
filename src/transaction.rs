@@ -1318,8 +1318,8 @@ impl TransactionCore {
 
     /// Queues a hook stored inside an FFI handle to be detached on commit.
     ///
-    /// The handle remains valid. On success, the selected hook is removed from
-    /// the handle's hook list and all remaining hooks keep their relative order.
+    /// The handle remains valid. On success, the selected slot is emptied and
+    /// every other hook keeps its index.
     ///
     /// # Safety
     ///
@@ -1339,8 +1339,8 @@ impl TransactionCore {
             return Err(DetourError::InvalidParameter);
         }
 
-        let hooks = unsafe { &*(handle as *mut Vec<Hook>) };
-        if index >= hooks.len() {
+        let hooks = handle as *const crate::api::HandleSlots;
+        if !with_code_lock(|| matches!(unsafe { &*hooks }.get(index), Some(Some(_)))) {
             return Err(DetourError::InvalidParameter);
         }
 
@@ -2394,8 +2394,11 @@ unsafe fn hook_from_detach_target_mut<'a>(
                 return Err(DetourError::InvalidParameter);
             }
 
-            let hooks = unsafe { &mut *(handle as *mut Vec<Hook>) };
-            hooks.get_mut(index).ok_or(DetourError::InvalidParameter)
+            let hooks = unsafe { &mut *(handle as *mut crate::api::HandleSlots) };
+            hooks
+                .get_mut(index)
+                .and_then(Option::as_mut)
+                .ok_or(DetourError::InvalidParameter)
         }
     }
 }
@@ -2411,8 +2414,6 @@ fn rollback_detaches(detached: &mut Vec<AppliedDetach>) {
 }
 
 fn finalize_detaches(detached: &mut Vec<AppliedDetach>) {
-    let mut handle_detaches = Vec::new();
-
     for detach in detached.iter() {
         match detach.target {
             DetachTarget::HookPtr(hook) => {
@@ -2423,29 +2424,18 @@ fn finalize_detaches(detached: &mut Vec<AppliedDetach>) {
                 }
             }
             DetachTarget::HandleIndex { handle, index } => {
-                handle_detaches.push((handle, index));
+                if handle.is_null() {
+                    continue;
+                }
+
+                // Empty the slot instead of removing it, so the indices of the
+                // handle's other hooks stay the same.
+                let hooks = unsafe { &mut *(handle as *mut crate::api::HandleSlots) };
+                if let Some(mut hook) = hooks.get_mut(index).and_then(Option::take) {
+                    hook.detach_finalize();
+                }
             }
         }
-    }
-
-    handle_detaches.sort_by(|(left_handle, left_index), (right_handle, right_index)| {
-        left_handle
-            .cmp(right_handle)
-            .then_with(|| right_index.cmp(left_index))
-    });
-
-    for (handle, index) in handle_detaches {
-        if handle.is_null() {
-            continue;
-        }
-
-        let hooks = unsafe { &mut *(handle as *mut Vec<Hook>) };
-        if index >= hooks.len() {
-            continue;
-        }
-
-        let mut hook = hooks.remove(index);
-        hook.detach_finalize();
     }
 
     detached.clear();

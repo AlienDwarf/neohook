@@ -429,10 +429,15 @@ pub unsafe extern "C" fn detours_transaction_attach(
 /// transaction commits.
 ///
 /// On success, the selected hook is removed from `handle` during commit. The
-/// handle remains valid and any other hooks stored in it remain active.
+/// handle remains valid and any other hooks stored in it remain active. Indices
+/// are stable: the detached hook leaves an empty slot behind, so every other
+/// index keeps naming the same hook and `detours_handle_len()` does not change.
+/// Every `detours_handle_*` accessor treats an empty slot like an out-of-range
+/// index, and it cannot be detached again.
 ///
 /// Returns `1` if the detach was queued, or `0` if `tx`/`handle` is null, the
-/// transaction is no longer pending, or `idx` is out of bounds.
+/// transaction is no longer pending, or `idx` is out of bounds or names an
+/// already detached hook.
 ///
 /// # Safety
 /// `tx` must be a valid transaction pointer returned by
@@ -483,13 +488,54 @@ pub unsafe extern "C" fn detours_transaction_commit(
         }
         let tx_box = unsafe { Box::from_raw(tx) };
         match tx_box.commit() {
-            Ok(v) => Box::into_raw(Box::new(v)) as *mut c_void,
+            Ok(v) => {
+                let slots: HandleSlots = v.into_iter().map(Some).collect();
+                Box::into_raw(Box::new(slots)) as *mut c_void
+            }
             Err(_) => std::ptr::null_mut(),
         }
     })
 }
 
-/// Returns the number of installed hooks stored in an opaque hook handle.
+/// Storage behind a hook handle returned by `detours_transaction_commit()`.
+///
+/// A hook detached through `detours_transaction_detach()` leaves `None` in its
+/// slot, so the index of every other hook stays the same.
+pub(crate) type HandleSlots = Vec<Option<Hook>>;
+
+/// Runs `f` on the hook in slot `idx` of `handle` under the transaction lock,
+/// so it cannot race a commit on another thread detaching from the same handle.
+///
+/// Returns `missing` if `handle` is null, `idx` is out of bounds or the slot was
+/// emptied by a detach.
+///
+/// # Safety
+/// `handle` must be null or a valid handle returned by
+/// `detours_transaction_commit()`.
+unsafe fn with_handle_slot<R>(
+    handle: *mut c_void,
+    idx: usize,
+    missing: R,
+    f: impl FnOnce(&mut Hook) -> R,
+) -> R {
+    if handle.is_null() {
+        return missing;
+    }
+    crate::transaction::with_code_lock(|| {
+        let slots = unsafe { &mut *(handle as *mut HandleSlots) };
+        match slots.get_mut(idx).and_then(Option::as_mut) {
+            Some(hook) => f(hook),
+            None => missing,
+        }
+    })
+}
+
+/// Returns the number of hook slots in an opaque hook handle.
+///
+/// This is the number of hooks the handle was committed with. Detaching a hook
+/// with `detours_transaction_detach()` empties its slot without shrinking the
+/// handle, so indices stay valid; the `detours_handle_*` accessors treat an
+/// emptied slot like an out-of-range index.
 ///
 /// Returns `0` if `handle` is null.
 ///
@@ -501,8 +547,7 @@ pub unsafe extern "C" fn detours_handle_len(handle: *mut c_void) -> usize {
     if handle.is_null() {
         return 0;
     }
-    let vec = unsafe { &*(handle as *mut Vec<Hook>) };
-    vec.len()
+    crate::transaction::with_code_lock(|| unsafe { &*(handle as *mut HandleSlots) }.len())
 }
 
 /// Returns the original function pointer associated with the hook at `idx`.
@@ -510,7 +555,8 @@ pub unsafe extern "C" fn detours_handle_len(handle: *mut c_void) -> usize {
 /// For inline hooks, this is the trampoline entry managed by NeoHook.
 /// For IAT hooks, this is the original imported function pointer.
 ///
-/// Returns null if `handle` is null or if `idx` is out of bounds.
+/// Returns null if `handle` is null, if `idx` is out of bounds or if the hook
+/// at `idx` was detached.
 ///
 /// # Safety
 /// `handle` must be a valid handle previously returned by
@@ -520,14 +566,7 @@ pub unsafe extern "C" fn detours_handle_get_original_ptr(
     handle: *mut c_void,
     idx: usize,
 ) -> *const u8 {
-    if handle.is_null() {
-        return std::ptr::null();
-    }
-    let vec = unsafe { &*(handle as *mut Vec<Hook>) };
-
-    vec.get(idx)
-        .map(|d| d.original_ptr())
-        .unwrap_or(std::ptr::null())
+    unsafe { with_handle_slot(handle, idx, std::ptr::null(), |hook| hook.original_ptr()) }
 }
 
 /// Enables (`enabled != 0`) or disables (`enabled == 0`) the hook at `idx`
@@ -537,8 +576,8 @@ pub unsafe extern "C" fn detours_handle_get_original_ptr(
 /// installed; enabling re-applies the detour. This is cheaper than a full
 /// unhook/rehook cycle.
 ///
-/// Returns `1` on success, `0` if `handle` is null, `idx` is out of bounds, or
-/// the toggle failed.
+/// Returns `1` on success, `0` if `handle` is null, `idx` is out of bounds,
+/// the hook at `idx` was detached, or the toggle failed.
 ///
 /// # Safety
 /// `handle` must be a valid handle previously returned by
@@ -549,37 +588,28 @@ pub unsafe extern "C" fn detours_handle_set_enabled(
     idx: usize,
     enabled: i32,
 ) -> i32 {
-    if handle.is_null() {
-        return 0;
-    }
-    let vec = unsafe { &mut *(handle as *mut Vec<Hook>) };
-
-    match vec.get_mut(idx) {
-        Some(hook) => {
+    unsafe {
+        with_handle_slot(handle, idx, 0, |hook| {
             let result = if enabled != 0 {
                 hook.enable()
             } else {
                 hook.disable()
             };
             result.map(|_| 1).unwrap_or(0)
-        }
-        None => 0,
+        })
     }
 }
 
 /// Returns `1` if the hook at `idx` is currently enabled, `0` otherwise (also
-/// `0` if `handle` is null or `idx` is out of bounds).
+/// `0` if `handle` is null, `idx` is out of bounds or the hook at `idx` was
+/// detached).
 ///
 /// # Safety
 /// `handle` must be a valid handle previously returned by
 /// `detours_transaction_commit()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn detours_handle_is_enabled(handle: *mut c_void, idx: usize) -> i32 {
-    if handle.is_null() {
-        return 0;
-    }
-    let vec = unsafe { &*(handle as *mut Vec<Hook>) };
-    vec.get(idx).map(|h| h.is_enabled() as i32).unwrap_or(0)
+    unsafe { with_handle_slot(handle, idx, 0, |hook| hook.is_enabled() as i32) }
 }
 
 /// Unhooks all installed hooks referenced by `handle` and frees the handle.
@@ -597,7 +627,7 @@ pub unsafe extern "C" fn detours_handle_unhook_and_free(handle: *mut c_void) -> 
         if handle.is_null() {
             return 0;
         }
-        let _vec_box = unsafe { Box::from_raw(handle as *mut Vec<Hook>) };
+        let _vec_box = unsafe { Box::from_raw(handle as *mut HandleSlots) };
         // Dropping the vector drops all hooks, which triggers unhooking via RAII.
         1
     })

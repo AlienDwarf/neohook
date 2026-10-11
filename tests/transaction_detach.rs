@@ -88,7 +88,7 @@ fn ffi_transaction_detach_removes_one_hook_from_handle() {
         assert!(!detach_result.is_null());
         assert_eq!(detours_handle_unhook_and_free(detach_result), 1);
 
-        assert_eq!(detours_handle_len(handle), 1);
+        assert_eq!(detours_handle_len(handle), 2);
         assert_eq!(target_one(1), 2);
         assert_eq!(target_two(1), 201);
 
