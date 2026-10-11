@@ -769,6 +769,53 @@ mod tests {
         }
     }
 
+    /// Relocates `call $+5; pop eax/rax; ret` (`stolen_len` bytes of it) from
+    /// an executable page into a trampoline on the next page, runs the
+    /// trampoline and returns `(source, value it returned, mapping, tramp)`.
+    fn run_relocated_get_pc(
+        stolen_len: usize,
+    ) -> (usize, usize, super::RelocationMapping, Vec<u8>) {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const CODE: [u8; 7] = [0xE8, 0x00, 0x00, 0x00, 0x00, 0x58, 0xC3];
+        unsafe {
+            let base = VirtualAlloc(
+                std::ptr::null(),
+                0x2000,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            ) as *mut u8;
+            assert!(!base.is_null(), "setup allocation failed");
+            std::ptr::write_bytes(base, 0xCC, 0x2000);
+            std::ptr::copy_nonoverlapping(CODE.as_ptr(), base, CODE.len());
+            let tramp = base.add(0x1000);
+
+            let map = Disassembler::relocate(base, tramp, stolen_len).expect("relocation failed");
+            let run: extern "C" fn() -> usize = std::mem::transmute(tramp);
+            let got = run();
+            let bytes = std::slice::from_raw_parts(tramp, map.written_len).to_vec();
+            assert_ne!(VirtualFree(base as _, 0, MEM_RELEASE), 0);
+            (base as usize, got, map, bytes)
+        }
+    }
+
+    /// The get-PC idiom must read the original return address, not one inside
+    /// the trampoline, whether the `pop` was stolen too or not.
+    #[test]
+    fn relocated_get_pc_sees_original_return_address() {
+        for stolen_len in [5, 7] {
+            let (src, got, map, tramp) = run_relocated_get_pc(stolen_len);
+            assert_eq!(got, src + 5, "stolen_len={stolen_len}");
+            assert_eq!(map.new_instruction_offsets[0], 0);
+            if stolen_len == 7 {
+                assert_eq!(map.old_instruction_offsets, vec![0, 5, 6]);
+                assert_eq!(tramp[map.new_instruction_offsets[1] as usize], 0x58);
+                assert_eq!(tramp[map.new_instruction_offsets[2] as usize], 0xC3);
+            }
+        }
+    }
+
     /// Regression (found by the relocator fuzzer): `jrcxz`/`jcxz`/`loop*` have no
     /// long form, so when the target is out of `rel8` range from the trampoline
     /// iced reports the new instruction offset as `u32::MAX`. `relocate` must then
