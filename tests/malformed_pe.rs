@@ -193,3 +193,45 @@ fn enumerate_exports_skips_overflowing_ordinals() {
         assert_eq!(ordinals, [u32::MAX]);
     });
 }
+
+const IMPORT_DIR: usize = 0x800;
+const DESCRIPTOR_SIZE: usize = 20;
+
+/// Adds an import table for `a.dll!Alpha` and `b.dll!Target`, terminated by a
+/// zero descriptor, whose directory entry reports `size` bytes.
+fn with_imports(image: &FakeImage, size: usize) {
+    image.set_directory(IMAGE_DIRECTORY_ENTRY_IMPORT, IMPORT_DIR, size);
+
+    for (i, (dll, func)) in [("a.dll", "Alpha"), ("b.dll", "Target")].iter().enumerate() {
+        let desc = IMPORT_DIR + i * DESCRIPTOR_SIZE;
+        let dll_rva = 0x900 + i * 0x40;
+        let by_name_rva = dll_rva + 0x10;
+        let int_rva = 0xA00 + i * 0x20;
+        let iat_rva = 0xB00 + i * 0x20;
+
+        image.write(desc, int_rva as u32); // OriginalFirstThunk
+        image.write(desc + 12, dll_rva as u32); // Name
+        image.write(desc + 16, iat_rva as u32); // FirstThunk
+
+        for (j, b) in dll.bytes().enumerate() {
+            image.write(dll_rva + j, b);
+        }
+        // IMAGE_IMPORT_BY_NAME: a zero hint followed by the name.
+        for (j, b) in func.bytes().enumerate() {
+            image.write(by_name_rva + 2 + j, b);
+        }
+
+        image.write(int_rva, by_name_rva);
+        image.write(iat_rva, 1usize);
+    }
+}
+
+#[test]
+fn attach_iat_walks_imports_past_an_understated_directory_size() {
+    for size in [DESCRIPTOR_SIZE, 0] {
+        let image = FakeImage::new();
+        with_imports(&image, size);
+        let result = attach_iat(&image, "b.dll", "Target");
+        assert!(result.is_ok(), "size {size}: {result:?}");
+    }
+}
