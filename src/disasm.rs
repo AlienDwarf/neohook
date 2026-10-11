@@ -403,6 +403,76 @@ mod tests {
         );
     }
 
+    /// Allocates a page of `nop`s ending in `ret` and protects it with
+    /// `protect`.
+    unsafe fn code_page(protect: u32) -> *mut u8 {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualProtect,
+        };
+        unsafe {
+            let page = VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            ) as *mut u8;
+            assert!(!page.is_null(), "setup allocation failed");
+            std::ptr::write_bytes(page, 0x90, 4096);
+            *page.add(4095) = 0xC3;
+            let mut old = 0u32;
+            assert_ne!(VirtualProtect(page as _, 4096, protect, &mut old), 0);
+            page
+        }
+    }
+
+    unsafe fn protect_of(addr: *const u8) -> u32 {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        unsafe {
+            let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let q = VirtualQuery(
+                addr as _,
+                &mut mbi,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            );
+            assert_ne!(q, 0, "VirtualQuery failed");
+            mbi.Protect
+        }
+    }
+
+    /// Reading a guard page consumes its guard (and raises
+    /// STATUS_GUARD_PAGE_VIOLATION), so guard and no-access pages must not be
+    /// reported as readable, and hooking into one must fail without touching it.
+    #[test]
+    fn guard_and_noaccess_pages_are_not_readable() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_RELEASE, PAGE_EXECUTE_READ, PAGE_GUARD, PAGE_NOACCESS, VirtualFree,
+        };
+        extern "C" fn detour() {}
+        for protect in [PAGE_EXECUTE_READ | PAGE_GUARD, PAGE_NOACCESS] {
+            unsafe {
+                let page = code_page(protect);
+                assert_eq!(
+                    super::readable_bytes_from(page),
+                    0,
+                    "protection {protect:#x} must not count as readable"
+                );
+                assert!(Disassembler::get_instruction_len(page, 5).is_err());
+
+                let mut tx = crate::DetourTransaction::begin();
+                let res = tx.attach(page, detour as *const u8);
+                tx.abort();
+                assert!(res.is_err(), "attach must fail cleanly, got {res:?}");
+
+                assert_eq!(
+                    protect_of(page),
+                    protect,
+                    "the page protection (guard bit) must be untouched"
+                );
+                assert_ne!(VirtualFree(page as _, 0, MEM_RELEASE), 0);
+            }
+        }
+    }
+
     #[test]
     fn get_instruction_len_handles_min_size_larger_than_32() {
         let code = [0x90u8; 64]; // 64 NOPs
