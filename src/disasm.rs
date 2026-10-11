@@ -157,8 +157,11 @@ impl Disassembler {
         // Set once an instruction that ends the function has been decoded;
         // from then on only padding may be covered.
         let mut function_ended = false;
-        // Furthest address a conditional jump decoded so far jumps to.
+        // Furthest address a conditional jump decoded so far jumps to. Only
+        // targets within the bytes decoded here count: a jump further away is
+        // a conditional tail call into another function, not an early exit.
         let mut branch_reach = 0u64;
+        let window_end = address as u64 + read_len as u64;
 
         // Decode instructions until we have at least min_size bytes or we run out of instructions to decode
         while decoder.can_decode() && total_bytes < min_size {
@@ -185,7 +188,9 @@ impl Disassembler {
                 return Ok(total_bytes);
             }
 
-            if Self::is_conditional_jump(&instruction) {
+            if Self::is_conditional_jump(&instruction)
+                && instruction.near_branch_target() < window_end
+            {
                 branch_reach = branch_reach.max(instruction.near_branch_target());
             }
             if Self::ends_function(&instruction) && branch_reach < instruction.next_ip() {
