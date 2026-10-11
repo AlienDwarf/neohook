@@ -6,7 +6,7 @@
 //! before being fixed run in a child process so a crash is reported as a
 //! failure instead of taking down the test run.
 
-use neohook::{DetourError, DetourTransaction, IatHookError};
+use neohook::{DetourError, DetourTransaction, IatHookError, get_module_size};
 use std::process::{Command, Stdio};
 use windows_sys::Win32::Foundation::HMODULE;
 use windows_sys::Win32::System::Diagnostics::Debug::*;
@@ -128,5 +128,28 @@ fn attach_iat_rejects_out_of_range_e_lfanew() {
         unsafe { (*image.dos()).e_lfanew = e_lfanew as i32 };
         image.write(e_lfanew, IMAGE_NT_SIGNATURE);
         assert!(is_invalid_pe(attach_iat(&image, "kernel32.dll", "Sleep")));
+    });
+}
+
+#[test]
+fn get_module_size_rejects_malformed_headers() {
+    in_child("get_module_size_rejects_malformed_headers", || {
+        let image = FakeImage::new();
+        assert_eq!(get_module_size(image.handle()), IMAGE_SIZE as u32);
+
+        for e_lfanew in [0x7FFF_FFF0, -0x1000, (IMAGE_SIZE - 4) as i32] {
+            let image = FakeImage::new();
+            unsafe { (*image.dos()).e_lfanew = e_lfanew };
+            image.write(IMAGE_SIZE - 4, IMAGE_NT_SIGNATURE);
+            assert_eq!(get_module_size(image.handle()), 0, "e_lfanew {e_lfanew:#x}");
+        }
+
+        let image = FakeImage::new();
+        unsafe { (*image.nt()).Signature = 0 };
+        assert_eq!(get_module_size(image.handle()), 0, "missing PE signature");
+
+        let image = FakeImage::new();
+        unsafe { (*image.nt()).OptionalHeader.Magic = !IMAGE_OPTIONAL_MAGIC };
+        assert_eq!(get_module_size(image.handle()), 0, "wrong optional magic");
     });
 }
