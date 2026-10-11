@@ -215,7 +215,9 @@ pub unsafe fn enumerate_exports(h_module: HMODULE) -> Result<Vec<ExportInfo>, Pe
         exports.push(ExportInfo {
             ordinal,
             name,
-            address: (image.base_address + func_rva) as *const u8,
+            // An export hook can point below the module: on x86 its RVA then
+            // wraps around the address space, as the loader resolves it.
+            address: image.base_address.wrapping_add(func_rva) as *const u8,
             forwarder,
         });
     }

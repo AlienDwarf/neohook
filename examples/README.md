@@ -132,6 +132,7 @@ hook does not behave as documented.
 | [`cpp/breakpoint_hooks.cpp`](cpp/breakpoint_hooks.cpp) | `VehHook` and `Int3Hook`, both with a gateway to the original. |
 | [`cpp/watchdog.cpp`](cpp/watchdog.cpp) | The watchdog through the `neohook::Watchdog` guard. |
 | [`cpp/signature.cpp`](cpp/signature.cpp) | Signature inference for an export and for a function in the program. |
+| [`cpp/hook_detection.cpp`](cpp/hook_detection.cpp) | Detecting an inline hook and where it leads, and scanning a module for hooks. |
 
 ### Building
 
