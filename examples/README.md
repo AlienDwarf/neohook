@@ -123,7 +123,7 @@ hook does not behave as documented.
 | :------ | :------------ |
 | [`c/inline_hook.c`](c/inline_hook.c) | The transaction API: `attach_export`, the trampoline, disable/enable, unhook. |
 | [`c/iat_hook.c`](c/iat_hook.c) | IAT hook, and why an import slot must be re-read rather than cached. |
-| [`c/introspect.c`](c/introspect.c) | Module/export/import enumeration, name and ordinal lookup, signature scanning. |
+| [`c/introspect.c`](c/introspect.c) | Module/export/import enumeration, name and ordinal lookup, signature scanning, signature inference. |
 | [`c/watchdog.c`](c/watchdog.c) | Anti-tamper watchdog with a tamper callback on the background thread. |
 | [`c/abi_conformance.c`](c/abi_conformance.c) | Compile-time checks that the header's `HookContext` layout and callback conventions match the stub. |
 | [`cpp/transaction.cpp`](cpp/transaction.cpp) | `neohook::Transaction` / `HookGuard` RAII, including rollback on an abandoned transaction. |
@@ -131,6 +131,7 @@ hook does not behave as documented.
 | [`cpp/midhook.cpp`](cpp/midhook.cpp) | Mid-function detour rewriting a register through `HookContext` (x64) . |
 | [`cpp/breakpoint_hooks.cpp`](cpp/breakpoint_hooks.cpp) | `VehHook` and `Int3Hook`, both with a gateway to the original. |
 | [`cpp/watchdog.cpp`](cpp/watchdog.cpp) | The watchdog through the `neohook::Watchdog` guard. |
+| [`cpp/signature.cpp`](cpp/signature.cpp) | Signature inference for an export and for a function in the program. |
 | [`cpp/hook_detection.cpp`](cpp/hook_detection.cpp) | Detecting an inline hook and where it leads, and scanning a module for hooks. |
 
 ### Building

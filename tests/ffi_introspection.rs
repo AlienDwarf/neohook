@@ -807,6 +807,67 @@ fn ffi_handle_enable_helpers_guard_oob_and_null() {
     }
 }
 
+// --- signature inference -------------------------------------------------------
+
+#[test]
+fn ffi_infer_signature_rejects_null_arguments() {
+    let mut sig = std::mem::MaybeUninit::<DetoursSignature>::uninit();
+    let target = scan_me as *const u8;
+    unsafe {
+        assert_eq!(detours_infer_signature(ptr::null(), sig.as_mut_ptr()), 0);
+        assert_eq!(detours_infer_signature(target, ptr::null_mut()), 0);
+        assert_eq!(
+            detours_infer_signature_by_name(ptr::null(), c"MulDiv".as_ptr(), sig.as_mut_ptr()),
+            0
+        );
+        assert_eq!(
+            detours_infer_signature_by_name(
+                c"kernel32.dll".as_ptr(),
+                c"NoSuchExportAnywhere".as_ptr(),
+                sig.as_mut_ptr()
+            ),
+            0
+        );
+    }
+}
+
+#[test]
+fn ffi_infer_signature_fills_the_struct() {
+    let mut sig = std::mem::MaybeUninit::<DetoursSignature>::uninit();
+    let ok = unsafe {
+        detours_infer_signature_by_name(
+            c"kernel32.dll".as_ptr(),
+            c"MulDiv".as_ptr(),
+            sig.as_mut_ptr(),
+        )
+    };
+    assert_eq!(ok, 1);
+    let sig = unsafe { sig.assume_init() };
+    assert_eq!(sig.arg_count, 3);
+    assert_eq!(sig.truncated, 0);
+    assert_eq!(sig.has_return, 1);
+    assert_eq!(sig.returns, DETOURS_VALUE_KIND_INT32);
+    for arg in &sig.args[..3] {
+        assert_eq!(arg.kind, DETOURS_VALUE_KIND_INT32);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        assert_eq!(sig.convention, DETOURS_CONVENTION_WIN64);
+        let name = unsafe { CStr::from_ptr(sig.args[0].register_name.as_ptr()) };
+        assert_eq!(name.to_str().unwrap(), "rcx");
+        assert_eq!(sig.args[0].on_stack, 0);
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        assert_eq!(sig.convention, DETOURS_CONVENTION_STDCALL);
+        assert_eq!(sig.stack_cleanup, 12);
+        assert_eq!(sig.args[0].on_stack, 1);
+        assert_eq!(sig.args[0].stack_offset, 4);
+        assert_eq!(sig.args[0].register_name[0], 0);
+    }
+}
+
 // --- hook detection --------------------------------------------------------------
 
 #[inline(never)]

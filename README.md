@@ -72,6 +72,8 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 
 - **Relative-Reference Resolving** - After a signature scan lands on a `call rel32` or a `lea/mov [rip + disp32]`, `resolve_call_target` / `resolve_rip_relative` decode the instruction and return the absolute address it points to (or `resolve_relative` from a known encoding). Turns "the signature near the function" into "the function".
 
+- **Signature Inference** - `infer_signature(ptr)` / `infer_signature_by_name("kernel32.dll", "MulDiv")` estimate a function's **argument count and types, return type and calling convention** from its machine code alone - for undocumented or internal functions that have no prototype to copy into a detour. It follows every path, register copies and stack spills, and calls a few levels deep to catch arguments a wrapper only forwards. Each argument carries a confidence; the result is an estimate, not a decompiler.
+
 - **Closure Detours** - `detour_closure!` installs an inline hook whose body is a **Rust closure that captures environment** (counters, channels, config) - something a bare-`fn`-pointer C/C++ library cannot express. The closure receives the original function as its first argument so it can forward to it.
 
 - **Delay / On-Load Hooks** - Register a hook for a function in a module that is **not loaded yet**; NeoHook inline-hooks `ntdll!LdrLoadDll` once and installs the real hook the moment the module appears (`DelayHook::register`).
@@ -189,6 +191,7 @@ this as a feature comparison rather than a maturity one.
 | v0.10.0 |    ✅ Done | Anti-tamper / re-hook watchdog (`Watchdog`)            |
 | v0.10.0 |    ✅ Done | Tracing / logging detour generator (`detour_trace!`)   |
 | v0.10.0 |    ✅ Done | Control Flow Guard (CFG) awareness (`cfg`)             |
+| v0.16.0 |    ✅ Done | Signature inference (`infer_signature`)                |
 | v0.16.0 |    ✅ Done | Hook detection (`check_function`, `scan_module_hooks`) |
 | v0.x   |    Planned | ARM64 inline hooking                                   |
 
@@ -669,6 +672,60 @@ you already know the exact encoding. The C ABI exposes `detours_resolve_call_tar
 `detours_resolve_rip_relative`, and `detours_resolve_relative`; the C++ wrapper
 mirrors them as `neohook::resolve_*`. See
 [`examples/resolve_relative.rs`](examples/resolve_relative.rs).
+
+---
+
+### Signature Inference - `infer_signature`
+
+A detour must match its target's signature exactly, but an internal or
+undocumented function has no prototype to copy. `infer_signature` reads the
+function's machine code and reports what the code itself reveals:
+
+- **Argument count** - every argument register (`rcx`, `rdx`, `r8`, `r9`,
+  `xmm0`-`xmm3` on x64; `ecx` / `edx` on x86) read before it is written, every
+  stack argument read, and on x86 the exact byte count of a `ret N`.
+- **Argument types** - an argument used as an address is a `Pointer`, one used
+  by `*ss` / `*sd` instructions a `Float` / `Double`, otherwise the width of the
+  read gives `Int8` ... `Int64`.
+- **Return type and calling convention** - what is left in `rax` / `xmm0` (or
+  on the x87 stack) at `ret`, and on x86 `Cdecl` / `Stdcall` / `Fastcall` /
+  `Thiscall`.
+
+```rust
+use neohook::{infer_signature_by_name, ArgLocation};
+
+let sig = infer_signature_by_name("kernel32.dll", "MulDiv").unwrap();
+println!("{:?}, returns {:?}", sig.convention, sig.returns); // Win64, Some(Int32)
+for arg in &sig.args {
+    match arg.location {
+        ArgLocation::Register(reg) => print!("{reg}: "),
+        ArgLocation::Stack(offset) => print!("[sp+{offset:#x}]: "),
+    }
+    println!("{:?} ({:.0}% sure)", arg.kind, arg.confidence * 100.0);
+}
+
+// Or for a function found by a signature scan:
+// let sig = unsafe { neohook::infer_signature(found) }.unwrap();
+```
+
+The analysis follows every branch, tracks register copies and stack spills (so
+debug builds work), and follows calls, import calls and tail jumps two levels
+deep, so a wrapper that only hands its arguments on - `MessageBoxW` calling
+`MessageBoxTimeoutW`, `Sleep` jumping to `SleepEx` - still reports them.
+
+It is an estimate, not a decompiler: an argument the function never touches is
+only visible as a gap before a later one, a handle that is never dereferenced is
+an integer rather than a pointer, a `struct` passed by value looks like an
+integer, and a variadic function looks like one that takes every register
+argument. `SignatureGuess::complete` is `false` when a path could not be followed
+to its end (a jump table, an unresolvable tail call).
+
+The C ABI fills a caller-allocated `DetoursSignature` (no handle, nothing to
+free) with `detours_infer_signature(func, &sig)` or
+`detours_infer_signature_by_name(module, func, &sig)`; kinds and conventions are
+the `DETOURS_VALUE_KIND_*` / `DETOURS_CONVENTION_*` constants. The C++ wrapper
+returns a `std::optional<DetoursSignature>` from `neohook::infer_signature`. See
+[`examples/c/introspect.c`](examples/c/introspect.c).
 
 ---
 
@@ -1303,6 +1360,7 @@ neohook/
 │   ├── pe.rs           - Shared bounds-checked PE parsing primitives
 │   ├── scan.rs         - Pattern: signature parsing + memory/module scanning
 │   ├── resolve.rs      - Resolve relative refs (call/jmp/rip) into absolute addresses
+│   ├── signature.rs    - Signature inference: argument count/types from machine code
 │   ├── symbols.rs      - Symbol-based resolution via dbghelp (resolve_symbol)
 │   ├── delay.rs        - DelayHook: on-load hooks via an ntdll!LdrLoadDll detour
 │   ├── detect.rs       - Hook detection: code vs. module file, debug registers, IAT/EAT
