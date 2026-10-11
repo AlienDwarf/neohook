@@ -199,7 +199,11 @@ unsafe fn free_quiescent_regions(regions: Vec<Region>) -> Vec<Region> {
                 continue;
             }
             if SuspendThread(h) == u32::MAX {
-                if !thread_has_exited(h) {
+                if thread_has_exited(h) {
+                    // Remember it, so the catch-up walk does not stop on it as
+                    // a new thread.
+                    frozen.push(tid);
+                } else {
                     inspected_all = false;
                 }
                 CloseHandle(h);
@@ -397,10 +401,7 @@ unsafe fn catch_up_new_threads(
                     continue;
                 }
 
-                // A thread created after the enumeration. Keep its handle in
-                // `handles` so it is resumed with the rest, and walk again: it
-                // may have spawned threads of its own.
-                restart = true;
+                // A thread created after the enumeration.
                 // Never grow either buffer here: a push that reallocates would
                 // take the heap lock a suspended thread may hold.
                 if handles.len() == handles.capacity() || frozen.len() == frozen.capacity() {
@@ -408,16 +409,19 @@ unsafe fn catch_up_new_threads(
                     return false;
                 }
                 if SuspendThread(found) == u32::MAX {
-                    let exited = thread_has_exited(found);
-                    CloseHandle(found);
-                    if !exited {
+                    if !thread_has_exited(found) {
+                        CloseHandle(found);
                         return false;
                     }
-                    // Already gone, so it references nothing. Remember it so the
-                    // next walk does not stop on it again.
+                    // Already gone, so it references nothing and spawned
+                    // nothing new: remember it and keep walking from it.
                     frozen.push(tid);
-                    break;
+                    cursor = found;
+                    continue;
                 }
+                // Keep its handle in `handles` so it is resumed with the rest,
+                // and walk again: it may have spawned threads of its own.
+                restart = true;
                 handles.push(found);
                 frozen.push(tid);
                 if !inspect_thread(found, regions, busy) {
