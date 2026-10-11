@@ -54,14 +54,23 @@ impl TrampolineAlloc {
             let safety_buffer = 1024 * 1024 + size; // 1MB + size of trampoline to ensure we have enough space (should be more than enough for almost every trampoline)
             let range = (i32::MAX as usize).saturating_sub(safety_buffer);
 
-            // We define a search range of ±2GB around the target address
-            let min_addr = (target as usize).saturating_sub(range);
-            let max_addr = (target as usize).saturating_add(range);
-
-            // Get System Info to know the allocation granularity
+            // Get System Info to know the allocation granularity and the
+            // usable address range
             let mut si: SYSTEM_INFO = unsafe { std::mem::zeroed() };
             unsafe { GetSystemInfo(&mut si) };
             let alloc_granularity = si.dwAllocationGranularity as usize;
+
+            // We define a search range of ±2GB around the target address,
+            // clamped to the usable address space. The lower bound is never 0:
+            // `VirtualAlloc(0, ..)` means "anywhere", which would place the
+            // trampoline out of rel32 range of a target near the bottom.
+            let min_addr = (target as usize)
+                .saturating_sub(range)
+                .max(si.lpMinimumApplicationAddress as usize)
+                .max(alloc_granularity);
+            let max_addr = (target as usize)
+                .saturating_add(range)
+                .min(si.lpMaximumApplicationAddress as usize);
 
             // Walk every free region in the ±2GB window and remember the aligned
             // start *closest to the target* in each. A trampoline placed as near
@@ -129,9 +138,15 @@ impl TrampolineAlloc {
                         PAGE_EXECUTE_READWRITE,
                     )
                 };
-                if !allocated.is_null() {
+                if allocated.is_null() {
+                    continue;
+                }
+                // Only accept the allocation if it really is inside the window.
+                let start = allocated as usize;
+                if start >= min_addr && start.saturating_add(size) <= max_addr {
                     return Some(allocated as *mut u8);
                 }
+                unsafe { VirtualFree(allocated, 0, MEM_RELEASE) };
             }
 
             None
@@ -160,7 +175,9 @@ fn align_down(addr: usize, align: usize) -> usize {
 /// region_end)` that is closest to `target`, while leaving room for `size`
 /// bytes and staying inside the `[min_addr, max_addr]` reachability window.
 ///
-/// Returns `None` if the region cannot host the trampoline within range.
+/// Never returns an address below `align` (in particular never 0, which
+/// `VirtualAlloc` treats as "anywhere"). Returns `None` if the region cannot
+/// host the trampoline within range.
 #[cfg(target_arch = "x86_64")]
 fn nearest_aligned_candidate(
     region_start: usize,
@@ -174,7 +191,7 @@ fn nearest_aligned_candidate(
     // Highest start that still fits `size` bytes in the region and the window.
     let region_hi = region_end.checked_sub(size)?;
     let window_hi = max_addr.checked_sub(size)?;
-    let lo = region_start.max(min_addr);
+    let lo = region_start.max(min_addr).max(align.max(1));
     let hi = region_hi.min(window_hi);
     if lo > hi {
         return None;
