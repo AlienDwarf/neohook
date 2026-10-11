@@ -17,6 +17,52 @@ NeoHook makes runtime function hooking simple and reliable: Win32 APIs, game eng
 
 ---
 
+## What's New in 0.16.0
+
+**New**
+
+- **Signature inference** - `infer_signature` / `infer_signature_by_name` estimate a
+  function's argument count and types, return type and calling convention from its
+  machine code. See [Signature Inference](#signature-inference---infer_signature).
+- **Hook detection** - `check_function`, `check_export` and `scan_module_hooks`
+  find inline, INT3, VEH, IAT and EAT hooks and report where they lead. See
+  [Hook Detection](#hook-detection).
+- **x64 unwind data** for trampolines, VEH/INT3 gateways and mid-hook stubs, so
+  exceptions and stack walks pass through them. See
+  [Unwinding Through Stubs](#unwinding-through-stubs-x64).
+- All three are in the C ABI and the C++ wrapper as well.
+
+**Fixed**
+
+- The INT3 and VEH exception handlers and the loader notification of delay hooks
+  are removed again with the last hook, so a DLL using NeoHook can be unloaded
+  without leaving a dangling handler behind.
+- Unhooking, dropping, enabling and disabling a hook no longer wait for another
+  thread's open transaction, which could deadlock `unhook_all` in
+  `DLL_PROCESS_DETACH`.
+- Passes that suspend every thread (commit, reclaim, watchdog, VEH arming) can no
+  longer suspend each other.
+- Return addresses into stolen bytes are redirected across the whole stack, not
+  only its top 4 KiB.
+- A retired stub is no longer freed while a thread still holds it in a register;
+  exited threads no longer keep stubs from being freed.
+- IAT commits no longer allocate while other threads are suspended.
+- Chaining onto a gateway whose owner is dropped, overlapping inline hooks and
+  more than one hook on a managed gateway are rejected instead of corrupting code.
+- Malformed PE headers, export tables and import directories no longer crash
+  the PE parsers; `enumerate_exports` no longer overflows on a hooked export on
+  x86.
+
+**Changed behaviour**
+
+- C ABI: detaching a hook from a handle leaves its slot empty; the other indices
+  stay the same and `detours_handle_len` does not shrink.
+- The INT3 slot limit is `INT3_MAX_HOOKS` in the C header (was `MAX_HOOKS`).
+- A commit fails instead of skipping return addresses when a stack is larger
+  than 32 MiB.
+
+---
+
 ## Why NeoHook?
 
 Function hooking is deceptively difficult to get right. Writing a `JMP` patch is only a few lines of assembly - but doing it safely in a live, multi-threaded process requires solving multiple problems at once:
@@ -105,49 +151,6 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 - **Zero-Boilerplate Macros** - `detour_inline!` and `detour_helper!` install a complete hook with a single expression.
 
 - **C FFI** - Exposes a C ABI with auto-generated headers (`cbindgen`), usable from C, C++, Python (`ctypes`), or any FFI-capable language.
-
----
-
-## Comparison
-
-How NeoHook relates to the other established Windows hooking libraries. This is a
-factual feature-presence matrix, not a benchmark - each project has different
-goals, and Detours and MinHook in particular have a far longer production track
-record (see the note below the table).
-
-Legend: ✅ built in · ◐ partial / via a different mechanism · ❌ not provided.
-Accurate as of June 2026; corrections welcome via an issue.
-
-| Capability | NeoHook | MS Detours | PolyHook2 | MinHook |
-| :--------- | :-----: | :--------: | :-------: | :-----: |
-| Inline hook + instruction relocation | ✅ | ✅ | ✅ | ✅ |
-| Atomic transaction + rollback | ✅ | ✅ | ❌ | ◐ |
-| Thread suspend + IP redirect | ✅ | ◐ | ◐ | ✅ |
-| Stack return-address rewrite | ✅ | ❌ | ❌ | ❌ |
-| IAT hooking | ✅ | ◐ | ✅ | ❌ |
-| EAT hooking | ✅ | ❌ | ✅ | ❌ |
-| VTable hook (+ per-instance) | ✅ | ❌ | ✅ | ❌ |
-| VEH (hardware-breakpoint) hook | ✅ | ❌ | ✅ | ❌ |
-| INT3 software-breakpoint hook | ✅ | ❌ | ❌ | ❌ |
-| Mid-function / register-context detour | ✅ | ❌ | ◐ | ❌ |
-| Pattern / signature scanning | ✅ | ❌ | ❌ | ❌ |
-| Symbol resolution (dbghelp / PDB) | ✅ | ❌ | ❌ | ❌ |
-| Closure detours (capturing) | ✅ | ❌ | ◐ | ❌ |
-| Tracing / logging detour generators | ✅ | ❌ | ❌ | ❌ |
-| Anti-tamper / re-hook watchdog | ✅ | ❌ | ❌ | ❌ |
-| Delay / on-load hooks | ✅ | ❌ | ❌ | ❌ |
-| Control Flow Guard awareness | ✅ | ✅ | ❌ | ❌ |
-| RAII / memory-safe ownership | ✅ | ❌ | ❌ | ❌ |
-| C ABI | ✅ | ✅ | ❌ | ✅ |
-| ARM64 inline hooking | ❌ | ✅ | ❌ | ❌ |
-| Cross-process / remote patching | ❌ | ✅ | ◐ | ❌ |
-| Process-launch DLL injection | ❌ | ✅ | ❌ | ❌ |
-| On-disk PE import editing | ❌ | ✅ | ❌ | ❌ |
-
-NeoHook is the broadest in-process engine on x86/x64 here; the areas Detours
-still owns are out-of-process / launch-time injection, on-disk binary editing,
-and ARM64. Detours and MinHook are also more battle-tested at scale, so treat
-this as a feature comparison rather than a maturity one.
 
 ---
 
