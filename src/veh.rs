@@ -88,9 +88,15 @@ struct VehManager {
     /// the last hook, once no thread is still dispatching a trap of one of
     /// neohook's breakpoints (see [`crate::inflight`]).
     handler: usize,
+    /// Set once a disarm could not reach every thread: a thread may still
+    /// carry a stale breakpoint, so the handler is never removed.
+    keep_handler: bool,
 }
 
-static MANAGER: Mutex<VehManager> = Mutex::new(VehManager { handler: 0 });
+static MANAGER: Mutex<VehManager> = Mutex::new(VehManager {
+    handler: 0,
+    keep_handler: false,
+});
 
 /// Errors produced while installing or removing a VEH hook.
 #[derive(Debug)]
@@ -258,7 +264,7 @@ impl VehHook {
         SLOT_TARGET[slot].store(target_addr, Ordering::Release);
 
         // Arm the breakpoint on every thread now that the slot is published.
-        set_breakpoint_on_all_threads(slot, target_addr, true);
+        let _ = set_breakpoint_on_all_threads(slot, target_addr, true);
 
         Ok(Self {
             target,
@@ -309,7 +315,11 @@ impl VehHook {
         // trap still finds a valid detour rather than an empty slot. A thread
         // that is mid-dispatch can still get the old debug registers restored
         // on resume; the handler disarms those when they trap.
-        set_breakpoint_on_all_threads(self.slot, 0, false);
+        if !set_breakpoint_on_all_threads(self.slot, 0, false) {
+            // A thread may keep the stale breakpoint; only the handler can
+            // disarm it, so it must stay.
+            mgr.keep_handler = true;
+        }
         SLOT_TARGET[self.slot].store(0, Ordering::Release);
         SLOT_DETOUR[self.slot].store(0, Ordering::Release);
 
@@ -332,6 +342,7 @@ const RELEASE_ATTEMPTS: usize = 20;
 /// the dispatch, the handler is kept and the next unhook tries again.
 fn release_idle_handler(mgr: &mut VehManager) {
     if mgr.handler == 0
+        || mgr.keep_handler
         || SLOT_TARGET
             .iter()
             .any(|target| target.load(Ordering::Acquire) != 0)
@@ -348,7 +359,7 @@ fn release_idle_handler(mgr: &mut VehManager) {
                     .any(|armed| armed.load(Ordering::Acquire) == addr))
     };
     for attempt in 0..RELEASE_ATTEMPTS {
-        if !crate::inflight::exceptions_in_flight(STATUS_SINGLE_STEP, is_ours) {
+        if !crate::inflight::exceptions_in_flight(STATUS_SINGLE_STEP, is_ours, true) {
             unsafe { RemoveVectoredExceptionHandler(mgr.handler as *mut _) };
             mgr.handler = 0;
             return;
@@ -486,16 +497,23 @@ fn lock_manager() -> std::sync::MutexGuard<'static, VehManager> {
 
 /// Arms (or disarms) breakpoint `slot` for `address` on the calling thread and
 /// every other thread in the process.
-fn set_breakpoint_on_all_threads(slot: usize, address: usize, enable: bool) {
+///
+/// Returns `false` if a live thread could not be updated.
+fn set_breakpoint_on_all_threads(slot: usize, address: usize, enable: bool) -> bool {
     // Suspends each thread in turn, so it must not race another such pass.
     let _freeze = crate::threads::hold_freeze_lock();
     // The calling thread cannot be suspended; update it directly.
-    unsafe { set_debug_register(GetCurrentThread(), slot, address, enable) };
+    let mut all = unsafe { set_debug_register(GetCurrentThread(), slot, address, enable) };
 
     for tid in ThreadEnumerator::enumerate_process_threads() {
-        let access = THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME;
+        let access = THREAD_GET_CONTEXT
+            | THREAD_SET_CONTEXT
+            | THREAD_SUSPEND_RESUME
+            | THREAD_QUERY_LIMITED_INFORMATION;
         let h_thread = unsafe { OpenThread(access, 0, tid) };
         if h_thread.is_null() {
+            // A thread that exited meanwhile carries no breakpoint.
+            all &= unsafe { GetLastError() } == ERROR_INVALID_PARAMETER;
             continue;
         }
 
@@ -504,12 +522,16 @@ fn set_breakpoint_on_all_threads(slot: usize, address: usize, enable: bool) {
             // A thread that cannot be suspended is left alone; if it keeps a
             // stale breakpoint, the handler disarms it on its next trap.
             if SuspendThread(h_thread) != u32::MAX {
-                set_debug_register(h_thread, slot, address, enable);
+                all &= set_debug_register(h_thread, slot, address, enable);
                 ResumeThread(h_thread);
+            } else {
+                let mut code = 0u32;
+                all &= GetExitCodeThread(h_thread, &mut code) != 0 && code != STILL_ACTIVE as u32;
             }
             CloseHandle(h_thread);
         }
     }
+    all
 }
 
 /// Programs a single hardware execution breakpoint in one thread's debug

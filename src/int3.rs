@@ -460,7 +460,7 @@ fn release_idle_handler(mgr: &mut Int3Manager) {
                 .any(|retired| retired.load(Ordering::Acquire) == addr)
     };
     for attempt in 0..RELEASE_ATTEMPTS {
-        if !crate::inflight::exceptions_in_flight(STATUS_BREAKPOINT, is_retired) {
+        if !crate::inflight::exceptions_in_flight(STATUS_BREAKPOINT, is_retired, false) {
             unsafe { RemoveVectoredExceptionHandler(mgr.handler as *mut _) };
             mgr.handler = 0;
             // No thread can reach the old handler any more.
