@@ -318,4 +318,139 @@ mod imp {
             }
         });
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+
+        /// A generated function with the given unwind info, registered as a
+        /// dynamic function table; unregistered and released on drop.
+        struct Function {
+            page: *mut u8,
+            entry: *mut IMAGE_RUNTIME_FUNCTION_ENTRY,
+        }
+
+        impl Function {
+            fn new(unwind_info: &[u8]) -> Self {
+                let page = unsafe {
+                    VirtualAlloc(
+                        std::ptr::null(),
+                        0x1000,
+                        MEM_COMMIT | MEM_RESERVE,
+                        PAGE_EXECUTE_READWRITE,
+                    )
+                } as *mut u8;
+                assert!(!page.is_null());
+                unsafe {
+                    // push rbp; mov rbp, rsp; sub rsp, 0x20; ...; ret
+                    let code = [0x55, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xEC, 0x20, 0xC9, 0xC3];
+                    std::ptr::copy_nonoverlapping(code.as_ptr(), page, code.len());
+                    std::ptr::copy_nonoverlapping(
+                        unwind_info.as_ptr(),
+                        page.add(0x80),
+                        unwind_info.len(),
+                    );
+                    let entry = page.add(0x40) as *mut IMAGE_RUNTIME_FUNCTION_ENTRY;
+                    entry.write(std::mem::zeroed());
+                    (*entry).BeginAddress = 0;
+                    (*entry).EndAddress = 10;
+                    (*entry).Anonymous.UnwindData = 0x80;
+                    assert!(RtlAddFunctionTable(entry, 1, page as u64));
+                    Self { page, entry }
+                }
+            }
+        }
+
+        impl Drop for Function {
+            fn drop(&mut self) {
+                unsafe {
+                    RtlDeleteFunctionTable(self.entry);
+                    VirtualFree(self.page.cast(), 0, MEM_RELEASE);
+                }
+            }
+        }
+
+        /// Version 1, prologue 8 bytes, three codes, frame register rbp:
+        /// at 8 alloc 0x20; at 4 set rbp; at 1 push rbp.
+        const FRAME_PROLOGUE: [u8; 12] = [
+            0x01, 0x08, 0x03, 0x05, 0x08, 0x32, 0x04, 0x03, 0x01, 0x50, 0x00, 0x00,
+        ];
+
+        fn mapping(old: &[u32], new: &[u32], jmp_back: u32) -> RelocationMapping {
+            RelocationMapping {
+                written_len: jmp_back as usize + 5,
+                old_instruction_offsets: old.to_vec(),
+                new_instruction_offsets: new.to_vec(),
+                jmp_back_offset: jmp_back,
+            }
+        }
+
+        fn translated(
+            function: &Function,
+            at: usize,
+            map: &RelocationMapping,
+            stolen: usize,
+        ) -> Option<(Vec<u16>, u8, u8)> {
+            unsafe { translate(function.page.add(at), map, stolen) }
+                .map(|t| (t.slots, t.prolog_size, t.frame))
+        }
+
+        #[test]
+        fn keeps_the_codes_the_stub_runs() {
+            let function = Function::new(&FRAME_PROLOGUE);
+            // Stolen: push rbp; mov rbp, rsp. sub rsp runs after the stub.
+            let map = mapping(&[0, 1], &[0, 1], 4);
+            assert_eq!(
+                translated(&function, 0, &map, 4),
+                Some((vec![0x0304, 0x5001], 4, 0x05))
+            );
+        }
+
+        #[test]
+        fn drops_the_frame_register_until_it_is_set() {
+            let function = Function::new(&FRAME_PROLOGUE);
+            // Stolen: push rbp only - rbp is not the frame pointer yet.
+            let map = mapping(&[0], &[0], 1);
+            assert_eq!(
+                translated(&function, 0, &map, 1),
+                Some((vec![0x5001], 1, 0))
+            );
+        }
+
+        #[test]
+        fn codes_before_a_mid_function_stub_always_apply() {
+            let function = Function::new(&FRAME_PROLOGUE);
+            // The stub starts at sub rsp (offset 4): push and set-frame are done.
+            let map = mapping(&[0], &[0], 4);
+            assert_eq!(
+                translated(&function, 4, &map, 4),
+                Some((vec![0x3204, 0x0300, 0x5000], 4, 0x05))
+            );
+        }
+
+        #[test]
+        fn follows_instructions_that_grew_in_relocation() {
+            let function = Function::new(&FRAME_PROLOGUE);
+            let map = mapping(&[0, 1], &[0, 3], 7);
+            assert_eq!(
+                translated(&function, 0, &map, 4),
+                Some((vec![0x0307, 0x5003], 7, 0x05))
+            );
+        }
+
+        #[test]
+        fn refuses_chained_and_missing_unwind_data() {
+            let mut chained = FRAME_PROLOGUE;
+            chained[0] |= UNW_FLAG_CHAININFO << 3;
+            let function = Function::new(&chained);
+            assert!(translated(&function, 0, &mapping(&[0], &[0], 1), 1).is_none());
+
+            // No table at all: a leaf.
+            let page = [0xC3u8; 16];
+            assert!(unsafe { translate(page.as_ptr(), &mapping(&[0], &[0], 1), 1) }.is_none());
+        }
+    }
 }
