@@ -152,7 +152,15 @@ pub fn reclaim() {
         return;
     }
 
+    // Unwind tables go before anything is suspended (their lock could be held
+    // by a frozen thread), and come back for the regions that stay.
+    let bases: Vec<usize> = regions.iter().map(|r| r.base).collect();
+    crate::unwind::suspend(&bases);
+
     let still_busy = unsafe { free_quiescent_regions(regions) };
+
+    let busy_bases: Vec<usize> = still_busy.iter().map(|r| r.base).collect();
+    crate::unwind::settle(&bases, &busy_bases);
 
     if !still_busy.is_empty() {
         lock_quarantine().extend(still_busy);

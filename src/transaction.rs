@@ -982,9 +982,11 @@ impl TransactionCore {
 
         // MANAGED GATEWAYS FOR HOOK CHAINING
         let tramp_capacity: usize = 128;
+        // The unwind data follows the code (see crate::unwind).
+        let alloc_size = tramp_capacity + crate::unwind::UNWIND_AREA;
         let trampoline_handle = unsafe {
             // Allocate memory. rwx is required for the trampoline, we switch to rx later
-            TrampolineAlloc::alloc_nearby_trampoline(target, tramp_capacity)
+            TrampolineAlloc::alloc_nearby_trampoline(target, alloc_size)
                 .ok_or(DetourError::AllocationFailed)?
         };
 
@@ -1004,6 +1006,14 @@ impl TransactionCore {
 
         unsafe {
             write_managed_gateway_stub(gateway, body as *const u8);
+            crate::unwind::register_relocated(
+                target,
+                gateway,
+                tramp_capacity,
+                MANAGED_GATEWAY_LEN,
+                &relocation,
+                stolen_len,
+            );
         }
 
         let _ = trampoline_handle.make_rx();

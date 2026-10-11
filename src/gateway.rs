@@ -61,10 +61,19 @@ pub(crate) unsafe fn build_original_gateway(target: *const u8) -> Option<Trampol
     // entry byte (INT3) or the armed address (VEH).
     let len = unsafe { Disassembler::get_instruction_len(target, 1) }.ok()?;
 
-    let tramp = unsafe { TrampolineAlloc::alloc_nearby_trampoline(target, GATEWAY_CAPACITY) }?;
+    // The unwind data follows the code (see crate::unwind).
+    let tramp = unsafe {
+        TrampolineAlloc::alloc_nearby_trampoline(
+            target,
+            GATEWAY_CAPACITY + crate::unwind::UNWIND_AREA,
+        )
+    }?;
 
     // Relocate the prologue into the stub and append a jump back to the body.
-    unsafe { Disassembler::relocate(target, tramp.ptr, len) }.ok()?;
+    let mapping = unsafe { Disassembler::relocate(target, tramp.ptr, len) }.ok()?;
+    unsafe {
+        crate::unwind::register_relocated(target, tramp.ptr, GATEWAY_CAPACITY, 0, &mapping, len)
+    };
 
     if !tramp.make_rx() {
         return None;

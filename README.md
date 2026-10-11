@@ -100,6 +100,8 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 
 - **Quiescence-Checked Teardown** - Freeing a trampoline the instant a hook drops would be unsound if another thread were still executing inside it. Instead a dropped stub is *retired* and released only once a thread scan (instruction pointers plus stack return addresses) shows no thread is inside it - otherwise it stays quarantined for a later pass. Reclamation runs automatically at the start of every transaction (a no-op when nothing is pending) and is also exposed as `neohook::reclaim()` for unhook-only workloads.
 
+- **Unwind-Aware Stubs (x64)** - Trampolines, VEH/INT3 gateways and mid-hook stubs carry x64 unwind data (`RtlAddFunctionTable`), so exceptions, debugger call stacks and profilers walk through them to the caller instead of stopping - or terminating the process - at code with no `RUNTIME_FUNCTION`.
+
 - **Zero-Boilerplate Macros** - `detour_inline!` and `detour_helper!` install a complete hook with a single expression.
 
 - **C FFI** - Exposes a C ABI with auto-generated headers (`cbindgen`), usable from C, C++, Python (`ctypes`), or any FFI-capable language.
@@ -193,6 +195,7 @@ this as a feature comparison rather than a maturity one.
 | v0.10.0 |    ✅ Done | Control Flow Guard (CFG) awareness (`cfg`)             |
 | v0.16.0 |    ✅ Done | Signature inference (`infer_signature`)                |
 | v0.16.0 |    ✅ Done | Hook detection (`check_function`, `scan_module_hooks`) |
+| v0.16.0 |    ✅ Done | x64 unwind data for trampolines, gateways and stubs    |
 | v0.x   |    Planned | ARM64 inline hooking                                   |
 
 --
@@ -1303,6 +1306,35 @@ A back-jump is appended at the end of the trampoline to return execution to the 
 
 On x86_64, a 5-byte `E9 rel32` jump can only reach ±2 GB. `TrampolineAlloc::alloc_nearby` scans free memory regions outward from the target using `VirtualQuery` and allocates within that window. If no suitable region exists within ±2 GB, the engine upgrades to a 14-byte indirect absolute jump (`FF 25 00000000 <abs64>`).
 
+### Unwinding Through Stubs (x64)
+
+x64 Windows unwinds a stack - to dispatch an exception, for a debugger's call
+stack, for a profiler - through table-based unwind data: every frame's
+instruction pointer must lie in a function with a `RUNTIME_FUNCTION` entry that
+describes what its prologue did to the stack. A trampoline runs a relocated
+copy of the target's prologue in memory NeoHook allocated, which has no such
+entry. While a call made by those stolen instructions is running, its return
+address points into the trampoline; without unwind data the unwinder treats
+the trampoline as a leaf, reads the wrong return address, and an exception
+raised below it never reaches a handler above it.
+
+So every stub gets unwind data, written next to its code and registered with
+`RtlAddFunctionTable`:
+
+- **Trampolines and VEH/INT3 gateways** reuse the target's own unwind codes for
+  the prologue instructions they run, with each code's offset translated through
+  the relocation map (a relocated instruction can change length). Codes for the
+  rest of the prologue, which runs in the original function after the jump back,
+  are left out.
+- **Mid-hook stubs** describe their own frame. The stub first stores the hooked
+  address where a return address would be, so an unwind that starts in the
+  handler continues in the hooked function at the patched instruction and on to
+  its caller.
+
+The tables are deleted before a retired stub's memory is released. x86 unwinds
+through frame-pointer chains and exception registration records rather than
+tables, so it needs none of this.
+
 ### Hook chaining
 
 A managed gateway can itself be used as the target of another inline hook. This is how hook chaining works.
@@ -1367,6 +1399,7 @@ neohook/
 │   ├── registry.rs     - Process-wide named hook registry (+ unhook_all)
 │   ├── watchdog.rs     - Watchdog: anti-tamper / re-hook byte-region guard
 │   ├── trace.rs        - Tracing detour sink for detour_trace!
+│   ├── unwind.rs       - x64 unwind data for trampolines, gateways and mid-hook stubs
 │   ├── introspect.rs   - Module / PE introspection (modules, exports, imports)
 │   ├── mem.rs          - Memory helpers: VirtualProtect wrapper, atomic write
 │   ├── module.rs       - Module utilities: find_function, get_module_handle
