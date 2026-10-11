@@ -14,8 +14,9 @@
 //! name; [`enable`] / [`disable`] toggle it; [`unhook`] removes one; and
 //! [`unhook_all`] tears everything down (useful from `DllMain` on
 //! `DLL_PROCESS_DETACH`), newest registration first, so a hook chained on an
-//! earlier one is removed before it. All entries are dropped - and therefore
-//! unhooked - if they are still present when the process exits.
+//! earlier one is removed before it. The registry is a static that is never
+//! dropped, so entries stay installed until they are removed with [`unhook`] or
+//! [`unhook_all`]; nothing unhooks them at process exit.
 //!
 //! ```rust,ignore
 //! use neohook::{registry, DetourTransaction};

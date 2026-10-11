@@ -111,9 +111,8 @@ pub struct Xmm {
 /// The field order matches the order in which the stub saves the state, so the
 /// pointer passed to the handler aliases this layout exactly. A handler may read
 /// any field to observe the live value, or write any field to change the
-/// register before the original instructions resume. `rsp` is captured for
-/// inspection but writing it has no effect (the stack pointer is managed by the
-/// stub).
+/// register before the original instructions resume. `rsp` is not captured -
+/// there is no `rsp` field, because the stack pointer is managed by the stub.
 ///
 /// `xmm` holds `XMM0`..`XMM15` in order, and `mxcsr` holds the SSE
 /// control/status word. The x87 stack registers are not captured (see the

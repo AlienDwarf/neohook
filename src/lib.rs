@@ -479,8 +479,10 @@ macro_rules! detour_trace {
 /// Where [`detour_trace!`] needs the full signature (and in return gives typed
 /// arguments *and* the return value), `trace_raw!` needs only the target. It
 /// hooks the entry with a [`MidHook`], reads the argument registers from the
-/// captured [`HookContext`] (`rcx`/`rdx`/`r8`/`r9` on x86_64; the stack slots
-/// above the return address on x86), formats them as hex, and emits a record to
+/// captured [`HookContext`] (`rcx`/`rdx`/`r8`/`r9` on x86_64; on x86, where the
+/// arguments live on the stack and are not reachable from the context, it dumps
+/// `eax`/`ecx`/`edx`/`ebx`/`esi`/`edi` instead, which are **not** the call
+/// arguments), formats them as hex, and emits a record to
 /// the same process-wide [`trace`] sink. Because it captures state *at entry*,
 /// there is no return value - the record's return field is the literal
 /// `<entry>`.
