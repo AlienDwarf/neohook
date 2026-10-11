@@ -379,6 +379,11 @@ fn register_unload_notification() {
         .is_ok()
     {
         UNLOAD_NOTIFIED.store(true, Ordering::Release);
+        // An unregister may have taken the cookie between the exchange and
+        // the store; the flag must not claim a notification that is gone.
+        if NOTIFICATION_COOKIE.load(Ordering::Acquire) != cookie {
+            UNLOAD_NOTIFIED.store(false, Ordering::Release);
+        }
     } else {
         // Another thread registered one meanwhile.
         unsafe { unregister_cookie(cookie) };
@@ -389,8 +394,10 @@ fn register_unload_notification() {
 /// unloaded once its last delay hook is gone. The loader waits for a running
 /// callback before it returns.
 fn unregister_unload_notification() {
-    UNLOAD_NOTIFIED.store(false, Ordering::Release);
+    // Cookie first, then the flag: a register that stores the flag after this
+    // swap sees the cookie gone and clears it again.
     let cookie = NOTIFICATION_COOKIE.swap(std::ptr::null_mut(), Ordering::AcqRel);
+    UNLOAD_NOTIFIED.store(false, Ordering::Release);
     if !cookie.is_null() {
         unsafe { unregister_cookie(cookie) };
     }
