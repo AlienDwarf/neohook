@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use iced_x86::{
     BlockEncoder, BlockEncoderOptions, Code, Decoder, DecoderOptions, FlowControl, Instruction,
-    InstructionBlock, Mnemonic,
+    InstructionBlock, MemoryOperand, Mnemonic, Register,
 };
 
 #[derive(Debug, Clone)]
@@ -180,6 +180,68 @@ impl Disassembler {
         )
     }
 
+    /// Emulates a relative `call` whose target lies inside the stolen range
+    /// `[start, end]` (typically the get-PC idiom `call $+5; pop reg`).
+    ///
+    /// Such a call reads its own return address, so relocating it unchanged
+    /// would push an address inside the trampoline and break the
+    /// position-independent code that uses it. Instead it is replaced by a
+    /// sequence that pushes the **original** return address and jumps to the
+    /// target (the relocated copy if the target was stolen, the original code if
+    /// it is `end`):
+    ///
+    /// - x86: `push imm32; jmp target`
+    /// - x64: `push imm32` (sign-extended low half); `mov dword [rsp+4], hi`;
+    ///   `jmp target`
+    ///
+    /// Neither sequence modifies flags or registers other than the stack
+    /// pointer, matching the `call`. The first instruction keeps the call's IP so
+    /// thread IP redirection maps a thread at the call to the start of the
+    /// sequence. A target strictly inside the range that is not an instruction
+    /// boundary cannot be reproduced and is rejected.
+    ///
+    /// Returns `None` for any other instruction.
+    fn emulate_get_pc_call(
+        instr: &Instruction,
+        decoded: &[Instruction],
+        start: u64,
+        end: u64,
+        jmp_code: Code,
+    ) -> Result<Option<Vec<Instruction>>, String> {
+        if !matches!(instr.code(), Code::Call_rel32_32 | Code::Call_rel32_64) {
+            return Ok(None);
+        }
+        let call_target = instr.near_branch_target();
+        if call_target < start || call_target > end {
+            return Ok(None);
+        }
+        if call_target != end && !decoded.iter().any(|i| i.ip() == call_target) {
+            return Err(
+                "Relocation failed: call into the middle of a relocated instruction".to_string(),
+            );
+        }
+
+        let ret_addr = instr.next_ip();
+        let err = |_| "Relocation failed: cannot emulate call to stolen code".to_string();
+        let mut seq = Vec::with_capacity(3);
+        if instr.code() == Code::Call_rel32_32 {
+            seq.push(Instruction::with1(Code::Pushd_imm32, ret_addr as u32).map_err(err)?);
+        } else {
+            seq.push(Instruction::with1(Code::Pushq_imm32, ret_addr as u32 as i32).map_err(err)?);
+            seq.push(
+                Instruction::with2(
+                    Code::Mov_rm32_imm32,
+                    MemoryOperand::with_base_displ(Register::RSP, 4),
+                    (ret_addr >> 32) as u32,
+                )
+                .map_err(err)?,
+            );
+        }
+        seq[0].set_ip(instr.ip());
+        seq.push(Instruction::with_branch(jmp_code, call_target).map_err(err)?);
+        Ok(Some(seq))
+    }
+
     /// Relocates a block of instructions from `target` to `trampoline`,
     /// adjusting any relative addresses as needed.
     ///
@@ -210,7 +272,7 @@ impl Disassembler {
         let mut decoder =
             Decoder::with_ip(bitness, code_slice, target as u64, DecoderOptions::NONE);
 
-        let mut instructions = Vec::new();
+        let mut decoded = Vec::new();
         let mut old_instruction_offsets = Vec::new();
 
         while decoder.can_decode() {
@@ -228,10 +290,8 @@ impl Disassembler {
             })?;
 
             old_instruction_offsets.push(old_off);
-            instructions.push(instr);
+            decoded.push(instr);
         }
-
-        let original_instruction_count = instructions.len();
 
         let return_addr = target as u64 + stolen_len as u64;
         let jmp_code = if bitness == 64 {
@@ -239,6 +299,23 @@ impl Disassembler {
         } else {
             Code::Jmp_rel32_32
         };
+
+        // The block handed to the encoder. An original instruction may expand to
+        // several block instructions; `block_index[i]` is the block index of the
+        // first one emitted for original instruction `i`, which carries its
+        // original IP so branches to it (and the offset map) resolve to it.
+        let mut instructions = Vec::with_capacity(decoded.len() + 4);
+        let mut block_index = Vec::with_capacity(decoded.len());
+        for instr in &decoded {
+            block_index.push(instructions.len());
+            if let Some(seq) =
+                Self::emulate_get_pc_call(instr, &decoded, target as u64, return_addr, jmp_code)?
+            {
+                instructions.extend(seq);
+            } else {
+                instructions.push(*instr);
+            }
+        }
 
         let jmp_back = Instruction::with_branch(jmp_code, return_addr)
             .map_err(|_| "Error while creating JMP back".to_string())?;
@@ -252,14 +329,16 @@ impl Disassembler {
         )
         .map_err(|e| format!("Relocation failed: {}", e))?;
 
-        if result.new_instruction_offsets.len() < original_instruction_count {
+        if result.new_instruction_offsets.len() < instructions.len() {
             return Err(
                 "Relocation failed: encoder returned incomplete instruction offsets".to_string(),
             );
         }
 
-        let new_instruction_offsets =
-            result.new_instruction_offsets[..original_instruction_count].to_vec();
+        let new_instruction_offsets: Vec<u32> = block_index
+            .iter()
+            .map(|&i| result.new_instruction_offsets[i])
+            .collect();
 
         // `iced` reports `u32::MAX` for an original instruction it could not place
         // at a tracked offset - e.g. a short-only branch (`jrcxz`/`jcxz`/`loop`)
@@ -333,7 +412,9 @@ mod tests {
     fn relocate_preserves_relative_call_target() {
         use iced_x86::{Decoder, DecoderOptions};
 
-        let code = [0xE8, 0x00, 0x00, 0x00, 0x00]; // call next instruction
+        // call $+0x15: a target outside the stolen range stays a call to it.
+        let mut code = [0x90u8; 32];
+        code[..5].copy_from_slice(&[0xE8, 0x10, 0x00, 0x00, 0x00]);
         let mut tramp = [0u8; 64];
 
         unsafe {
@@ -350,7 +431,8 @@ mod tests {
             Decoder::with_ip(bitness, &tramp, tramp.as_ptr() as u64, DecoderOptions::NONE);
 
         let instr = decoder.decode();
-        assert_eq!(instr.near_branch_target(), code.as_ptr() as u64 + 5);
+        assert_eq!(instr.mnemonic(), iced_x86::Mnemonic::Call);
+        assert_eq!(instr.near_branch_target(), code.as_ptr() as u64 + 0x15);
     }
 
     #[test]
@@ -722,7 +804,7 @@ mod tests {
         // instruction; those are covered by the no-crash / valid-re-decode
         // invariants in the fuzzer rather than this single-instruction check.
         let mut cases: Vec<Vec<u8>> = vec![
-            vec![0xE8, 0x00, 0x00, 0x00, 0x00], // call rel32 ($+5)
+            vec![0xE8, 0x10, 0x00, 0x00, 0x00], // call rel32 ($+0x15)
             vec![0xE9, 0x40, 0x00, 0x00, 0x00], // jmp rel32
             vec![0xEB, 0x10],                   // jmp rel8
         ];
@@ -814,6 +896,17 @@ mod tests {
                 assert_eq!(tramp[map.new_instruction_offsets[2] as usize], 0xC3);
             }
         }
+    }
+
+    /// A call into the middle of a stolen instruction cannot be reproduced in
+    /// the trampoline and must be refused.
+    #[test]
+    fn relocate_rejects_call_into_middle_of_stolen_instruction() {
+        // call $+6 (into the imm32 of the following mov eax, imm32)
+        let code = [0xE8u8, 0x01, 0x00, 0x00, 0x00, 0xB8, 0x11, 0x22, 0x33, 0x44];
+        let mut tramp = [0u8; 64];
+        let res = unsafe { Disassembler::relocate(code.as_ptr(), tramp.as_mut_ptr(), code.len()) };
+        assert!(res.is_err(), "got {res:?}");
     }
 
     /// Regression (found by the relocator fuzzer): `jrcxz`/`jcxz`/`loop*` have no
