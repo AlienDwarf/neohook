@@ -84,9 +84,9 @@ static RETIRED_NEXT: AtomicUsize = AtomicUsize::new(0);
 /// Serializes installs/unhooks and owns the registered handler.
 struct VehManager {
     /// Handle from `AddVectoredExceptionHandler`, stored as `usize` so the
-    /// state is `Send`. Zero until the first install. The handler is never
-    /// removed: a thread can still trap on a stale breakpoint after its hook is
-    /// gone, and the handler is what disarms it.
+    /// state is `Send`. Zero while no handler is registered. It is removed with
+    /// the last hook, once no thread is still dispatching a trap of one of
+    /// neohook's breakpoints (see [`crate::inflight`]).
     handler: usize,
 }
 
@@ -133,9 +133,9 @@ impl std::error::Error for VehHookError {}
 /// An installed VEH (hardware-breakpoint) hook.
 ///
 /// The hook stays active until it is explicitly removed with [`Self::unhook`]
-/// or dropped, at which point the breakpoint is cleared on every thread. The
-/// vectored handler stays registered so it can disarm any thread that still
-/// traps on the stale breakpoint.
+/// or dropped, at which point the breakpoint is cleared on every thread. A
+/// thread that still traps on the stale breakpoint is disarmed by the vectored
+/// handler, which is removed with the last hook once no such thread remains.
 #[derive(Debug)]
 pub struct VehHook {
     target: *const u8,
@@ -303,7 +303,7 @@ impl VehHook {
         }
         self.active = false;
 
-        let _mgr = lock_manager();
+        let mut mgr = lock_manager();
 
         // Disarm the breakpoint everywhere before retiring the slot so a late
         // trap still finds a valid detour rather than an empty slot. A thread
@@ -315,6 +315,47 @@ impl VehHook {
 
         let next = RETIRED_NEXT.fetch_add(1, Ordering::Relaxed) % RETIRED_COUNT;
         RETIRED[next].store(self.target as usize, Ordering::Release);
+
+        release_idle_handler(&mut mgr);
+    }
+}
+
+/// How often removing the handler re-checks for threads still dispatching a
+/// trap, one millisecond apart, before leaving it to a later unhook.
+const RELEASE_ATTEMPTS: usize = 20;
+
+/// Removes the vectored handler once no hook is live and no thread is still
+/// dispatching a trap of one of neohook's breakpoints, so the module holding
+/// it can be unloaded. The unhooks disarmed every thread; a thread could only
+/// get a stale breakpoint back from a context restored by a dispatch that is
+/// still running, which is what the check looks for. If a thread stays inside
+/// the dispatch, the handler is kept and the next unhook tries again.
+fn release_idle_handler(mgr: &mut VehManager) {
+    if mgr.handler == 0
+        || SLOT_TARGET
+            .iter()
+            .any(|target| target.load(Ordering::Acquire) != 0)
+    {
+        return;
+    }
+    let is_ours = |addr: usize| {
+        addr != 0
+            && (RETIRED
+                .iter()
+                .any(|retired| retired.load(Ordering::Acquire) == addr)
+                || SLOT_ARMED
+                    .iter()
+                    .any(|armed| armed.load(Ordering::Acquire) == addr))
+    };
+    for attempt in 0..RELEASE_ATTEMPTS {
+        if !crate::inflight::exceptions_in_flight(STATUS_SINGLE_STEP, is_ours) {
+            unsafe { RemoveVectoredExceptionHandler(mgr.handler as *mut _) };
+            mgr.handler = 0;
+            return;
+        }
+        if attempt + 1 < RELEASE_ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 }
 

@@ -41,9 +41,9 @@ typedef struct DelayHook DelayHook;
  * An installed INT3 software-breakpoint hook.
  *
  * The hook stays active until it is explicitly removed with [`Self::unhook`]
- * or dropped, at which point the original byte is restored. The vectored
- * handler stays registered so a thread that trapped just before the removal
- * is still resumed safely.
+ * or dropped, at which point the original byte is restored. A thread that
+ * trapped just before the removal is still resumed safely; the vectored
+ * handler is removed with the last hook once no such thread remains.
  */
 typedef struct Int3Hook Int3Hook;
 
@@ -60,9 +60,9 @@ typedef struct MidHook MidHook;
  * An installed VEH (hardware-breakpoint) hook.
  *
  * The hook stays active until it is explicitly removed with [`Self::unhook`]
- * or dropped, at which point the breakpoint is cleared on every thread. The
- * vectored handler stays registered so it can disarm any thread that still
- * traps on the stale breakpoint.
+ * or dropped, at which point the breakpoint is cleared on every thread. A
+ * thread that still traps on the stale breakpoint is disarmed by the vectored
+ * handler, which is removed with the last hook once no such thread remains.
  */
 typedef struct VehHook VehHook;
 

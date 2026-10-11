@@ -20,6 +20,7 @@ mod disasm;
 mod eat;
 mod gateway;
 mod iat;
+mod inflight;
 mod int3;
 mod introspect;
 mod mem;

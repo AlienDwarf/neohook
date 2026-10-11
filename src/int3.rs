@@ -80,8 +80,9 @@ static RETIRED: [AtomicUsize; RETIRED_LEN] = [const { AtomicUsize::new(0) }; RET
 /// Serializes installs/unhooks and owns the registered handler.
 struct Int3Manager {
     /// Handle from `AddVectoredExceptionHandler`, stored as `usize` so the
-    /// state is `Send`. Zero until the first install. The handler is never
-    /// removed: a thread may still be on its way into it after an unhook.
+    /// state is `Send`. Zero while no handler is registered. It is removed with
+    /// the last hook, once no thread is still dispatching a trap of a removed
+    /// hook (see [`crate::inflight`]).
     handler: usize,
     /// Next [`RETIRED`] index to overwrite.
     retired_next: usize,
@@ -137,9 +138,9 @@ impl std::error::Error for Int3HookError {}
 /// An installed INT3 software-breakpoint hook.
 ///
 /// The hook stays active until it is explicitly removed with [`Self::unhook`]
-/// or dropped, at which point the original byte is restored. The vectored
-/// handler stays registered so a thread that trapped just before the removal
-/// is still resumed safely.
+/// or dropped, at which point the original byte is restored. A thread that
+/// trapped just before the removal is still resumed safely; the vectored
+/// handler is removed with the last hook once no such thread remains.
 #[derive(Debug)]
 pub struct Int3Hook {
     target: *const u8,
@@ -358,6 +359,8 @@ impl Int3Hook {
             unsafe { write_memory_atomic(self.target as *mut u8, &self.original_byte, 1) };
             SLOT_TARGET[self.slot].store(0, Ordering::Release);
             SLOT_DETOUR[self.slot].store(0, Ordering::Release);
+
+            release_idle_handler(&mut mgr);
         });
     }
 
@@ -442,6 +445,45 @@ unsafe extern "system" fn int3_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     }
 
     EXCEPTION_CONTINUE_SEARCH
+}
+
+/// How often removing the handler re-checks for threads still dispatching a
+/// trap, one millisecond apart, before leaving it to a later unhook.
+const RELEASE_ATTEMPTS: usize = 20;
+
+/// Removes the vectored handler once no hook is live and no thread is still
+/// dispatching a trap of a removed hook, so the module holding it can be
+/// unloaded. If a thread stays inside the dispatch, the handler is kept and
+/// the next unhook tries again.
+fn release_idle_handler(mgr: &mut Int3Manager) {
+    if mgr.handler == 0
+        || SLOT_TARGET
+            .iter()
+            .any(|target| target.load(Ordering::Acquire) != 0)
+    {
+        return;
+    }
+    let is_retired = |addr: usize| {
+        addr != 0
+            && RETIRED
+                .iter()
+                .any(|retired| retired.load(Ordering::Acquire) == addr)
+    };
+    for attempt in 0..RELEASE_ATTEMPTS {
+        if !crate::inflight::exceptions_in_flight(STATUS_BREAKPOINT, is_retired) {
+            unsafe { RemoveVectoredExceptionHandler(mgr.handler as *mut _) };
+            mgr.handler = 0;
+            // No thread can reach the old handler any more.
+            for retired in &RETIRED {
+                retired.store(0, Ordering::Release);
+            }
+            mgr.retired_next = 0;
+            return;
+        }
+        if attempt + 1 < RELEASE_ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
 }
 
 /// Returns the detour of the live slot hooking `addr`, if any.
