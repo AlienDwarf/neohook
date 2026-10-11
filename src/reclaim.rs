@@ -488,6 +488,88 @@ mod tests {
         );
     }
 
+    /// XOR mask that keeps the region address off the stack in readable form.
+    const MASK: usize = 0x5A5A_5A5A;
+
+    /// Unmasks `masked` into a callee-saved register and spins there until
+    /// `*stop` is set, so the address lives only in that register.
+    #[cfg(target_arch = "x86_64")]
+    #[unsafe(naked)]
+    unsafe extern "C" fn hold_in_register(_masked: usize, _stop: *const u8) {
+        std::arch::naked_asm!(
+            "push rbx",
+            "mov rbx, rcx",
+            "xor rbx, {mask}",
+            "2:",
+            "pause",
+            "cmp byte ptr [rdx], 0",
+            "je 2b",
+            "pop rbx",
+            "ret",
+            mask = const MASK,
+        );
+    }
+
+    #[cfg(target_arch = "x86")]
+    #[unsafe(naked)]
+    unsafe extern "C" fn hold_in_register(_masked: usize, _stop: *const u8) {
+        std::arch::naked_asm!(
+            "push ebx",
+            "mov ebx, [esp + 8]",
+            "xor ebx, {mask}",
+            "mov ecx, [esp + 12]",
+            "2:",
+            "pause",
+            "cmp byte ptr [ecx], 0",
+            "je 2b",
+            "pop ebx",
+            "ret",
+            mask = const MASK,
+        );
+    }
+
+    #[test]
+    fn region_held_only_in_a_register_stays_quarantined() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_FREE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc,
+        };
+        static STOP: AtomicBool = AtomicBool::new(false);
+
+        let region = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                0x1000,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            )
+        };
+        assert!(!region.is_null(), "allocation failed");
+        let masked = region as usize ^ MASK;
+        let holder = std::thread::spawn(move || unsafe {
+            hold_in_register(masked, STOP.as_ptr() as *const u8)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let freed = |addr: *const core::ffi::c_void| {
+            let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            let q = unsafe { VirtualQuery(addr, &mut mbi, std::mem::size_of_val(&mbi)) };
+            q != 0 && mbi.State == MEM_FREE
+        };
+        retire(region as *mut u8, 0x1000);
+        reclaim();
+        let freed_while_held = freed(region);
+
+        STOP.store(true, Ordering::Release);
+        holder.join().unwrap();
+        reclaim();
+        assert!(
+            !freed_while_held,
+            "a region a thread holds in a register was freed"
+        );
+        assert!(freed(region), "freed once nothing references it");
+    }
+
     /// Threads that have exited but whose handles are still open (an unjoined
     /// `JoinHandle`) reference nothing and must not keep an idle region
     /// quarantined, however many of them there are.
