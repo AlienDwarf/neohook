@@ -14,6 +14,7 @@
 
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::Diagnostics::Debug::*;
+use windows_sys::Win32::System::Memory::*;
 use windows_sys::Win32::System::SystemServices::*;
 
 // --- Architecture-specific imports ---
@@ -26,6 +27,9 @@ const IMAGE_OPTIONAL_MAGIC: u16 = IMAGE_NT_OPTIONAL_HDR32_MAGIC;
 use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64 as IMAGE_NT_HEADERS;
 #[cfg(target_arch = "x86_64")]
 const IMAGE_OPTIONAL_MAGIC: u16 = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+
+// Largest `e_lfanew` the Windows loader accepts (RTLP_IMAGE_MAX_DOS_HEADER).
+const MAX_E_LFANEW: usize = 256 * 1024 * 1024;
 
 /// Errors produced while validating and parsing a loaded PE image.
 #[derive(Debug)]
@@ -63,6 +67,9 @@ pub fn parse_module_image(h_module: HMODULE) -> Result<ModuleImage, PeError> {
 
     let base_address = h_module as usize;
     let dos = base_address as *const IMAGE_DOS_HEADER;
+    if !is_readable(base_address, std::mem::size_of::<IMAGE_DOS_HEADER>()) {
+        return Err(PeError::InvalidDosHeader);
+    }
 
     // DOS signature should be "MZ" (0x5A4D) when valid.
     if unsafe { (*dos).e_magic } != IMAGE_DOS_SIGNATURE {
@@ -71,7 +78,7 @@ pub fn parse_module_image(h_module: HMODULE) -> Result<ModuleImage, PeError> {
 
     // Locate the NT headers via the e_lfanew offset from the DOS header.
     let e_lfanew = unsafe { (*dos).e_lfanew };
-    if e_lfanew <= 0 {
+    if e_lfanew <= 0 || e_lfanew as usize >= MAX_E_LFANEW {
         return Err(PeError::InvalidNtHeader);
     }
 
@@ -79,6 +86,12 @@ pub fn parse_module_image(h_module: HMODULE) -> Result<ModuleImage, PeError> {
         .checked_add(e_lfanew as usize)
         .ok_or(PeError::InvalidNtHeader)?;
     let nt = nt_addr as *const IMAGE_NT_HEADERS;
+
+    // The offset comes from the image itself, so make sure the whole NT
+    // headers block is mapped and readable before touching it.
+    if !is_readable(nt_addr, std::mem::size_of::<IMAGE_NT_HEADERS>()) {
+        return Err(PeError::InvalidNtHeader);
+    }
 
     // NT signature should be "PE\0\0" (0x4550) when valid.
     // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#signature-image-only
@@ -100,6 +113,40 @@ pub fn parse_module_image(h_module: HMODULE) -> Result<ModuleImage, PeError> {
         base_address,
         size: size_of_image,
     })
+}
+
+/// Returns `true` if every byte of `[addr, addr + len)` is committed and
+/// readable.
+fn is_readable(addr: usize, len: usize) -> bool {
+    let Some(end) = addr.checked_add(len) else {
+        return false;
+    };
+
+    let mut cur = addr;
+    while cur < end {
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let res = unsafe {
+            VirtualQuery(
+                cur as *const _,
+                &mut mbi,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if res == 0
+            || mbi.State != MEM_COMMIT
+            || mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0
+            || mbi.Protect == 0
+        {
+            return false;
+        }
+
+        match (mbi.BaseAddress as usize).checked_add(mbi.RegionSize) {
+            Some(next) if next > cur => cur = next,
+            _ => return false,
+        }
+    }
+
+    true
 }
 
 /// Returns the RVA of the module entry point (`AddressOfEntryPoint`), or `None`
