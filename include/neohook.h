@@ -25,7 +25,7 @@ typedef struct DetourTransaction DetourTransaction;
  * Unlike VEH hooks (capped at four by the hardware debug registers), the only
  * limit here is the size of the lock-free slot table read by the handler.
  */
-#define MAX_HOOKS 256
+#define INT3_MAX_HOOKS 256
 
 /**
  * A registered delay / on-load hook.
