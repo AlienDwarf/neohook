@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use iced_x86::{
     BlockEncoder, BlockEncoderOptions, Code, Decoder, DecoderOptions, FlowControl, Instruction,
-    InstructionBlock, MemoryOperand, Mnemonic, Register,
+    InstructionBlock, MemoryOperand, Mnemonic, OpKind, Register,
 };
 
 #[derive(Debug, Clone)]
@@ -91,6 +91,17 @@ impl Disassembler {
         }
     }
 
+    /// Returns `true` for a direct conditional jump (`jcc`, `loop`, `jrcxz`),
+    /// whose target is in this function. An unconditional `jmp` is not counted:
+    /// it is just as often a tail jump into the next function.
+    fn is_conditional_jump(instr: &Instruction) -> bool {
+        instr.flow_control() == FlowControl::ConditionalBranch
+            && matches!(
+                instr.op0_kind(),
+                OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+            )
+    }
+
     /// Returns `true` for alignment padding emitted between functions:
     /// `int3` and (multi-byte) `nop`.
     fn is_padding(instr: &Instruction) -> bool {
@@ -103,7 +114,10 @@ impl Disassembler {
     /// reached before `min_size` bytes are covered, the range may only extend
     /// over `int3` / `nop` padding after it. Otherwise the bytes that follow
     /// belong to other code (typically the next function), overwriting them
-    /// would corrupt it, and an error is returned.
+    /// would corrupt it, and an error is returned. An earlier branch that jumps
+    /// past such an instruction (an early-exit `jcc` over a `ret`) shows that
+    /// the bytes after it are still this function's, so it does not end the
+    /// function there; the relocation retargets that branch.
     ///
     /// # Safety
     /// The caller must ensure that `address` is a valid pointer
@@ -143,6 +157,8 @@ impl Disassembler {
         // Set once an instruction that ends the function has been decoded;
         // from then on only padding may be covered.
         let mut function_ended = false;
+        // Furthest address a conditional jump decoded so far jumps to.
+        let mut branch_reach = 0u64;
 
         // Decode instructions until we have at least min_size bytes or we run out of instructions to decode
         while decoder.can_decode() && total_bytes < min_size {
@@ -169,7 +185,10 @@ impl Disassembler {
                 return Ok(total_bytes);
             }
 
-            if Self::ends_function(&instruction) {
+            if Self::is_conditional_jump(&instruction) {
+                branch_reach = branch_reach.max(instruction.near_branch_target());
+            }
+            if Self::ends_function(&instruction) && branch_reach < instruction.next_ip() {
                 function_ended = true;
             }
         }
@@ -373,6 +392,17 @@ impl Disassembler {
 #[cfg(test)]
 mod tests {
     use crate::disasm::Disassembler;
+
+    #[test]
+    fn get_instruction_len_continues_past_a_ret_a_branch_jumps_over() {
+        // stc; jc +1; ret; mov eax, 42; ret
+        let code = [0xF9u8, 0x72, 0x01, 0xC3, 0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3];
+        let len = unsafe { Disassembler::get_instruction_len(code.as_ptr(), 5) };
+        assert_eq!(len, Ok(9));
+        // Without the branch the ret ends the function.
+        let code = [0xF9u8, 0x90, 0x90, 0xC3, 0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3];
+        assert!(unsafe { Disassembler::get_instruction_len(code.as_ptr(), 5) }.is_err());
+    }
 
     #[test]
     fn get_instruction_len_on_nops() {
