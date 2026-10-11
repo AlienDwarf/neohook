@@ -332,7 +332,7 @@ impl VehHook {
 
 /// How often removing the handler re-checks for threads still dispatching a
 /// trap, one millisecond apart, before leaving it to a later unhook.
-const RELEASE_ATTEMPTS: usize = 20;
+const RELEASE_ATTEMPTS: usize = 5;
 
 /// Removes the vectored handler once no hook is live and no thread is still
 /// dispatching a trap of one of neohook's breakpoints, so the module holding
