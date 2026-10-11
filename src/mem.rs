@@ -131,7 +131,8 @@ mod tests {
 
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ,
-        PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualQuery,
+        PAGE_EXECUTE_READWRITE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        VirtualProtect, VirtualQuery,
     };
 
     use crate::mem::virtual_protect_same_execute;
@@ -218,6 +219,95 @@ mod tests {
             assert_eq!(
                 mbi.Protect, PAGE_EXECUTE_READWRITE,
                 "execute permission should have been preserved"
+            );
+        }
+    }
+
+    /// Reserves two adjacent pages with `first` / `second` protection and
+    /// returns their base.
+    unsafe fn two_pages(first: u32, second: u32) -> *mut u8 {
+        unsafe {
+            let base = VirtualAlloc(
+                ptr::null(),
+                0x2000,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            ) as *mut u8;
+            assert!(!base.is_null(), "setup allocation failed");
+            let mut old = 0u32;
+            assert_ne!(VirtualProtect(base as _, 0x1000, first, &mut old), 0);
+            assert_ne!(
+                VirtualProtect(base.add(0x1000) as _, 0x1000, second, &mut old),
+                0
+            );
+            base
+        }
+    }
+
+    unsafe fn protect_of(addr: *const u8) -> u32 {
+        unsafe {
+            let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let q = VirtualQuery(
+                addr as _,
+                &mut mbi,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            );
+            assert_ne!(q, 0, "VirtualQuery failed");
+            mbi.Protect
+        }
+    }
+
+    /// A write straddling a page boundary must restore each page's own
+    /// protection, not stamp the first page's protection over both.
+    #[test]
+    fn page_straddling_writes_restore_each_page_protection() {
+        let layouts = [
+            (PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_READ),
+            (PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE),
+            (PAGE_READONLY, PAGE_EXECUTE_READ),
+        ];
+        let bytes = [0xC3u8, 0xCC, 0x90, 0x90];
+        for (first, second) in layouts {
+            for atomic in [false, true] {
+                unsafe {
+                    let base = two_pages(first, second);
+                    let at = base.add(0xFFE);
+                    if atomic {
+                        let orig = crate::mem::write_memory_atomic(at, bytes.as_ptr(), 4)
+                            .expect("write_memory_atomic failed");
+                        assert_eq!(orig, [0, 0, 0, 0]);
+                    } else {
+                        assert!(crate::mem::write_code_bytes(at, bytes.as_ptr(), 4));
+                    }
+                    assert_eq!(std::slice::from_raw_parts(at, 4), bytes);
+                    let (p1, p2) = (protect_of(base), protect_of(base.add(0x1000)));
+                    assert_ne!(VirtualFree(base as _, 0, MEM_RELEASE), 0);
+                    assert_eq!(
+                        (p1, p2),
+                        (first, second),
+                        "page protections must be restored per page (atomic={atomic})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Execute permission must be preserved per page when a range covering a
+    /// non-executable page and an executable one is made writable.
+    #[test]
+    fn virtual_protect_same_execute_preserves_execute_per_page() {
+        unsafe {
+            let base = two_pages(PAGE_READWRITE, PAGE_EXECUTE_READ);
+            let mut old = 0u32;
+            let ok = virtual_protect_same_execute(base.add(0xFFE), 4, PAGE_READWRITE, &mut old);
+            let (p1, p2) = (protect_of(base), protect_of(base.add(0x1000)));
+            assert_ne!(VirtualFree(base as _, 0, MEM_RELEASE), 0);
+            assert_ne!(ok, 0);
+            assert_eq!(old, PAGE_READWRITE, "old protection is the first page's");
+            assert_eq!(p1, PAGE_READWRITE);
+            assert_eq!(
+                p2, PAGE_EXECUTE_READWRITE,
+                "the executable second page must stay executable"
             );
         }
     }
