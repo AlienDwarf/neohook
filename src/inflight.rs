@@ -290,30 +290,42 @@ mod tests {
         assert!(!after, "a resumed thread is no longer in flight");
     }
 
-    static SPINNING: AtomicBool = AtomicBool::new(false);
     static STOP_SPIN: AtomicBool = AtomicBool::new(false);
 
-    #[inline(never)]
-    fn spin() {
-        SPINNING.store(true, Ordering::Release);
-        while !STOP_SPIN.load(Ordering::Relaxed) {
-            std::hint::spin_loop();
-        }
+    /// Spins until `*stop` is set, never leaving these few instructions, so
+    /// the thread's IP is always inside them.
+    #[cfg(target_arch = "x86_64")]
+    #[unsafe(naked)]
+    unsafe extern "C" fn spin(_stop: *const u8) {
+        std::arch::naked_asm!("2:", "pause", "cmp byte ptr [rcx], 0", "je 2b", "ret");
+    }
+
+    #[cfg(target_arch = "x86")]
+    #[unsafe(naked)]
+    unsafe extern "C" fn spin(_stop: *const u8) {
+        std::arch::naked_asm!(
+            "mov ecx, [esp + 4]",
+            "2:",
+            "pause",
+            "cmp byte ptr [ecx], 0",
+            "je 2b",
+            "ret"
+        );
     }
 
     #[test]
     fn sees_a_thread_stopped_at_a_trap_address() {
-        let spinner = std::thread::spawn(spin);
-        while !SPINNING.load(Ordering::Acquire) {
-            std::thread::yield_now();
-        }
+        let stop = STOP_SPIN.as_ptr() as usize;
+        let spinner = std::thread::spawn(move || unsafe { spin(stop as *const u8) });
+        // Let it reach the loop.
+        std::thread::sleep(std::time::Duration::from_millis(50));
         let start = spin as *const () as usize;
-        let in_spin = |a: usize| (start..start + 0x100).contains(&a);
+        let in_spin = |a: usize| (start..start + 16).contains(&a);
 
         let at_trap = exceptions_in_flight(PARK_CODE ^ 2, in_spin, false);
         let elsewhere = exceptions_in_flight(PARK_CODE ^ 2, |_| false, false);
 
-        STOP_SPIN.store(true, Ordering::Relaxed);
+        STOP_SPIN.store(true, Ordering::Release);
         spinner.join().unwrap();
         assert!(
             at_trap,
