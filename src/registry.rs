@@ -13,8 +13,9 @@
 //! This module provides that shared store. [`register`] moves a hook in under a
 //! name; [`enable`] / [`disable`] toggle it; [`unhook`] removes one; and
 //! [`unhook_all`] tears everything down (useful from `DllMain` on
-//! `DLL_PROCESS_DETACH`). All entries are dropped - and therefore unhooked - if
-//! they are still present when the process exits.
+//! `DLL_PROCESS_DETACH`), newest registration first, so a hook chained on an
+//! earlier one is removed before it. All entries are dropped - and therefore
+//! unhooked - if they are still present when the process exits.
 //!
 //! ```rust,ignore
 //! use neohook::{registry, DetourTransaction};
@@ -32,6 +33,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::DetourError;
 use crate::transaction::Hook;
@@ -42,7 +44,10 @@ use crate::transaction::Hook;
 /// default. Those pointers are process-global code addresses with no thread
 /// affinity, so moving the guard between threads is sound; the registry
 /// serializes every access through its mutex.
-struct SendHook(Hook);
+///
+/// The second field is the registration sequence number, which orders the
+/// teardown in [`unhook_all`].
+struct SendHook(Hook, u64);
 
 // SAFETY: see `SendHook` docs - the wrapped pointers are process-global and all
 // access is serialized by `REGISTRY`'s mutex.
@@ -50,6 +55,9 @@ unsafe impl Send for SendHook {}
 
 /// The shared name -> hook table. `None` until the first `register`.
 static REGISTRY: Mutex<Option<HashMap<String, SendHook>>> = Mutex::new(None);
+
+/// Sequence number of the next registration, guarded by `REGISTRY`'s mutex.
+static NEXT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Locks the registry, recovering from a poisoned mutex (the guarded map carries
 /// no invariant a panic could corrupt).
@@ -66,7 +74,9 @@ fn lock() -> std::sync::MutexGuard<'static, Option<HashMap<String, SendHook>>> {
 pub fn register(name: impl Into<String>, hook: Hook) -> Option<Hook> {
     let mut guard = lock();
     let map = guard.get_or_insert_with(HashMap::new);
-    map.insert(name.into(), SendHook(hook)).map(|prev| prev.0)
+    let seq = NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
+    map.insert(name.into(), SendHook(hook, seq))
+        .map(|prev| prev.0)
 }
 
 /// Removes the hook registered under `name` and returns it without unhooking, so
@@ -130,9 +140,9 @@ pub fn unhook(name: &str) -> Result<bool, DetourError> {
 
 /// Removes and unhooks **every** registered hook.
 ///
-/// Each hook is dropped, which restores its target via RAII. Intended for a
-/// single teardown point such as `DLL_PROCESS_DETACH`. Returns the number of
-/// hooks that were torn down.
+/// Each hook is dropped, which restores its target via RAII, in reverse
+/// registration order. Intended for a single teardown point such as
+/// `DLL_PROCESS_DETACH`. Returns the number of hooks that were torn down.
 pub fn unhook_all() -> usize {
     let map = {
         let mut guard = lock();
@@ -140,8 +150,10 @@ pub fn unhook_all() -> usize {
     };
     match map {
         Some(m) => {
-            let n = m.len();
-            drop(m); // dropping each SendHook(Hook) unhooks via RAII
+            let mut hooks: Vec<SendHook> = m.into_values().collect();
+            hooks.sort_by_key(|h| std::cmp::Reverse(h.1));
+            let n = hooks.len();
+            drop(hooks); // dropping each SendHook(Hook) unhooks via RAII, front to back
             n
         }
         None => 0,

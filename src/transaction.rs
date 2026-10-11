@@ -226,6 +226,11 @@ impl Hook {
 }
 
 /// Helper struct to manage the allocation of trampolines, which are used for inline hooks.
+///
+/// Hooks chained on this hook's gateway may outlive it. Dropping it first
+/// restores the target, so calls run the original function and bypass the
+/// chained hooks; its gateway memory stays allocated until the last of them is
+/// dropped, so their unhook never writes into released memory.
 #[derive(Debug)]
 pub struct InlineHook {
     pub target: *mut u8,
@@ -335,12 +340,6 @@ impl InlineHook {
             // copy the original bytes back to the target function
             std::ptr::copy_nonoverlapping(self.orig_bytes.as_ptr(), self.target, self.stolen_len);
 
-            // If this hook had overwritten a managed gateway, restoring the original bytes
-            // makes the target a managed gateway again
-            if matches!(self.target_kind, TargetKind::ManagedGateway) {
-                register_managed_gateway(self.target);
-            }
-
             // CPU-Cache flush so CPU has to read from RAM not from L1 L2 L3 cache
             let flush_ok = windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache(
                 windows_sys::Win32::System::Threading::GetCurrentProcess(),
@@ -373,6 +372,19 @@ impl InlineHook {
         }
         self.published = false;
         unregister_live_patch(self.target);
+
+        // Restoring a managed gateway makes it chainable again, unless its
+        // owner was dropped meanwhile; the last dependent of such a gateway
+        // releases its memory.
+        if matches!(self.target_kind, TargetKind::ManagedGateway) {
+            let (owner_alive, orphan) = remove_gateway_dependent(self.target);
+            if owner_alive {
+                register_managed_gateway(self.target);
+            }
+            if let Some((ptr, size)) = orphan {
+                crate::reclaim::retire(ptr as *mut u8, size);
+            }
+        }
     }
 
     fn detach_finalize(&mut self) {
@@ -397,6 +409,12 @@ impl Drop for InlineHook {
             }
             self.release();
             unregister_managed_gateway(self.trampoline.ptr);
+
+            // Hooks chained on the gateway still restore their bytes into it,
+            // so it is retired by the last of them instead of here.
+            if orphan_chained_gateway(self.trampoline.ptr, self.trampoline.size) {
+                self.trampoline.ptr = std::ptr::null_mut();
+            }
         });
     }
 }
@@ -1563,6 +1581,7 @@ impl TransactionCore {
             if let Hook::Inline(inline) = hook {
                 if matches!(inline.target_kind, TargetKind::ManagedGateway) {
                     unregister_managed_gateway(inline.target);
+                    add_gateway_dependent(inline.target);
                 }
                 register_managed_gateway(inline.trampoline.ptr);
                 register_live_patch(inline.target, inline.stolen_len);
@@ -2546,6 +2565,67 @@ fn is_managed_gateway(ptr: *mut u8) -> bool {
     managed_gateways()
         .lock()
         .map(|s| s.contains(&(ptr as usize)))
+        .unwrap_or(false)
+}
+
+/// Hooks chained on a managed gateway, keyed by the gateway address.
+struct ChainedGateway {
+    /// Installed hooks whose target is this gateway.
+    dependents: usize,
+    /// The gateway's trampoline (address, size) once its owner was dropped,
+    /// retired when the last dependent is released.
+    orphan: Option<(usize, usize)>,
+}
+
+/// Updated only outside the suspend window, under the transaction lock.
+fn chained_gateways() -> &'static Mutex<HashMap<usize, ChainedGateway>> {
+    static CHAINED: OnceLock<Mutex<HashMap<usize, ChainedGateway>>> = OnceLock::new();
+    CHAINED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn add_gateway_dependent(gateway: *mut u8) {
+    let _ = chained_gateways().lock().map(|mut m| {
+        m.entry(gateway as usize)
+            .or_insert(ChainedGateway {
+                dependents: 0,
+                orphan: None,
+            })
+            .dependents += 1;
+    });
+}
+
+/// Drops one dependent of `gateway`. Returns whether the gateway's owner is
+/// still alive, and the orphaned trampoline to retire once the last dependent
+/// is gone.
+fn remove_gateway_dependent(gateway: *mut u8) -> (bool, Option<(usize, usize)>) {
+    let Ok(mut m) = chained_gateways().lock() else {
+        return (false, None);
+    };
+    let Some(entry) = m.get_mut(&(gateway as usize)) else {
+        return (true, None);
+    };
+    let owner_alive = entry.orphan.is_none();
+    entry.dependents = entry.dependents.saturating_sub(1);
+    if entry.dependents > 0 {
+        return (owner_alive, None);
+    }
+    let orphan = entry.orphan;
+    m.remove(&(gateway as usize));
+    (owner_alive, orphan)
+}
+
+/// Hands the trampoline of a dropped hook to the hooks chained on its gateway.
+/// Returns `false` if nothing is chained on it, so the caller retires it.
+fn orphan_chained_gateway(gateway: *mut u8, size: usize) -> bool {
+    chained_gateways()
+        .lock()
+        .map(|mut m| match m.get_mut(&(gateway as usize)) {
+            Some(entry) if entry.dependents > 0 => {
+                entry.orphan = Some((gateway as usize, size));
+                true
+            }
+            _ => false,
+        })
         .unwrap_or(false)
 }
 
