@@ -1317,3 +1317,155 @@ fn function_bounds(entry: u64) -> Option<(u64, u64)> {
 fn function_bounds(_entry: u64) -> Option<(u64, u64)> {
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs the analysis on raw instruction bytes (readable memory suffices).
+    fn infer_bytes(code: &[u8]) -> SignatureGuess {
+        unsafe { infer_signature(code.as_ptr()) }.expect("infer")
+    }
+
+    fn kinds(sig: &SignatureGuess) -> Vec<ValueKind> {
+        sig.args.iter().map(|a| a.kind).collect()
+    }
+
+    #[test]
+    fn evidence_kind_prefers_pointer_then_float_then_width() {
+        let mut e = Evidence::default();
+        assert_eq!(e.kind(), ValueKind::Unknown);
+        assert_eq!(e.confidence(), 0.3);
+        e.read(4);
+        assert_eq!(e.kind(), ValueKind::Int32);
+        assert_eq!(e.confidence(), 0.6);
+        e.read(1);
+        assert_eq!(e.kind(), ValueKind::Int32, "the widest read wins");
+        e.double = true;
+        assert_eq!(e.kind(), ValueKind::Double);
+        e.pointer = true;
+        assert_eq!(e.kind(), ValueKind::Pointer);
+        assert_eq!(e.confidence(), 0.85);
+    }
+
+    #[test]
+    fn evidence_merge_ignores_unused_evidence() {
+        let mut e = Evidence::default();
+        e.merge(&Evidence {
+            pointer: true,
+            ..Evidence::default()
+        });
+        assert!(!e.used && !e.pointer, "an unused callee slot adds nothing");
+        let mut used = Evidence::default();
+        used.read(8);
+        used.float = true;
+        e.merge(&used);
+        assert!(e.used && e.float);
+        assert_eq!(e.width, 8);
+    }
+
+    #[test]
+    fn xmm_kind_from_mnemonic() {
+        assert_eq!(xmm_kind(Mnemonic::Addss), Some(ValueKind::Float));
+        assert_eq!(xmm_kind(Mnemonic::Mulsd), Some(ValueKind::Double));
+        assert_eq!(xmm_kind(Mnemonic::Cvtss2sd), Some(ValueKind::Float));
+        assert_eq!(xmm_kind(Mnemonic::Ucomisd), Some(ValueKind::Double));
+        assert_eq!(xmm_kind(Mnemonic::Movq), None);
+        assert_eq!(xmm_kind(Mnemonic::Pxor), None);
+    }
+
+    #[test]
+    fn unreadable_code_is_rejected() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc, VirtualFree,
+        };
+        let page = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                0x1000,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_NOACCESS,
+            )
+        };
+        assert!(!page.is_null());
+        let result = unsafe { infer_signature(page as *const u8) };
+        unsafe { VirtualFree(page, 0, MEM_RELEASE) };
+        assert_eq!(result, Err(SignatureError::UnreadableCode));
+    }
+
+    #[test]
+    fn a_function_without_ret_is_incomplete() {
+        // jmp $ - loops forever, never returns.
+        let sig = infer_bytes(&[0xEB, 0xFE]);
+        assert!(!sig.complete);
+        assert!(sig.args.is_empty());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn zeroing_idioms_are_writes() {
+        // xor ecx, ecx; sub edx, edx; or r8d, -1; and r9d, 0;
+        // add ecx, edx; add ecx, r8d; add ecx, r9d; mov eax, ecx; ret
+        let sig = infer_bytes(&[
+            0x31, 0xC9, 0x29, 0xD2, 0x41, 0x83, 0xC8, 0xFF, 0x41, 0x83, 0xE1, 0x00, 0x01, 0xD1,
+            0x44, 0x01, 0xC1, 0x44, 0x01, 0xC9, 0x89, 0xC8, 0xC3,
+        ]);
+        assert!(sig.args.is_empty(), "{sig:?}");
+        assert_eq!(sig.returns, Some(ValueKind::Int32));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn copies_carry_the_argument_along() {
+        // mov rax, rdx; mov r10, rax; mov eax, [r10]; ret
+        let sig = infer_bytes(&[0x48, 0x89, 0xD0, 0x49, 0x89, 0xC2, 0x41, 0x8B, 0x02, 0xC3]);
+        assert_eq!(kinds(&sig), vec![ValueKind::Unknown, ValueKind::Pointer]);
+        assert_eq!(sig.args[0].location, ArgLocation::Register("rcx"));
+        assert_eq!(sig.args[1].location, ArgLocation::Register("rdx"));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn aligned_stack_keeps_spills_trackable() {
+        // push rbp; mov rbp, rsp; and rsp, -16; sub rsp, 0x20;
+        // mov [rsp], rcx; mov rax, [rsp]; mov eax, [rax]; leave; ret
+        let sig = infer_bytes(&[
+            0x55, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xE4, 0xF0, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x89,
+            0x0C, 0x24, 0x48, 0x8B, 0x04, 0x24, 0x8B, 0x00, 0xC9, 0xC3,
+        ]);
+        assert_eq!(kinds(&sig), vec![ValueKind::Pointer], "{sig:?}");
+    }
+
+    #[cfg(target_arch = "x86")]
+    #[test]
+    fn zeroing_idioms_are_writes() {
+        // xor ecx, ecx; or edx, -1; add ecx, edx; mov eax, ecx; ret
+        let sig = infer_bytes(&[0x31, 0xC9, 0x83, 0xCA, 0xFF, 0x01, 0xD1, 0x89, 0xC8, 0xC3]);
+        assert!(sig.args.is_empty(), "{sig:?}");
+        assert_eq!(sig.convention, CallingConvention::Cdecl);
+    }
+
+    #[cfg(target_arch = "x86")]
+    #[test]
+    fn copies_carry_the_argument_along() {
+        // mov eax, [esp+4]; mov edx, eax; mov eax, [edx]; ret 4
+        let sig = infer_bytes(&[
+            0x8B, 0x44, 0x24, 0x04, 0x89, 0xC2, 0x8B, 0x02, 0xC2, 0x04, 0x00,
+        ]);
+        assert_eq!(kinds(&sig), vec![ValueKind::Pointer]);
+        assert_eq!(sig.args[0].location, ArgLocation::Stack(4));
+        assert_eq!(sig.convention, CallingConvention::Stdcall);
+    }
+
+    #[cfg(target_arch = "x86")]
+    #[test]
+    fn aligned_stack_keeps_spills_trackable() {
+        // push ebp; mov ebp, esp; and esp, -8; sub esp, 8; mov eax, [ebp+8];
+        // mov [esp], eax; mov ecx, [esp]; mov eax, [ecx]; leave; ret
+        let sig = infer_bytes(&[
+            0x55, 0x89, 0xE5, 0x83, 0xE4, 0xF8, 0x83, 0xEC, 0x08, 0x8B, 0x45, 0x08, 0x89, 0x04,
+            0x24, 0x8B, 0x0C, 0x24, 0x8B, 0x01, 0xC9, 0xC3,
+        ]);
+        assert_eq!(kinds(&sig), vec![ValueKind::Pointer], "{sig:?}");
+    }
+}

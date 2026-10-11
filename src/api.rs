@@ -2331,3 +2331,72 @@ mod attach_export_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod signature_ffi_tests {
+    use super::*;
+    use crate::{ArgGuess, ArgLocation, CallingConvention, SignatureGuess, ValueKind};
+
+    fn arg(location: ArgLocation, kind: ValueKind) -> ArgGuess {
+        ArgGuess {
+            location,
+            kind,
+            confidence: 0.5,
+        }
+    }
+
+    #[test]
+    fn from_guess_copies_registers_and_stack_slots() {
+        let guess = SignatureGuess {
+            convention: CallingConvention::Win64,
+            args: vec![
+                arg(ArgLocation::Register("xmm1"), ValueKind::Double),
+                arg(ArgLocation::Stack(0x28), ValueKind::Pointer),
+            ],
+            returns: None,
+            stack_cleanup: 0,
+            complete: true,
+        };
+        let sig = DetoursSignature::from_guess(&guess);
+        assert_eq!(sig.convention, DETOURS_CONVENTION_WIN64);
+        assert_eq!(sig.has_return, 0);
+        assert_eq!(sig.complete, 1);
+        assert_eq!(sig.truncated, 0);
+        assert_eq!(sig.arg_count, 2);
+
+        let name = unsafe { CStr::from_ptr(sig.args[0].register_name.as_ptr()) };
+        assert_eq!(name.to_str().unwrap(), "xmm1");
+        assert_eq!(sig.args[0].on_stack, 0);
+        assert_eq!(sig.args[0].kind, DETOURS_VALUE_KIND_DOUBLE);
+
+        assert_eq!(sig.args[1].on_stack, 1);
+        assert_eq!(sig.args[1].stack_offset, 0x28);
+        assert_eq!(sig.args[1].register_name, [0; 8]);
+        assert_eq!(sig.args[1].kind, DETOURS_VALUE_KIND_POINTER);
+        assert_eq!(sig.args[1].confidence, 0.5);
+    }
+
+    #[test]
+    fn from_guess_truncates_past_the_capacity() {
+        let guess = SignatureGuess {
+            convention: CallingConvention::Cdecl,
+            args: (0..DETOURS_MAX_SIGNATURE_ARGS + 5)
+                .map(|i| arg(ArgLocation::Stack(4 + 4 * i as u32), ValueKind::Int32))
+                .collect(),
+            returns: Some(ValueKind::Int64),
+            stack_cleanup: 0,
+            complete: false,
+        };
+        let sig = DetoursSignature::from_guess(&guess);
+        assert_eq!(sig.truncated, 1);
+        assert_eq!(sig.arg_count as usize, DETOURS_MAX_SIGNATURE_ARGS);
+        assert_eq!(sig.has_return, 1);
+        assert_eq!(sig.returns, DETOURS_VALUE_KIND_INT64);
+        assert_eq!(sig.complete, 0);
+        let last = sig.args[DETOURS_MAX_SIGNATURE_ARGS - 1];
+        assert_eq!(
+            last.stack_offset,
+            4 + 4 * (DETOURS_MAX_SIGNATURE_ARGS as u32 - 1)
+        );
+    }
+}
