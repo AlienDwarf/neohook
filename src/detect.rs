@@ -66,6 +66,7 @@ use windows_sys::Win32::System::Threading::{
 pub const COMPARE_BYTES: usize = 16;
 
 /// What kind of hook was found.
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DetectedHookKind {
     /// The function starts with a jump that the file does not have.

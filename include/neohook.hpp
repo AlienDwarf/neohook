@@ -3,6 +3,7 @@
 #include "neohook.h"
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -228,6 +229,61 @@ namespace neohook
             static_cast<const uint8_t *>(addr),
             static_cast<uintptr_t>(disp_offset),
             static_cast<uintptr_t>(instr_len)));
+    }
+
+    // ----------------- Hook detection -----------------
+
+    /**
+     * @brief Checks whether the function at @p func is hooked: an inline jump,
+     *        a breakpoint, other changed bytes, or a hardware breakpoint.
+     *
+     * @return The hook found, or std::nullopt if the function matches its
+     *         module's file.
+     * @throws std::runtime_error if @p func is not inside a loaded module or the
+     *         module's file cannot be read.
+     */
+    inline std::optional<DetoursDetectedHook> check_function(const void *func)
+    {
+        DetoursDetectedHook hook{};
+        switch (detours_check_function(static_cast<const uint8_t *>(func), &hook)) {
+        case 1: return hook;
+        case 0: return std::nullopt;
+        default: throw std::runtime_error("NeoHook: Failed to check the function");
+        }
+    }
+
+    /**
+     * @brief Checks whether the export @p func of @p module (loaded if needed)
+     *        is hooked, inline or in the export table.
+     * @throws std::runtime_error if the export cannot be found or the module's
+     *         file cannot be read.
+     */
+    inline std::optional<DetoursDetectedHook> check_export(const std::string &module, const std::string &func)
+    {
+        DetoursDetectedHook hook{};
+        switch (detours_check_export(module.c_str(), func.c_str(), &hook)) {
+        case 1: return hook;
+        case 0: return std::nullopt;
+        default: throw std::runtime_error("NeoHook: Failed to check the export");
+        }
+    }
+
+    /**
+     * @brief Scans a loaded module for hooks: its exported functions, its export
+     *        table and its import table.
+     * @throws std::runtime_error if the module is not loaded or its file cannot
+     *         be read.
+     */
+    inline std::vector<DetoursDetectedHook> scan_module_hooks(const std::string &module)
+    {
+        void *handle = detours_scan_module_hooks(module.c_str());
+        if (!handle)
+            throw std::runtime_error("NeoHook: Failed to scan the module for hooks");
+        std::vector<DetoursDetectedHook> hooks(detours_detected_hooks_len(handle));
+        for (size_t i = 0; i < hooks.size(); ++i)
+            detours_detected_hooks_get(handle, i, &hooks[i]);
+        detours_detected_hooks_free(handle);
+        return hooks;
     }
 
     // ----------------- Control Flow Guard (CFG) awareness -----------------

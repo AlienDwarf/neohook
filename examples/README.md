@@ -131,6 +131,7 @@ hook does not behave as documented.
 | [`cpp/midhook.cpp`](cpp/midhook.cpp) | Mid-function detour rewriting a register through `HookContext` (x64) . |
 | [`cpp/breakpoint_hooks.cpp`](cpp/breakpoint_hooks.cpp) | `VehHook` and `Int3Hook`, both with a gateway to the original. |
 | [`cpp/watchdog.cpp`](cpp/watchdog.cpp) | The watchdog through the `neohook::Watchdog` guard. |
+| [`cpp/hook_detection.cpp`](cpp/hook_detection.cpp) | Detecting an inline hook and where it leads, and scanning a module for hooks. |
 
 ### Building
 

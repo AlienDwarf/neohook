@@ -806,3 +806,94 @@ fn ffi_handle_enable_helpers_guard_oob_and_null() {
         detours_handle_unhook_and_free(handle);
     }
 }
+
+// --- hook detection --------------------------------------------------------------
+
+#[inline(never)]
+extern "system" fn detect_target(a: u32) -> u32 {
+    std::hint::black_box(a).wrapping_mul(13)
+}
+
+#[inline(never)]
+extern "system" fn detect_detour(a: u32) -> u32 {
+    std::hint::black_box(a).wrapping_add(1)
+}
+
+#[test]
+fn ffi_check_function_and_export() {
+    let mut out = std::mem::MaybeUninit::<DetoursDetectedHook>::uninit();
+    unsafe {
+        assert_eq!(detours_check_function(ptr::null(), out.as_mut_ptr()), -1);
+        assert_eq!(
+            detours_check_function(detect_target as *const u8, ptr::null_mut()),
+            -1
+        );
+        assert_eq!(
+            detours_check_function(detect_target as *const u8, out.as_mut_ptr()),
+            0,
+            "clean before the hook"
+        );
+        assert_eq!(
+            detours_check_export(
+                c"kernel32.dll".as_ptr(),
+                c"GetTickCount".as_ptr(),
+                out.as_mut_ptr()
+            ),
+            0
+        );
+        assert_eq!(
+            detours_check_export(
+                c"kernel32.dll".as_ptr(),
+                c"NoSuchExportAnywhere".as_ptr(),
+                out.as_mut_ptr()
+            ),
+            -1
+        );
+    }
+
+    let mut tx = neohook::DetourTransaction::begin();
+    tx.update_all_threads();
+    tx.attach(detect_target as *mut u8, detect_detour as *const u8)
+        .expect("attach");
+    let hooks = tx.commit().expect("commit");
+    let found = unsafe { detours_check_function(detect_target as *const u8, out.as_mut_ptr()) };
+    drop(hooks);
+
+    assert_eq!(found, 1);
+    let hook = unsafe { out.assume_init() };
+    assert_eq!(hook.kind, DETOURS_DETECTED_INLINE_JUMP);
+    assert_eq!(hook.destination, unsafe {
+        neohook::detour_code_from_pointer(detect_detour as *const u8)
+    } as *const u8);
+    let exe = std::env::current_exe().unwrap();
+    let module = unsafe { CStr::from_ptr(hook.destination_module.as_ptr()) };
+    assert_eq!(
+        module.to_str().unwrap(),
+        exe.file_name().unwrap().to_str().unwrap()
+    );
+}
+
+#[test]
+fn ffi_scan_module_hooks() {
+    unsafe {
+        assert!(detours_scan_module_hooks(ptr::null()).is_null());
+        assert!(detours_scan_module_hooks(c"no_such_module_here.dll".as_ptr()).is_null());
+        assert_eq!(detours_detected_hooks_len(ptr::null_mut()), 0);
+        detours_detected_hooks_free(ptr::null_mut());
+    }
+
+    let exe = std::env::current_exe().unwrap();
+    let name = CString::new(exe.file_name().unwrap().to_str().unwrap()).unwrap();
+    let handle = unsafe { detours_scan_module_hooks(name.as_ptr()) };
+    assert!(!handle.is_null());
+    let mut out = std::mem::MaybeUninit::<DetoursDetectedHook>::uninit();
+    unsafe {
+        assert_eq!(
+            detours_detected_hooks_len(handle),
+            0,
+            "nothing hooks the test binary"
+        );
+        assert_eq!(detours_detected_hooks_get(handle, 0, out.as_mut_ptr()), 0);
+        detours_detected_hooks_free(handle);
+    }
+}
