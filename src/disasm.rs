@@ -405,6 +405,19 @@ mod tests {
     }
 
     #[test]
+    fn get_instruction_len_stops_at_a_ret_after_a_conditional_tail_call() {
+        // test ecx, ecx; jne +0x1000 (another function); xor eax, eax; ret;
+        // then the next function: mov eax, 42; ret.
+        let mut code = [0xCCu8; 48];
+        code[..17].copy_from_slice(&[
+            0x85, 0xC9, 0x0F, 0x85, 0x00, 0x10, 0x00, 0x00, 0x31, 0xC0, 0xC3, 0xB8, 0x2A, 0x00,
+            0x00, 0x00, 0xC3,
+        ]);
+        // A 14-byte patch would run into the next function.
+        assert!(unsafe { Disassembler::get_instruction_len(code.as_ptr(), 14) }.is_err());
+    }
+
+    #[test]
     fn get_instruction_len_on_nops() {
         let code = [0x90u8; 32]; // NOPs
         let len = unsafe { Disassembler::get_instruction_len(code.as_ptr(), 5) }
