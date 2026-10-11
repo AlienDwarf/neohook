@@ -16,6 +16,7 @@ pub mod api;
 pub mod cfg;
 mod code;
 mod delay;
+mod detect;
 mod disasm;
 mod eat;
 mod gateway;
@@ -49,6 +50,9 @@ mod suspend_window;
 pub use crate::api::DetourTransaction;
 pub use crate::code::detour_code_from_pointer;
 pub use crate::delay::{DelayHook, DelayHookError};
+pub use crate::detect::{
+    DetectError, DetectedHook, DetectedHookKind, check_export, check_function, scan_module_hooks,
+};
 pub use crate::eat::EatHookError;
 pub use crate::iat::IatHookError;
 pub use crate::int3::{Int3Hook, Int3HookError, MAX_HOOKS as INT3_MAX_HOOKS};
