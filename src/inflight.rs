@@ -26,6 +26,11 @@
 //! the unhook cleared its live registers, and then needs the handler. Such a
 //! saved context, with a trap address in an enabled `DR0`-`DR3`, counts as in
 //! flight too.
+//!
+//! A thread can also be stopped in the trap before any record is on the stack
+//! that is scanned: inside the kernel while a debugger sees the first chance,
+//! or in the 64-bit half of a WOW64 dispatch. Its instruction pointer is then
+//! still at the trap (or just past an `int3`), so that counts as well.
 
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, HANDLE};
 use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, GetThreadContext};
@@ -140,9 +145,13 @@ unsafe fn dispatching(
             return true;
         }
         #[cfg(target_arch = "x86_64")]
-        let sp = ctx.0.Rsp as usize;
+        let (ip, sp) = (ctx.0.Rip as usize, ctx.0.Rsp as usize);
         #[cfg(target_arch = "x86")]
-        let sp = ctx.0.Esp as usize;
+        let (ip, sp) = (ctx.0.Eip as usize, ctx.0.Esp as usize);
+
+        if is_trap_address(ip) || is_trap_address(ip.wrapping_sub(1)) {
+            return true;
+        }
 
         let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
         let size = std::mem::size_of::<MEMORY_BASIC_INFORMATION>();
@@ -236,12 +245,15 @@ mod tests {
     const PARK_CODE: i32 = 0xE04E_4801_u32 as i32;
     static PARKED: AtomicBool = AtomicBool::new(false);
     static RELEASE: AtomicBool = AtomicBool::new(false);
+    static RAISED_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     /// Parks the raising thread inside the dispatch until released.
     unsafe extern "system" fn parking_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         if unsafe { (*(*info).ExceptionRecord).ExceptionCode } != PARK_CODE {
             return 0;
         }
+        let raised_at = unsafe { (*(*info).ExceptionRecord).ExceptionAddress } as usize;
+        RAISED_AT.store(raised_at, Ordering::Release);
         PARKED.store(true, Ordering::Release);
         while !RELEASE.load(Ordering::Acquire) {
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -261,19 +273,53 @@ mod tests {
             std::thread::yield_now();
         }
 
-        let parked = exceptions_in_flight(PARK_CODE, |_| true, false);
-        let other_code = exceptions_in_flight(PARK_CODE ^ 1, |_| true, false);
+        let raised_at = RAISED_AT.load(Ordering::Acquire);
+        let is_raise = |a: usize| a == raised_at;
+        let parked = exceptions_in_flight(PARK_CODE, is_raise, false);
+        let other_code = exceptions_in_flight(PARK_CODE ^ 1, is_raise, false);
         let other_address = exceptions_in_flight(PARK_CODE, |_| false, false);
 
         RELEASE.store(true, Ordering::Release);
         raiser.join().unwrap();
-        let after = exceptions_in_flight(PARK_CODE, |_| true, false);
+        let after = exceptions_in_flight(PARK_CODE, is_raise, false);
         unsafe { RemoveVectoredExceptionHandler(handler) };
 
         assert!(parked, "a thread inside the dispatch is in flight");
         assert!(!other_code, "only records with the given code match");
         assert!(!other_address, "only records at a trap address match");
         assert!(!after, "a resumed thread is no longer in flight");
+    }
+
+    static SPINNING: AtomicBool = AtomicBool::new(false);
+    static STOP_SPIN: AtomicBool = AtomicBool::new(false);
+
+    #[inline(never)]
+    fn spin() {
+        SPINNING.store(true, Ordering::Release);
+        while !STOP_SPIN.load(Ordering::Relaxed) {
+            std::hint::spin_loop();
+        }
+    }
+
+    #[test]
+    fn sees_a_thread_stopped_at_a_trap_address() {
+        let spinner = std::thread::spawn(spin);
+        while !SPINNING.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        let start = spin as *const () as usize;
+        let in_spin = |a: usize| (start..start + 0x100).contains(&a);
+
+        let at_trap = exceptions_in_flight(PARK_CODE ^ 2, in_spin, false);
+        let elsewhere = exceptions_in_flight(PARK_CODE ^ 2, |_| false, false);
+
+        STOP_SPIN.store(true, Ordering::Relaxed);
+        spinner.join().unwrap();
+        assert!(
+            at_trap,
+            "a thread whose IP is at a trap address is in flight"
+        );
+        assert!(!elsewhere);
     }
 
     static ARMED_PARKED: AtomicBool = AtomicBool::new(false);
