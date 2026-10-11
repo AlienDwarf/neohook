@@ -259,8 +259,8 @@ fn mark(addr: usize, regions: &[Region], busy: &mut [bool]) {
     }
 }
 
-/// Reads a suspended thread's instruction pointer and whole stack, marking the
-/// regions either references. Returns `false` if the thread could not be
+/// Reads a suspended thread's instruction pointer, general registers and whole
+/// stack, marking the regions any of them references. Returns `false` if the thread could not be
 /// inspected in full, in which case it must not be treated as idle.
 unsafe fn inspect_thread(h_thread: HANDLE, regions: &[Region], busy: &mut [bool]) -> bool {
     unsafe {
@@ -279,6 +279,20 @@ unsafe fn inspect_thread(h_thread: HANDLE, regions: &[Region], busy: &mut [bool]
         let (ip, sp) = (ctx.0.Eip as usize, ctx.0.Esp as usize);
 
         mark(ip, regions, busy);
+        // A detour can hold a trampoline pointer in a register it is about to
+        // call through, with no copy on the stack.
+        #[cfg(target_arch = "x86_64")]
+        let registers = [
+            ctx.0.Rax, ctx.0.Rbx, ctx.0.Rcx, ctx.0.Rdx, ctx.0.Rsi, ctx.0.Rdi, ctx.0.Rbp, ctx.0.R8,
+            ctx.0.R9, ctx.0.R10, ctx.0.R11, ctx.0.R12, ctx.0.R13, ctx.0.R14, ctx.0.R15,
+        ];
+        #[cfg(target_arch = "x86")]
+        let registers = [
+            ctx.0.Eax, ctx.0.Ebx, ctx.0.Ecx, ctx.0.Edx, ctx.0.Esi, ctx.0.Edi, ctx.0.Ebp,
+        ];
+        for register in registers {
+            mark(register as usize, regions, busy);
+        }
         scan_stack(sp, regions, busy)
     }
 }
