@@ -4,8 +4,8 @@
  * The C counterpart of `examples/introspect.rs` and `examples/pattern_scan.rs`.
  * Everything here is read-only - no hooks are installed. It walks the loaded
  * modules, the export and import tables of kernel32, resolves a function by name
- * and by ordinal, and finally locates that same function again purely by byte
- * signature.
+ * and by ordinal, locates that same function again purely by byte signature, and
+ * finally infers a function's arguments from its machine code.
  *
  * Every handle returned by an enumerate/scan API is owned by the caller and must
  * be released with the matching *_free function; the strings and addresses it
@@ -31,6 +31,47 @@ static int g_failures = 0;
             g_failures++;                  \
         }                                  \
     } while (0)
+
+static const char *kind_name(uint8_t kind)
+{
+    switch (kind) {
+    case DETOURS_VALUE_KIND_INT8: return "int8";
+    case DETOURS_VALUE_KIND_INT16: return "int16";
+    case DETOURS_VALUE_KIND_INT32: return "int32";
+    case DETOURS_VALUE_KIND_INT64: return "int64";
+    case DETOURS_VALUE_KIND_POINTER: return "pointer";
+    case DETOURS_VALUE_KIND_FLOAT: return "float";
+    case DETOURS_VALUE_KIND_DOUBLE: return "double";
+    default: return "unknown";
+    }
+}
+
+static void infer_muldiv(void)
+{
+    DetoursSignature sig;
+    uint32_t i;
+
+    printf("\n== inferring int MulDiv(int, int, int) ==\n");
+    if (!detours_infer_signature_by_name("kernel32.dll", "MulDiv", &sig)) {
+        printf("  <inference failed>\n");
+        g_failures++;
+        return;
+    }
+    for (i = 0; i < sig.arg_count; ++i) {
+        const DetoursArgGuess *arg = &sig.args[i];
+        if (arg->on_stack) {
+            printf("  arg %u: %-7s [sp+0x%x] confidence %.2f\n", i, kind_name(arg->kind),
+                   arg->stack_offset, arg->confidence);
+        } else {
+            printf("  arg %u: %-7s %-6s confidence %.2f\n", i, kind_name(arg->kind),
+                   arg->register_name, arg->confidence);
+        }
+    }
+    printf("  returns %s\n", sig.has_return ? kind_name(sig.returns) : "void");
+
+    CHECK(sig.arg_count == 3, "MulDiv should take three arguments");
+    CHECK(sig.has_return && sig.returns == DETOURS_VALUE_KIND_INT32, "MulDiv returns an int");
+}
 
 static void list_modules(void)
 {
@@ -182,6 +223,8 @@ int main(void)
         printf("  scan_module_by_name-> %p\n", (const void *)found);
         CHECK(found == by_name, "scan_module_by_name disagreed with scan_module");
     }
+
+    infer_muldiv();
 
     if (g_failures) {
         printf("\nFAILED (%d check(s))\n", g_failures);

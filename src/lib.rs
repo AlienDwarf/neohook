@@ -32,6 +32,7 @@ mod reentrancy;
 pub mod registry;
 mod resolve;
 mod scan;
+mod signature;
 mod symbols;
 mod threads;
 pub mod trace;
@@ -68,6 +69,10 @@ pub use crate::resolve::{resolve_call_target, resolve_relative, resolve_rip_rela
 pub use crate::scan::{
     Pattern, PatternError, scan, scan_all, scan_module, scan_module_all, scan_module_by_name,
     scan_range, scan_range_all,
+};
+pub use crate::signature::{
+    ArgGuess, ArgLocation, CallingConvention, SignatureError, SignatureGuess, ValueKind,
+    infer_signature, infer_signature_by_name,
 };
 pub use crate::symbols::resolve_symbol;
 pub use crate::transaction::{

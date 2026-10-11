@@ -3,6 +3,7 @@
 #include "neohook.h"
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -161,6 +162,35 @@ namespace neohook
     inline void *resolve_symbol(const std::string &module, const std::string &symbol)
     {
         return const_cast<uint8_t *>(detours_resolve_symbol(module.c_str(), symbol.c_str()));
+    }
+
+    // ----------------- Signature inference -----------------
+
+    /**
+     * @brief Infers the argument count and types, return type and calling
+     *        convention of a function from its machine code.
+     *
+     * A best-effort estimate: see DetoursSignature for what is reported.
+     * Returns std::nullopt if @p func is null or its code is not readable.
+     */
+    inline std::optional<DetoursSignature> infer_signature(const void *func)
+    {
+        DetoursSignature sig{};
+        if (!detours_infer_signature(static_cast<const uint8_t *>(func), &sig))
+            return std::nullopt;
+        return sig;
+    }
+
+    /**
+     * @brief Like infer_signature(const void *), for the export @p func of
+     *        @p module (loaded if needed).
+     */
+    inline std::optional<DetoursSignature> infer_signature(const std::string &module, const std::string &func)
+    {
+        DetoursSignature sig{};
+        if (!detours_infer_signature_by_name(module.c_str(), func.c_str(), &sig))
+            return std::nullopt;
+        return sig;
     }
 
     // ----------------- Pattern / signature scanning -----------------
