@@ -324,41 +324,12 @@ impl InlineHook {
             return Err(DetourError::InvalidParameter);
         }
 
-        unsafe {
-            let mut old = 0u32;
-            // Get current protection and add execute permissions
-            let protect_ok = crate::mem::virtual_protect_same_execute(
-                self.target,
-                self.stolen_len,
-                windows_sys::Win32::System::Memory::PAGE_READWRITE,
-                &mut old,
-            );
-            if protect_ok == 0 {
-                return Err(DetourError::RelocationFailed);
-            }
-
-            // copy the original bytes back to the target function
-            std::ptr::copy_nonoverlapping(self.orig_bytes.as_ptr(), self.target, self.stolen_len);
-
-            // CPU-Cache flush so CPU has to read from RAM not from L1 L2 L3 cache
-            let flush_ok = windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache(
-                windows_sys::Win32::System::Threading::GetCurrentProcess(),
-                self.target as _,
-                self.stolen_len,
-            );
-
-            // Restore original protection
-            let restore_ok = windows_sys::Win32::System::Memory::VirtualProtect(
-                self.target as _,
-                self.stolen_len,
-                old,
-                &mut old,
-            );
-
-            // Wait til end even if an error occurs so we try to restore original protection always
-            if flush_ok == 0 || restore_ok == 0 {
-                return Err(DetourError::RelocationFailed);
-            }
+        // Per-page protection save/restore, cache flush, no allocation.
+        let written = unsafe {
+            crate::mem::write_code_bytes(self.target, self.orig_bytes.as_ptr(), self.stolen_len)
+        };
+        if !written {
+            return Err(DetourError::RelocationFailed);
         }
         Ok(())
     }
