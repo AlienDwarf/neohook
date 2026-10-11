@@ -479,4 +479,48 @@ mod tests {
             "an idle retired region should be released by reclaim"
         );
     }
+
+    /// Threads that have exited but whose handles are still open (an unjoined
+    /// `JoinHandle`) reference nothing and must not keep an idle region
+    /// quarantined, however many of them there are.
+    #[test]
+    fn exited_unjoined_threads_do_not_block_reclaim() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_FREE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc,
+        };
+
+        let exited = 2 * WALK_ROUNDS;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handles: Vec<_> = (0..exited)
+            .map(|_| {
+                let done = done_tx.clone();
+                std::thread::spawn(move || done.send(()).unwrap())
+            })
+            .collect();
+        for _ in 0..exited {
+            done_rx.recv().unwrap();
+        }
+        // Let the threads terminate; their handles stay open.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let region = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                0x1000,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            )
+        };
+        assert!(!region.is_null(), "allocation failed");
+        retire(region as *mut u8, 0x1000);
+        reclaim();
+
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let q = unsafe { VirtualQuery(region, &mut mbi, std::mem::size_of_val(&mbi)) };
+        let freed = q != 0 && mbi.State == MEM_FREE;
+        // Drain the quarantine for later tests either way.
+        drop(handles);
+        reclaim();
+        assert!(freed, "exited threads kept an idle region quarantined");
+    }
 }
