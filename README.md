@@ -19,53 +19,18 @@ NeoHook makes runtime function hooking simple and reliable: Win32 APIs, game eng
 
 ## What's New in 0.16.0
 
-**New**
+- **Signature inference** - estimate a function's arguments, return type and calling convention from its machine code ([`infer_signature`](#more-features)).
+- **Hook detection** - find inline, INT3, VEH, IAT and EAT hooks and where they lead ([`check_function`, `scan_module_hooks`](#more-features)).
+- **x64 unwind data** for trampolines, gateways and mid-hook stubs, so exceptions and stack walks pass through them.
+- Many fixes: handlers are removed with the last hook (DLLs using NeoHook unload cleanly), no deadlock between `unhook_all` in `DllMain` and an open transaction, whole-stack return-address redirection, hardened PE parsing.
 
-- **Signature inference** - `infer_signature` / `infer_signature_by_name` estimate a
-  function's argument count and types, return type and calling convention from its
-  machine code. See [Signature Inference](#signature-inference---infer_signature).
-- **Hook detection** - `check_function`, `check_export` and `scan_module_hooks`
-  find inline, INT3, VEH, IAT and EAT hooks and report where they lead. See
-  [Hook Detection](#hook-detection).
-- **x64 unwind data** for trampolines, VEH/INT3 gateways and mid-hook stubs, so
-  exceptions and stack walks pass through them. See
-  [Unwinding Through Stubs](#unwinding-through-stubs-x64).
-- All three are in the C ABI and the C++ wrapper as well.
-
-**Fixed**
-
-- The INT3 and VEH exception handlers and the loader notification of delay hooks
-  are removed again with the last hook, so a DLL using NeoHook can be unloaded
-  without leaving a dangling handler behind.
-- Unhooking, dropping, enabling and disabling a hook no longer wait for another
-  thread's open transaction, which could deadlock `unhook_all` in
-  `DLL_PROCESS_DETACH`.
-- Passes that suspend every thread (commit, reclaim, watchdog, VEH arming) can no
-  longer suspend each other.
-- Return addresses into stolen bytes are redirected across the whole stack, not
-  only its top 4 KiB.
-- A retired stub is no longer freed while a thread still holds it in a register;
-  exited threads no longer keep stubs from being freed.
-- IAT commits no longer allocate while other threads are suspended.
-- Chaining onto a gateway whose owner is dropped, overlapping inline hooks and
-  more than one hook on a managed gateway are rejected instead of corrupting code.
-- Malformed PE headers, export tables and import directories no longer crash
-  the PE parsers; `enumerate_exports` no longer overflows on a hooked export on
-  x86.
-
-**Changed behaviour**
-
-- C ABI: detaching a hook from a handle leaves its slot empty; the other indices
-  stay the same and `detours_handle_len` does not shrink.
-- The INT3 slot limit is `INT3_MAX_HOOKS` in the C header (was `MAX_HOOKS`).
-- A commit fails instead of skipping return addresses when a stack is larger
-  than 32 MiB.
+The full list is in the [`v0.16.0` tag](https://github.com/aliendwarf/neohook/releases/tag/v0.16.0).
 
 ---
 
 ## Why NeoHook?
 
-Function hooking is deceptively difficult to get right. Writing a `JMP` patch is only a few lines of assembly - but doing it safely in a live, multi-threaded process requires solving multiple problems at once:
+Writing a `JMP` patch is a few lines of assembly - doing it safely in a live, multi-threaded process is not:
 
 | Problem                                            |          Naive approach          |                 NeoHook                  |
 | :------------------------------------------------- | :------------------------------: | :--------------------------------------: |
@@ -80,132 +45,37 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 
 ## Features
 
-- **Atomic Transactions** - Queue multiple hooks and commit them in one step. If any hook fails, every previously applied change in the same transaction is rolled back automatically, leaving the process in a known-good state.
+**Hooking methods**
 
-- **Full Thread Safety** - Enumerates and suspends every thread in the process before applying patches.
+- **Inline hooks** with instruction relocation ([`iced-x86`](https://github.com/icedland/iced)) and a trampoline to call the original.
+- **IAT / EAT hooks** - rewrite an import slot (one module's calls) or an export entry (every later `GetProcAddress`).
+- **VTable hooks** - shared slot or per-instance cloned table.
+- **VEH hooks** - hardware breakpoints, no byte modified (four at a time).
+- **INT3 hooks** - one `0xCC` byte, up to 256 targets, covers threads created later.
+- **Mid-function hooks** - at any instruction, with all registers, flags, XMM and `MXCSR` readable and writable.
+- **Closure detours**, **delay hooks** for modules not loaded yet, **hook chaining**, **enable / disable**.
 
-- **RIP / EIP Redirection** - If a thread's instruction pointer falls within the bytes being overwritten, it is relocated.
+**Safety**
 
-- **Stack Scanning** - Scans each thread's whole committed stack for return addresses pointing into the patch area and rewrites them to the trampoline equivalent.
+- Atomic transactions with rollback; one transaction at a time process-wide.
+- Threads suspended while patching; instruction pointers and return addresses (whole stack) redirected.
+- Trampolines within ±2 GB on x64 (5-byte jump), 14-byte absolute jump otherwise.
+- RAII unhook on `Drop`; retired stubs freed only once no thread references them.
+- Control Flow Guard aware; x64 unwind data for every stub.
 
-- **Instruction Relocation** - Uses [`iced-x86`](https://github.com/icedland/iced) to accurately decode, relocate, and re-encode.
+**Finding targets**
 
-- **Smart Trampoline Allocation** - On x64, allocates trampoline memory within ±2 GB of the target so that a compact 5-byte relative jump suffices. Falls back to a 14-byte absolute jump `(FF 25)`.
+- Export name (`attach_export`), byte signature (`attach_pattern`), PDB symbol (`resolve_symbol`), module / export / import enumeration.
+- Relative-reference resolving after a scan, signature inference, hook detection.
 
-- **IAT Hooking** - Rewrites Import Address Table entries to redirect calls to entire DLL exports without touching function preambles.
+**Tooling**
 
-- **EAT Hooking** - Rewrites a module's Export Address Table so every consumer that resolves the export afterwards (e.g. via `GetProcAddress`) is redirected, without patching the function body. On x64 an out-of-range detour is reached through an automatically managed jump stub.
-
-- **VEH Hooking** - Redirects a function using a CPU hardware breakpoint and a vectored exception handler, **without modifying a single byte** of the target. Ideal for read-only or shared code that must not be patched. Up to four targets at a time (this is a hardware limitation not caused by NeoHook).
-
-- **INT3 Software-Breakpoint Hooking** - Redirects a function by patching a single `0xCC` byte and routing the resulting breakpoint through a vectored exception handler. Unlike VEH hooks there is **no four-hook limit** (up to 256 targets), and threads created *after* the install still trap. The single-byte write is atomic, so no thread suspension is needed.
-
-- **Call-the-Original Gateway (VEH / INT3)** - Breakpoint-style hooks normally *replace* the target with no way back to it. `install_with_original` builds a small gateway holding the relocated prologue plus a jump into the body, so the detour can forward to the original (use its return value, conditionally fall through) without re-triggering the breakpoint or recursing.
-
-- **Symbol-Based Resolution** - Resolve a target by name through the Debug Help library (`dbghelp`): `resolve_symbol("ntdll.dll", "LdrpInitializeProcess")`. With a PDB available (next to the binary or via a symbol server / `_NT_SYMBOL_PATH`) this reaches **non-exported** internal routines that export-table and signature lookups cannot; without a PDB it still resolves export names.
-
-- **Anti-Tamper / Re-Hook Watchdog** - A background `Watchdog` snapshots a hook's patched bytes and, on tamper, either **re-applies** them (`WatchMode::Restore`) or just **reports** the event (`WatchMode::DetectOnly`) via an `on_tamper` callback - keeping a hook in place across, or surfacing, periodic self-integrity checks that restore the original prologue. Works at the byte level, so it guards inline jumps, the INT3 `0xCC`, or any patch.
-
-- **Hook Detection** - Find out whether a function is already hooked, and where the hook leads: `check_function(ptr)`, `check_export("user32.dll", "MessageBoxW")`, or `scan_module_hooks("ntdll.dll")` for a whole module. Inline hooks are found by comparing the code in memory with the module's file on disk (relocations applied), VEH hooks in the threads' debug registers, IAT and EAT hooks in the import and export tables. Each finding names the destination's module - or reports private memory, where trampolines and injected code live.
-
-- **Control Flow Guard (CFG) Awareness** - On a process that enforces CFG, neohook registers the entry points it generates (inline trampolines, VEH/INT3 gateways, EAT jump stubs) and the IAT/EAT/VTable detours as valid indirect-call targets via `SetProcessValidCallTargets` - the same mechanism Microsoft Detours uses. Auto-detected and a no-op when CFG is off, so it is safe to leave on; it keeps hooks holding up under **strict CFG** and **export suppression**, where the default permit for private executable memory no longer applies. `cfg::register_valid_target` is public for your own runtime-generated code.
-
-- **Tracing Detours** - Two generators, no hand-written boilerplate: `detour_trace!` takes a signature and `Debug`-formats every call's arguments **and return value**; `trace_raw!` needs **no signature** and dumps the integer argument registers at entry via the `MidHook`/`HookContext` bridge. Both emit to a process-wide sink (stderr by default, or your own logger).
-
-- **Pattern / Signature Scanning** - Resolve unexported, statically-linked, or stripped functions by a byte signature (IDA / x64dbg `48 8B ?? E8` syntax, or code+mask). Scans only committed, executable regions of a module - safely skipping guard pages and holes - and feeds the match straight into a hook via `attach_pattern`.
-
-- **Hook-by-Export-Name** - `attach_export("user32.dll", "MessageBoxW", detour)` resolves a named export (loading the module if needed) and queues an inline hook on the function body in a single call - no manual `GetModuleHandle` / `GetProcAddress` dance.
-
-- **Relative-Reference Resolving** - After a signature scan lands on a `call rel32` or a `lea/mov [rip + disp32]`, `resolve_call_target` / `resolve_rip_relative` decode the instruction and return the absolute address it points to (or `resolve_relative` from a known encoding). Turns "the signature near the function" into "the function".
-
-- **Signature Inference** - `infer_signature(ptr)` / `infer_signature_by_name("kernel32.dll", "MulDiv")` estimate a function's **argument count and types, return type and calling convention** from its machine code alone - for undocumented or internal functions that have no prototype to copy into a detour. It follows every path, register copies and stack spills, and calls a few levels deep to catch arguments a wrapper only forwards. Each argument carries a confidence; the result is an estimate, not a decompiler.
-
-- **Closure Detours** - `detour_closure!` installs an inline hook whose body is a **Rust closure that captures environment** (counters, channels, config) - something a bare-`fn`-pointer C/C++ library cannot express. The closure receives the original function as its first argument so it can forward to it.
-
-- **Delay / On-Load Hooks** - Register a hook for a function in a module that is **not loaded yet**; NeoHook inline-hooks `ntdll!LdrLoadDll` once and installs the real hook the moment the module appears (`DelayHook::register`).
-
-- **Named Hook Registry** - Park hooks in a process-wide store and refer to them by name: `registry::register`, `enable` / `disable`, `unhook`, and `unhook_all` for a single teardown point (e.g. `DLL_PROCESS_DETACH`).
-
-- **Mid-Function / Arbitrary-Address Detours** - Hook *any* instruction boundary, not just a function entry. NeoHook snapshots all general-purpose registers, flags, the XMM registers and `MXCSR` into a `HookContext`, calls your handler with a pointer to it, restores the (possibly modified) state, then resumes the original instructions. Rewrite integer or floating-point/SIMD arguments, results, or loop state in flight at a spot found by a signature scan - all on the thread-safe inline engine (thread suspension, IP/stack redirection, relocation, atomic rollback).
-
-- **VTable Hooking** - Rewrites a selected VTable slot to detour virtual calls and restores the original slot on unhook.
-
-- **Per-Instance VTable Hooking** - Clones an object's VTable, patches the clone, and redirects only that instance.
-
-- **Hook Chaining** - Detour the trampoline of an already-installed hook to layer multiple interceptors in a defined order.
-
-- **Enable / Disable** - Toggle an installed hook on or off (`Hook::enable` / `Hook::disable`) without unhooking, keeping the trampoline and cloned tables in place.
-
-- **Reentrancy Guard** - The `reentrancy_guard!` macro lets a detour detect that it is already running on the current thread and forward to the original instead of recursing.
-
-- **Serialized Transactions** - A process-wide lock applies one transaction at a time, so concurrent installs on different threads cannot suspend each other or patch overlapping code.
-
-- **Failure Diagnostics** - A failed `commit()` reports which queued hook failed (`DetourError::CommitFailed { index, kind, source }`) after rolling back.
-
-- **RAII Ownership** - The `Vec<Hook>` returned by `commit()` unhooks and restores original memory automatically when dropped.
-
-- **Quiescence-Checked Teardown** - Freeing a trampoline the instant a hook drops would be unsound if another thread were still executing inside it. Instead a dropped stub is *retired* and released only once a thread scan (instruction pointers plus stack return addresses) shows no thread is inside it - otherwise it stays quarantined for a later pass. Reclamation runs automatically at the start of every transaction (a no-op when nothing is pending) and is also exposed as `neohook::reclaim()` for unhook-only workloads.
-
-- **Unwind-Aware Stubs (x64)** - Trampolines, VEH/INT3 gateways and mid-hook stubs carry x64 unwind data (`RtlAddFunctionTable`), so exceptions, debugger call stacks and profilers walk through them to the caller instead of stopping - or terminating the process - at code with no `RUNTIME_FUNCTION`.
-
-- **Zero-Boilerplate Macros** - `detour_inline!` and `detour_helper!` install a complete hook with a single expression.
-
-- **C FFI** - Exposes a C ABI with auto-generated headers (`cbindgen`), usable from C, C++, Python (`ctypes`), or any FFI-capable language.
+- One-line macros (`detour_inline!`, `detour_helper!`), tracing detours (`detour_trace!`, `trace_raw!`), named hook registry, reentrancy guard, anti-tamper watchdog.
+- C ABI (`cbindgen` header) and an RAII C++ wrapper.
 
 ---
 
-## Roadmap
-
-| Version |     Status | Features                                               |
-| ------- | ---------: | ------------------------------------------------------ |
-| v0.1.0  |    ✅ Done | Initial release                                        |
-| v0.1.0  |    ✅ Done | Inline hooking                                         |
-| v0.1.0  |    ✅ Done | IAT hooking                                            |
-| v0.1.0  |    ✅ Done | Transaction API (`begin`, `attach`, `commit`, `abort`) |
-| v0.1.0  |    ✅ Done | Thread updates (`update_thread`, `update_all_threads`) |
-| v0.1.0  |    ✅ Done | Trampoline allocation + relocation                     |
-| v0.1.0  |    ✅ Done | Managed gateways / hook chaining                       |
-| v0.1.0  |    ✅ Done | Rollback on failed commit                              |
-| v0.1.0  |    ✅ Done | RAII unhook on drop                                    |
-| v0.1.0  |    ✅ Done | C FFI transaction entry points                         |
-| v0.2.0  |    ✅ Done | VTable hooking                                         |
-| v0.2.0  |    ✅ Done | Per-instance VTable hooks                              |
-| v0.2.0  |    ✅ Done | Shared VTable patching                                 |
-| v0.2.0  |    ✅ Done | VTable hook support in C FFI                           |
-| v0.2.0  |    ✅ Done | Additional tests and examples for C++ / COM targets    |
-| v0.3.0  |    ✅ Done | Enable / disable hooks without full unhook             |
-| v0.3.0  |    ✅ Done | Recursion / reentrancy guards                          |
-| v0.3.0  |    ✅ Done | Improved diagnostics / debug output                    |
-| v0.3.0  |    ✅ Done | Module / PE introspection (modules, exports, imports)  |
-| v0.4.0  |    ✅ Done | Export / EAT hooking                                   |
-| v0.5.0  |    ✅ Done | VEH hooking                                            |
-| v0.6.0  |    ✅ Done | Pattern / signature scanning                           |
-| v0.6.0  |    ✅ Done | Signature-based hook resolution (`attach_pattern`)     |
-| v0.7.0  |    ✅ Done | Mid-function / arbitrary-address detours (`MidHook`)   |
-| v0.7.0  |    ✅ Done | Register-context capture / modification (`HookContext`)|
-| v0.8.0  |    ✅ Done | INT3 software-breakpoint hooking (`Int3Hook`)          |
-| v0.8.0  |    ✅ Done | Hook-by-export-name (`attach_export`)                   |
-| v0.8.0  |    ✅ Done | Relative-reference resolving (`resolve_call_target`)   |
-| v0.8.0  |    ✅ Done | Closure detours (`detour_closure!`)                    |
-| v0.8.0  |    ✅ Done | Delay / on-load hooks (`DelayHook`)                    |
-| v0.8.0  |    ✅ Done | Named hook registry (`registry`)                       |
-| v0.9.0  |    ✅ Done | XMM / MXCSR context capture in `MidHook`               |
-| v0.9.0  |    ✅ Done | Control-flow redirect from a `MidHook` handler         |
-| v0.10.0 |    ✅ Done | Call-the-original gateway for VEH / INT3 hooks          |
-| v0.10.0 |    ✅ Done | Symbol-based resolution via `dbghelp` (`resolve_symbol`)|
-| v0.10.0 |    ✅ Done | Anti-tamper / re-hook watchdog (`Watchdog`)            |
-| v0.10.0 |    ✅ Done | Tracing / logging detour generator (`detour_trace!`)   |
-| v0.10.0 |    ✅ Done | Control Flow Guard (CFG) awareness (`cfg`)             |
-| v0.16.0 |    ✅ Done | Signature inference (`infer_signature`)                |
-| v0.16.0 |    ✅ Done | Hook detection (`check_function`, `scan_module_hooks`) |
-| v0.16.0 |    ✅ Done | x64 unwind data for trampolines, gateways and stubs    |
-| v0.x   |    Planned | ARM64 inline hooking                                   |
-
---
-
 ## Installation
-
-Add the crate to your `Cargo.toml`:
 
 ```toml
 [dependencies]
@@ -216,102 +86,75 @@ neohook = "0.16.0"
 
 ## Quick Start
 
-### One-liner hook - `detour_inline!`
-
-Use this when you want to completely replace a function and do not need to call the original.
+Replace a function completely:
 
 ```rust
 use neohook::detour_inline;
 
 #[inline(never)]
-fn target(x: i32) -> i32 { std::hint::black_box(x) * 2 } // returns x * 2
+fn target(x: i32) -> i32 { std::hint::black_box(x) * 2 }
 fn detour(x: i32) -> i32 { x + 100 }
 
 fn main() {
-    let _hook = detour_inline!(target, detour).expect("hook failed"); // One line: suspend threads, patch, resume.
+    let _hook = detour_inline!(target, detour).expect("hook failed");
     assert_eq!(target(5), 105); // intercepted
-    // _hook drops here => original bytes restored automatically
+    // _hook drops here => original bytes restored
 }
 ```
 
 ---
 
-## Usage Examples
+## Usage
 
 ### Call the original - `detour_helper!`
-
-`detour_helper!` stores the trampoline pointer in a `OnceLock` so you can forward calls to the original function from within your detour.
 
 ```rust
 use std::sync::OnceLock;
 use neohook::detour_helper;
 
 type AddFn = fn(i32, i32) -> i32;
-
-// Storage for the original function pointer (generated by the macro)
 static ORG_ADD: OnceLock<AddFn> = OnceLock::new();
 
 #[inline(never)]
 fn add(a: i32, b: i32) -> i32 { a + b }
 
 fn detour_add(a: i32, b: i32) -> i32 {
-    // Call the original, then multiply the result
-    let original = ORG_ADD.get().expect("original not set");
-    original(a, b) * 10
+    ORG_ADD.get().expect("original not set")(a, b) * 10
 }
 
 fn main() {
-    // Args: (static name, target, detour, function type)
-    let _hook = detour_helper!(ORG_ADD, add, detour_add, AddFn)
-        .expect("hook failed");
-
-    assert_eq!(add(2, 3), 50); // (2 + 3) * 10
+    // (static for the original, target, detour, function type)
+    let _hook = detour_helper!(ORG_ADD, add, detour_add, AddFn).expect("hook failed");
+    assert_eq!(add(2, 3), 50);
 }
 ```
 
----
+### Transactions
 
-### Full Control - Transaction API
-
-Use the `DetourTransaction` API directly when you need to install several hooks atomically or when you require fine-grained control.
+Install several hooks atomically - if one fails, none stays applied:
 
 ```rust
 use neohook::DetourTransaction;
 
-fn main() {
-    let mut session = DetourTransaction::begin();
+let mut tx = DetourTransaction::begin();
+tx.update_all_threads(); // suspended while the commit patches
 
-    // Track all threads in the process; the commit suspends them while it patches
-    session.update_all_threads();
+let original_a = tx.attach(fn_a as *mut u8, detour_a as *const u8).unwrap(); // trampoline
+tx.attach(fn_b as *mut u8, detour_b as *const u8).unwrap();
 
-    // Queue hooks - none are applied yet
-    session.attach(fn_a as *mut u8, detour_a as *const u8).unwrap();
-    session.attach(fn_b as *mut u8, detour_b as *const u8).unwrap();
-
-    // Atomically apply all queued hooks.
-    // If fn_b fails, fn_a is automatically rolled back.
-    let hooks = session.commit().expect("transaction failed");
-}
+let hooks = tx.commit().expect("transaction failed"); // Vec<Hook>, unhooked on drop
 ```
 
-> **Thunk following & deduplication:** `attach` follows leading jump thunks to the
-> real function body (like MS Detours), so distinct entry points that forward to the
-> same implementation - for example a CRT function and its `_o_*` alias - resolve to
-> one address. Queueing the same resolved target twice in a transaction does **not**
-> patch it twice: an identical hook (same target *and* same detour) is deduplicated
-> and returns the same gateway, while the same target with a *different* detour is
-> rejected with `DetourError::InvalidParameter` - stack several detours on one
-> function by chaining onto the returned gateway instead. Because duplicates
-> collapse, the `Vec<Hook>` returned by `commit()` can be **shorter** than the number
-> of `attach` calls.
+`attach` follows leading jump thunks to the real function body. Queueing the same
+target twice with the same detour patches it once; with a different detour it is
+rejected - chain onto the returned trampoline instead.
 
----
+### IAT hooks
 
-### IAT Hooking
-
-Redirect calls to an imported function across an entire module by rewriting the Import Address Table entry instead of patching the function preamble. This is useful when you want to intercept only calls from a specific module.
+Redirect one module's calls to an import, without touching the function itself:
 
 ```rust
+use std::sync::OnceLock;
 use neohook::DetourTransaction;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 
@@ -320,146 +163,24 @@ static ORIG_SLEEP: OnceLock<SleepFn> = OnceLock::new();
 
 unsafe extern "system" fn hooked_sleep(ms: u32) {
     if let Some(orig) = ORIG_SLEEP.get() {
-        orig(ms / 2);
+        unsafe { orig(ms / 2) };
     }
 }
 
 fn main() {
-    unsafe {
-        let h_module = GetModuleHandleW(std::ptr::null()); // current module
-
-        let mut orig_ptr: *mut u8 = std::ptr::null_mut();
-        let mut session = DetourTransaction::begin();
-        session.update_all_threads();
-
-        session
-            .attach_iat(
-                h_module,
-                "KERNEL32.dll",
-                "Sleep",
-                hooked_sleep as *const u8,
-            )
-            .expect("IAT hook failed");
-
-        let hooks = session.commit().expect("transaction failed");
-        let original_ptr = hooks[0].original_ptr();
-        let original: SleepFn = std::mem::transmute(original_ptr);
-        let _ = ORIG_SLEEP.set(original);
-
-        // Sleep is now intercepted for this module
-        windows_sys::Win32::System::Threading::Sleep(1000); // returns immediately
-    }
-}
-```
-
----
-
-### EAT Hooking
-
-Redirect a function at its source by rewriting the exporting module's Export
-Address Table. Unlike an IAT hook - which only affects one caller module - an
-EAT hook redirects **every** consumer that resolves the export *after* the hook
-is installed (for example through `GetProcAddress`). Code that already cached
-the resolved address is unaffected, because only the lookup table changes, not
-the function body.
-
-```rust
-use neohook::DetourTransaction;
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleA;
-
-unsafe extern "system" fn get_tick_count_detour() -> u32 {
-    0xDEAD_BEEF
-}
-
-fn main() {
-    let module = unsafe { GetModuleHandleA(c"kernel32.dll".as_ptr() as *const u8) };
-
+    let exe = unsafe { GetModuleHandleW(std::ptr::null()) };
     let mut tx = DetourTransaction::begin();
-    tx.attach_eat(module, "GetTickCount", get_tick_count_detour as *const u8)
-        .expect("EAT hook failed");
+    tx.update_all_threads();
+    tx.attach_iat(exe, "KERNEL32.dll", "Sleep", hooked_sleep as *const u8)
+        .expect("IAT hook failed");
     let hooks = tx.commit().expect("transaction failed");
-
-    // Any GetProcAddress(module, "GetTickCount") now resolves to the detour,
-    // while `hooks[0].original_ptr()` still reaches the real function.
+    let _ = ORIG_SLEEP.set(unsafe { std::mem::transmute(hooks[0].original_ptr()) });
 }
 ```
 
-On x86_64 the export slot stores a 32-bit RVA. When the detour lies more than
-4 GB from the module base, NeoHook allocates a small jump stub within range and
-points the slot at it; the stub is released automatically when the hook is
-dropped or unhooked. See [`examples/eat_hook.rs`](examples/eat_hook.rs).
+### Mid-function hooks
 
-The C ABI exposes this as
-`detours_transaction_attach_eat(tx, h_module, target_func, detour)`.
-
----
-
-### Pattern / Signature Scanning
-
-Direct pointers and export names cover functions the loader knows about. For
-**unexported, statically-linked, or stripped** functions - the usual situation
-when hooking a game engine or a stripped third-party DLL - the reliable handle
-is a byte **signature**: a short run of opcode bytes with wildcards over the
-parts that move between builds (relative offsets, absolute addresses).
-
-`Pattern` parses both common dialects, and `scan_module` resolves a signature
-inside a loaded module, scanning only its committed, executable regions.
-
-```rust
-use neohook::{Pattern, scan_module, get_module_handle};
-
-// IDA / x64dbg syntax: `?` / `??` are wildcard bytes.
-let pat = Pattern::parse("48 8B 05 ?? ?? ?? ?? 48 89").unwrap();
-
-// code + mask is also supported:
-// let pat = Pattern::from_code_style(b"\x48\x8B\x05\x00\x00\x00\x00", "xxx????").unwrap();
-
-let h = get_module_handle("game.dll").unwrap();
-if let Some(addr) = unsafe { scan_module(h, &pat) } {
-    println!("resolved target at {addr:p}");
-}
-```
-
-The matched address can be fed straight into `DetourTransaction::attach`, or you
-can let `attach_pattern` resolve the signature and queue the inline hook in one
-step:
-
-```rust
-use neohook::DetourTransaction;
-
-let mut tx = DetourTransaction::begin();
-tx.update_all_threads();
-
-// Resolve "game.dll!?" by signature and hook it inline. Returns the trampoline.
-let _trampoline = tx
-    .attach_pattern("game.dll", "48 89 5C 24 ?? 57 48 83 EC 20", my_detour as *const u8)
-    .expect("signature not found");
-
-let _hooks = tx.commit().expect("transaction failed");
-```
-
-The C ABI exposes `detours_scan_module`, `detours_scan_module_by_name`,
-`detours_scan_range`, and `detours_transaction_attach_pattern`. The C++ wrapper
-provides `neohook::scan_module(...)`, `neohook::scan_range(...)`, and
-`Transaction::attach_pattern(...)`. See [`examples/pattern_scan.rs`](examples/pattern_scan.rs).
-
----
-
-### Mid-Function / Arbitrary-Address Detours
-
-Every other hook is anchored to a function entry or a table slot. A
-**mid-function detour** lets you intercept *any* instruction boundary - the
-exact spot inside a routine where a register holds the value you care about,
-typically located with a [signature scan](#pattern--signature-scanning).
-
-Because such a site is reached with arbitrary registers live, a normal detour
-would clobber them. Instead NeoHook installs a context bridge: it snapshots all
-general-purpose registers, flags, every XMM register and `MXCSR` into a
-[`HookContext`], calls your handler with a pointer to it, restores the
-(possibly modified) state, then runs the original instructions and resumes the
-function. The patch runs on the full inline engine - threads suspended,
-instruction pointers/return addresses redirected, stolen bytes relocated,
-atomic rollback on failure.
+Hook any instruction and read or change the live CPU state:
 
 ```rust
 use neohook::{HookContext, MidHook};
@@ -469,453 +190,41 @@ extern "system" fn price_for(quantity: u64) -> u64 {
     std::hint::black_box(quantity) * 100
 }
 
-// Reached with the live CPU state; Win64 holds the first argument in RCX.
-// Handlers use the C calling convention, matching `MidHookHandler` in neohook.h.
 unsafe extern "C" fn handler(ctx: *mut HookContext) {
-    let ctx = &mut *ctx;
-    ctx.rcx = ctx.rcx.wrapping_add(5); // rewrite the argument in flight
+    let ctx = unsafe { &mut *ctx };
+    ctx.rcx = ctx.rcx.wrapping_add(5); // Win64: first argument in RCX
 }
 
 fn main() {
-    let hook = unsafe { MidHook::install(price_for as *const u8, handler) }
-        .expect("mid-function hook failed");
-
-    assert_eq!(price_for(2), 700); // (2 + 5) * 100 - the edit took effect
-
-    hook.unhook().unwrap(); // original bytes restored
-    assert_eq!(price_for(2), 200);
+    let hook = unsafe { MidHook::install(price_for as *const u8, handler) }.unwrap();
+    assert_eq!(price_for(2), 700); // (2 + 5) * 100
+    hook.unhook().unwrap();
 }
 ```
 
-A handler may read any field of `HookContext` to observe a live register, or
-write one to change it before execution continues - including the floating-point
-/ SIMD argument registers via `ctx.xmm[..]` (e.g.
-`f64::from_bits(ctx.xmm[0].low)` for a scalar `double`). General-purpose
-registers, flags, all XMM registers and `MXCSR` are captured; the legacy x87
-stack registers are not. `target` must sit on a real instruction boundary.
+The handler can also set `ctx.redirect_rip` (`redirect_eip` on x86) to continue
+somewhere else, e.g. `hook.resume_address()` to skip the patched instructions.
+XMM registers are in `ctx.xmm[..]`; the x87 stack is not captured.
 
-By default the detour *continues* the original function. A handler can instead
-**redirect control flow** by setting `ctx.redirect_rip` (`redirect_eip` on x86)
-to a code address: the stub restores the (possibly modified) state and jumps
-there, skipping the stolen instructions. Use it to replace a routine wholesale
-(redirect a hooked entry to a same-ABI drop-in that returns to the caller) or to
-skip the patched region via `hook.resume_address()` (`= target + stolen_len`).
-The redirect is an indirect `jmp`, not a `ret`, so it leaves the CET shadow
-stack intact.
+### VEH and INT3 hooks
 
-The C ABI exposes `detours_midhook_install(target, handler)` and
-`detours_midhook_unhook(hook)`; the C++ wrapper provides an RAII `neohook::MidHook`.
-See [`examples/midhook.rs`](examples/midhook.rs).
-
----
-
-### VEH Hooking (hardware breakpoints)
-
-Redirect a function **without patching its bytes**. NeoHook arms a CPU hardware
-execution breakpoint (debug registers `DR0`-`DR3`) on the target and installs a
-vectored exception handler that rewrites the instruction pointer to the detour
-when the breakpoint fires. Because the code is never modified, this works on
-read-only or shared pages that must stay byte-for-byte intact.
+Breakpoint-based hooks replace the target without a jump patch:
 
 ```rust
-use neohook::VehHook;
+use neohook::{Int3Hook, VehHook};
 
-#[inline(never)]
-extern "system" fn secret() -> u32 { 1234 }
-extern "system" fn secret_detour() -> u32 { 9999 }
-
-fn main() {
-    let hook = unsafe {
-        VehHook::install(
-            secret as *const () as *const u8,
-            secret_detour as *const () as *const u8,
-        )
-    }
-    .expect("VEH hook failed");
-
-    assert_eq!(secret(), 9999); // intercepted via the exception handler
-    hook.unhook().unwrap();     // breakpoint cleared on every thread
-}
+let veh = unsafe { VehHook::install(target, detour) }.unwrap();   // no byte changed, max. 4
+let int3 = unsafe { Int3Hook::install(target2, detour) }.unwrap(); // one 0xCC byte, max. 256
 ```
 
-VEH hooking has inherent limits worth knowing:
+Both are full replacements; `install_with_original` builds a gateway
+(`hook.original_ptr()`) to call the original. VEH breakpoints are per-thread:
+threads created after the install are not armed.
 
-- **Four hooks at a time** - one per hardware debug register.
-- **Per-thread arming** - debug registers are per-thread. NeoHook arms every
-  thread that exists when the hook is installed; threads created afterwards call
-  the original.
-- **Full replacement** - like `detour_inline!`, the detour replaces the target;
-  there is no trampoline to call the original through.
+### Keeping hooks alive in a DLL
 
-To **call the original** anyway, install with `VehHook::install_with_original`:
-it builds a small gateway holding the relocated prologue, retrievable with
-`hook.original_ptr()`, that runs the original without re-triggering the
-breakpoint. (The plain `install` stays a pure full replacement.)
-
-See [`examples/veh_hook.rs`](examples/veh_hook.rs). The C ABI exposes
-`detours_veh_install(target, detour)`,
-`detours_veh_install_with_original(target, detour)`, `detours_veh_original(hook)`,
-and `detours_veh_unhook(hook)`.
-
----
-
-### INT3 Software-Breakpoint Hooking
-
-Like a VEH hook, an INT3 hook redirects a function through a vectored exception
-handler rather than overwriting its prologue with a jump - but it arms the trap
-by patching a **single `0xCC` byte** at the target instead of using a hardware
-debug register. That removes VEH's four-hook ceiling (up to 256 targets), and
-threads created *after* the install still trap. The one-byte write is atomic, so
-no threads are suspended.
-
-```rust
-use neohook::Int3Hook;
-
-#[inline(never)]
-extern "system" fn secret() -> u32 { 1234 }
-extern "system" fn secret_detour() -> u32 { 9999 }
-
-fn main() {
-    let hook = unsafe {
-        Int3Hook::install(
-            secret as *const () as *const u8,
-            secret_detour as *const () as *const u8,
-        )
-    }
-    .expect("INT3 hook failed");
-
-    assert_eq!(secret(), 9999); // intercepted via the breakpoint handler
-    hook.unhook().unwrap();     // original byte restored
-}
-```
-
-Trade-offs versus a VEH hook:
-
-- **One byte is modified.** The target is not byte-for-byte intact, so this is
-  unsuitable for read-only pages that reject the write or code guarded by an
-  integrity check. (Use a VEH hook there.)
-- **No four-hook limit.** Up to `INT3_MAX_HOOKS` (256) targets at once.
-- **Covers future threads.** Arming is not per-thread.
-- **Full replacement.** Like VEH, the detour replaces the target; there is no
-  trampoline to call the original through - unless you install with
-  `Int3Hook::install_with_original`, which builds a gateway (retrievable via
-  `hook.original_ptr()`) so the detour can forward to the original without
-  re-triggering the breakpoint.
-
-See [`examples/int3_hook.rs`](examples/int3_hook.rs) (which installs six hooks at
-once to show the limit is gone). The C ABI exposes
-`detours_int3_install(target, detour)`,
-`detours_int3_install_with_original(target, detour)`, `detours_int3_original(hook)`,
-and `detours_int3_unhook(hook)`; the C++ wrapper provides an RAII
-`neohook::Int3Hook`.
-
----
-
-### Hooking a Named Export - `attach_export`
-
-When the target is a named export, you do not need to resolve its address
-yourself. `attach_export` loads the module if necessary, resolves the export, and
-queues an inline hook on the function body in one call - intercepting **every**
-caller in the process (unlike an IAT hook, which only affects one module).
-
-```rust
-use neohook::DetourTransaction;
-
-unsafe extern "system" fn my_message_box_w(
-    hwnd: *mut core::ffi::c_void,
-    _text: *const u16,
-    caption: *const u16,
-    utype: u32,
-) -> i32 {
-    // Replace the body text, then forward through the trampoline if desired.
-    0
-}
-
-fn main() {
-    let mut tx = DetourTransaction::begin();
-    tx.update_all_threads();
-
-    // One call: resolve user32!MessageBoxW by name and queue the inline hook.
-    let _trampoline = tx
-        .attach_export("user32.dll", "MessageBoxW", my_message_box_w as *const u8)
-        .expect("export not found");
-
-    let _hooks = tx.commit().expect("transaction failed");
-}
-```
-
-The C ABI exposes `detours_transaction_attach_export(tx, module, func, detour)`;
-the C++ wrapper provides `Transaction::attach_export(...)`. See
-[`examples/attach_export.rs`](examples/attach_export.rs).
-
----
-
-### Resolving Relative References After a Scan
-
-A [signature scan](#pattern--signature-scanning) usually lands on an instruction
-that *references* the address you want rather than being it - a `call rel32` into
-the function, or a `lea/mov [rip + disp32]` loading a global. On x86_64 these
-encodings are position-dependent, so the bytes you matched do not contain the
-absolute target; you must add the displacement to the address *past* the
-instruction. These helpers do that for you.
-
-```rust
-use neohook::{Pattern, scan_module_by_name, resolve_call_target, resolve_rip_relative};
-
-// Signature lands on `call InitWorld` inside the caller.
-let pat = Pattern::parse("E8 ?? ?? ?? ??").unwrap();
-let call_site = scan_module_by_name("game.dll", &pat).unwrap();
-
-// Follow the relative call to the real function entry, then hook that.
-let init_world = unsafe { resolve_call_target(call_site) }.unwrap();
-
-// Or, for `mov rax, [rip+disp32]` loading a global pointer:
-// let global = unsafe { resolve_rip_relative(load_site) }.unwrap();
-```
-
-`resolve_relative(addr, disp_offset, instr_len)` is the decode-free variant when
-you already know the exact encoding. The C ABI exposes `detours_resolve_call_target`,
-`detours_resolve_rip_relative`, and `detours_resolve_relative`; the C++ wrapper
-mirrors them as `neohook::resolve_*`. See
-[`examples/resolve_relative.rs`](examples/resolve_relative.rs).
-
----
-
-### Signature Inference - `infer_signature`
-
-A detour must match its target's signature exactly, but an internal or
-undocumented function has no prototype to copy. `infer_signature` reads the
-function's machine code and reports what the code itself reveals:
-
-- **Argument count** - every argument register (`rcx`, `rdx`, `r8`, `r9`,
-  `xmm0`-`xmm3` on x64; `ecx` / `edx` on x86) read before it is written, every
-  stack argument read, and on x86 the exact byte count of a `ret N`.
-- **Argument types** - an argument used as an address is a `Pointer`, one used
-  by `*ss` / `*sd` instructions a `Float` / `Double`, otherwise the width of the
-  read gives `Int8` ... `Int64`.
-- **Return type and calling convention** - what is left in `rax` / `xmm0` (or
-  on the x87 stack) at `ret`, and on x86 `Cdecl` / `Stdcall` / `Fastcall` /
-  `Thiscall`.
-
-```rust
-use neohook::{infer_signature_by_name, ArgLocation};
-
-let sig = infer_signature_by_name("kernel32.dll", "MulDiv").unwrap();
-println!("{:?}, returns {:?}", sig.convention, sig.returns); // Win64, Some(Int32)
-for arg in &sig.args {
-    match arg.location {
-        ArgLocation::Register(reg) => print!("{reg}: "),
-        ArgLocation::Stack(offset) => print!("[sp+{offset:#x}]: "),
-    }
-    println!("{:?} ({:.0}% sure)", arg.kind, arg.confidence * 100.0);
-}
-
-// Or for a function found by a signature scan:
-// let sig = unsafe { neohook::infer_signature(found) }.unwrap();
-```
-
-The analysis follows every branch, tracks register copies and stack spills (so
-debug builds work), and follows calls, import calls and tail jumps two levels
-deep, so a wrapper that only hands its arguments on - `MessageBoxW` calling
-`MessageBoxTimeoutW`, `Sleep` jumping to `SleepEx` - still reports them.
-
-It is an estimate, not a decompiler: an argument the function never touches is
-only visible as a gap before a later one, a handle that is never dereferenced is
-an integer rather than a pointer, a `struct` passed by value looks like an
-integer, and a variadic function looks like one that takes every register
-argument. `SignatureGuess::complete` is `false` when a path could not be followed
-to its end (a jump table, an unresolvable tail call).
-
-The C ABI fills a caller-allocated `DetoursSignature` (no handle, nothing to
-free) with `detours_infer_signature(func, &sig)` or
-`detours_infer_signature_by_name(module, func, &sig)`; kinds and conventions are
-the `DETOURS_VALUE_KIND_*` / `DETOURS_CONVENTION_*` constants. The C++ wrapper
-returns a `std::optional<DetoursSignature>` from `neohook::infer_signature`. See
-[`examples/c/introspect.c`](examples/c/introspect.c).
-
----
-
-### Closure Detours - `detour_closure!`
-
-Every detour shown so far is a bare `fn` pointer. `detour_closure!` lets the
-detour be a **Rust closure that captures environment** - a counter, a channel, a
-config value - which no C/C++ hooking library can express. The closure receives
-the original function as its first argument, so it can still forward to it.
-
-```rust
-use neohook::detour_closure;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
-
-#[inline(never)]
-extern "system" fn add(a: i32, b: i32) -> i32 { a + b }
-
-fn main() {
-    let calls = Arc::new(AtomicU32::new(0));
-    let calls_in = Arc::clone(&calls);
-
-    let _hooks = detour_closure!(
-        add,                                    // target
-        "system" fn(a: i32, b: i32) -> i32,     // ABI + arg names/types + return
-        move |orig, a, b| {                     // first param is the original
-            calls_in.fetch_add(1, Ordering::Relaxed); // captured state!
-            orig(a, b) * 10
-        },
-    )
-    .expect("hook failed");
-
-    assert_eq!(add(2, 3), 50);               // (2 + 3) * 10
-    assert_eq!(calls.load(Ordering::Relaxed), 1);
-}
-```
-
-The argument names in the signature are reused for the closure parameters.
-Returns `Result<Vec<Hook>, DetourError>` like `detour_inline!`; keep the value
-alive to keep the hook installed. The closure is heap-allocated and leaked for
-the process lifetime, and - like any detour - may run concurrently, so it must be
-`Fn + Send + Sync`: keep mutable state in atomics or behind a lock. Each macro
-invocation drives one live hook at a time; running it again works once the
-previous hook is dropped. See
-[`examples/closure_detour.rs`](examples/closure_detour.rs).
-
----
-
-### Delay / On-Load Hooks
-
-Sometimes the target lives in a module that is not loaded yet - a plugin, a
-lazily-loaded codec, a graphics backend chosen at runtime. A `DelayHook`
-registers the module + export name up front and installs the hook the moment
-that module appears. NeoHook inline-hooks `ntdll!LdrLoadDll` (the chokepoint
-every `LoadLibrary*` funnels through) once, and on each load re-checks the
-pending list.
-
-```rust
-use neohook::DelayHook;
-
-unsafe extern "system" fn my_present(/* ... */) -> i32 { 0 }
-
-fn main() {
-    // d3d11.dll may not be loaded yet - register anyway.
-    let hook = unsafe {
-        DelayHook::register("d3d11.dll", "D3D11CreateDeviceAndSwapChain", my_present as *const u8)
-    }
-    .expect("register failed");
-
-    // ... later, when the game loads d3d11.dll, the hook installs itself.
-    assert!(hook.is_active() || !hook.is_active()); // query install state
-}
-```
-
-The redirect uses an INT3 hook (single byte, no thread suspension) so the install
-is safe under the loader lock. Like INT3/VEH hooks it is full-replacement (no
-trampoline to the original). The C ABI exposes `detours_delay_register`,
-`detours_delay_is_active`, and `detours_delay_unhook`; the C++ wrapper provides
-an RAII `neohook::DelayHook`. See [`examples/delay_hook.rs`](examples/delay_hook.rs).
-
----
-
-### Named Hook Registry
-
-By default a hook is owned by the `Vec<Hook>` you hold and is unhooked when that
-value drops. In a long-lived injected DLL it is often handier to park hooks in
-one place and refer to them by name - toggling, removing, or tearing them all
-down without threading a guard through your code.
-
-```rust
-use neohook::{registry, DetourTransaction};
-
-fn install(target: *mut u8, detour: *const u8) {
-    let mut tx = DetourTransaction::begin();
-    tx.update_all_threads();
-    tx.attach(target, detour).unwrap();
-    let mut hooks = tx.commit().unwrap();
-
-    registry::register("sleep", hooks.remove(0));
-}
-
-fn shutdown() {
-    registry::disable("sleep").ok();   // temporarily off
-    registry::enable("sleep").ok();    // back on
-    registry::unhook_all();            // tear everything down (e.g. DLL_PROCESS_DETACH)
-}
-```
-
-`register`, `take`, `enable`, `disable`, `is_enabled`, `unhook`, `unhook_all`,
-`names`, and `count` operate on the shared store. This is a Rust-side ergonomic
-layer (no C ABI).
-
----
-
-### VTable Hooking
-
-Redirect a specific virtual slot by queueing a VTable hook in the same transaction API.
-
-```rust
-use neohook::DetourTransaction;
-
-type SlotFn = extern "system" fn() -> i32;
-
-extern "system" fn original_method() -> i32 { 1 }
-extern "system" fn detour_method() -> i32 { 2 }
-
-fn main() {
-    // Demonstration with a synthetic VTable array.
-    // In real usage, this is usually an object's vtable pointer.
-    let mut vtable = [original_method as *mut u8];
-
-    let mut tx = DetourTransaction::begin();
-    let original_ptr = tx
-        .attach_vtable(vtable.as_mut_ptr(), 0, detour_method as *const u8)
-        .expect("VTable attach failed");
-
-    let _hooks = tx.commit().expect("transaction failed");
-
-    let original: SlotFn = unsafe { std::mem::transmute(original_ptr) };
-    let current: SlotFn = unsafe { std::mem::transmute(vtable[0]) };
-
-    assert_eq!(current(), 2);
-    assert_eq!(original(), 1);
-}
-```
-
-For an object-scoped variant, see [`examples/vtable_instance_hook.rs`](examples/vtable_instance_hook.rs).
-For hooking a COM-style interface (the `IUnknown` `QueryInterface`/`AddRef`/`Release` layout),
-see [`examples/com_vtable_hook.rs`](examples/com_vtable_hook.rs).
-For an end-to-end input hook (intercepting `user32!GetMessageW` so every keystroke
-in a window becomes `'a'`), see [`examples/force_keystroke_to_a.rs`](examples/force_keystroke_to_a.rs).
-
----
-
-### Graphics API Hooking (DirectX / OpenGL)
-
-The flagship use case for VTable and inline hooks is intercepting a graphics
-API's frame-present call - the anchor point for overlays, ESPs, and frame
-counters. NeoHook ships four **self-contained, runnable** examples that set up
-their own rendering context (no game required) and confirm the hook fires. They
-use the software rasterizer / software GL, so they run **without a GPU** (and in
-CI):
-
-| Example | Target | Technique |
-| :------ | :----- | :-------- |
-| [`examples/d3d11_present.rs`](examples/d3d11_present.rs) | `IDXGISwapChain::Present` (vtable slot 8) | VTable hook on a WARP swapchain |
-| [`examples/dxgi_present1.rs`](examples/dxgi_present1.rs) | `IDXGISwapChain1::Present1` (vtable slot 22) | VTable hook on a flip-model WARP swapchain |
-| [`examples/d3d9_endscene.rs`](examples/d3d9_endscene.rs) | `IDirect3DDevice9::EndScene` (vtable slot 42) | VTable hook on a NULLREF device |
-| [`examples/opengl_swapbuffers.rs`](examples/opengl_swapbuffers.rs) | `opengl32!wglSwapBuffers` | Inline hook via `attach_export` |
-
-The hard part of hooking DirectX is just *getting* the vtable: create a throwaway
-device/swapchain and read the vtable pointer from the COM object. Each example
-shows that, then hooks the present/end-scene slot and forwards to the original.
-In an injected DLL the hook logic is identical - only the delivery differs (you
-install it from `DllMain` instead of creating your own context). Run them with
-e.g. `cargo run --example d3d11_present`.
-
----
-
-### Keeping hooks alive (DLL injection / DllMain)
-
-In Rust, values are dropped (and hooks uninstalled) when they leave scope. Inside a DLL that is injected into a running process, your initialization thread will eventually finish - taking your hooks with it unless you explicitly extend their lifetime.
-
-The correct pattern is to move the hook guard into a `OnceLock<Vec<Hook>>` global:
+Hooks are removed when their guard drops. In an injected DLL, move the guard
+into a global so it outlives the initialization thread:
 
 ```rust
 use std::sync::OnceLock;
@@ -923,541 +232,169 @@ use neohook::{DetourTransaction, Hook};
 
 static ACTIVE_HOOKS: OnceLock<Vec<Hook>> = OnceLock::new();
 
-unsafe extern "system" fn target_present(/* ... */) { /* ... */ }
-unsafe extern "system" fn hooked_present(/* ... */) { /* ... */ }
-
 fn install_hooks() {
-    let mut session = DetourTransaction::begin();
-    session.update_all_threads();
-    session
-        .attach(target_present as *mut u8, hooked_present as *const u8)
-        .unwrap();
-
-    let guards = session.commit().expect("hook install failed");
-
-    // Transfer ownership into the global - hooks stay alive for the process lifetime
-    if ACTIVE_HOOKS.set(guards).is_err() {
-        // Already initialised (e.g. called twice) - new guards drop and unhook safely
-    }
+    let mut tx = DetourTransaction::begin();
+    tx.update_all_threads();
+    tx.attach(target as *mut u8, detour as *const u8).unwrap();
+    let _ = ACTIVE_HOOKS.set(tx.commit().expect("hook install failed"));
 }
 ```
 
-> **Alternative for fire-and-forget hooks:** use `std::mem::forget(guards)` to intentionally leak the guard and prevent the `Drop` from ever running. The hooks will remain active until the process terminates.
+For a single teardown point (e.g. `DLL_PROCESS_DETACH`), park hooks in the
+[named registry](#more-features) and call `registry::unhook_all()`.
+
+### C / C++
+
+`include/neohook.h` (generated with `cargo build --features generate-headers`)
+exposes the C ABI; `include/neohook.hpp` wraps it in RAII types. A committed
+transaction returns a handle that keeps its hooks alive until
+`detours_handle_unhook_and_free`. See [`examples/c`](examples/c) and
+[`examples/cpp`](examples/cpp).
+
+### More features
+
+| Feature | API | Example |
+| :------ | :-- | :------ |
+| EAT hooks | `attach_eat` - every later `GetProcAddress` gets the detour | [`eat_hook.rs`](examples/eat_hook.rs) |
+| Hook by export name | `attach_export("user32.dll", "MessageBoxW", detour)` | [`attach_export.rs`](examples/attach_export.rs) |
+| Signature scanning | `Pattern::parse("48 8B 05 ?? ??")`, `scan_module`, `attach_pattern` | [`pattern_scan.rs`](examples/pattern_scan.rs) |
+| Relative references | `resolve_call_target`, `resolve_rip_relative` after a scan | [`resolve_relative.rs`](examples/resolve_relative.rs) |
+| Signature inference | `infer_signature(ptr)` / `infer_signature_by_name(module, name)`: argument count and types, return type, calling convention - an estimate from the machine code | [`signature.cpp`](examples/cpp/signature.cpp) |
+| Hook detection | `check_function`, `check_export`, `scan_module_hooks`: inline, INT3, VEH, IAT and EAT hooks compared against the module file and debug registers, with destination and owning module | [`hook_detection.cpp`](examples/cpp/hook_detection.cpp) |
+| Closure detours | `detour_closure!(target, "system" fn(a: i32) -> i32, move \|orig, a\| ...)` - capturing `Fn + Send + Sync` closures | [`closure_detour.rs`](examples/closure_detour.rs) |
+| Delay hooks | `DelayHook::register("d3d11.dll", "Func", detour)` - installed when the module loads | [`delay_hook.rs`](examples/delay_hook.rs) |
+| Named registry | `registry::register`, `enable` / `disable`, `unhook_all` | - |
+| VTable hooks | `attach_vtable`, `attach_vtable_instance` (per object) | [`vtable_hook.rs`](examples/vtable_hook.rs), [`com_vtable_hook.rs`](examples/com_vtable_hook.rs) |
+| Graphics APIs | `Present`, `Present1`, `EndScene`, `wglSwapBuffers` - runnable without a GPU | [`d3d11_present.rs`](examples/d3d11_present.rs), [`d3d9_endscene.rs`](examples/d3d9_endscene.rs), [`opengl_swapbuffers.rs`](examples/opengl_swapbuffers.rs) |
+| Introspection | `enumerate_modules`, `enumerate_exports`, `enumerate_imports`, `find_function_by_ordinal` | [`introspect.rs`](examples/introspect.rs) |
+| PDB symbols | `resolve_symbol("ntdll.dll", "LdrpInitializeProcess")` via `dbghelp` | - |
+| Watchdog | `Watchdog::guard` re-applies (or reports) a patch that something restored | [`watchdog.rs`](examples/watchdog.rs) |
+| Tracing | `detour_trace!(f, "system" fn(a: i32) -> i32)` logs arguments and result; `trace_raw!(f, args = 2)` needs no signature | [`trace_detour.rs`](examples/trace_detour.rs) |
+| Control Flow Guard | automatic; `cfg::register_valid_target` for your own generated code | - |
+| Enable / disable, reentrancy | `Hook::enable` / `disable`, `reentrancy_guard!` | - |
+
+Nearly everything above is also in the C ABI and the C++ wrapper; the registry
+and tracing are Rust-only.
 
 ---
 
-### C / C++ FFI
+## How It Works
 
-NeoHook exposes a C ABI. Generate the header with:
+### The problem
 
-```bash
-cargo build --features generate-headers
-```
+A `JMP` patch takes several bytes. Another core may be executing exactly those
+bytes while they are overwritten, and a relative jump (`E9 rel32`) copied to a new
+address jumps to the wrong place.
 
-The header is written to `include` directory.
+### The commit sequence
 
-**Notes on FFI ownership:**
-
-- `detours_transaction_commit` takes ownership of the transaction pointer and frees it.
-- The returned handle keeps hooks alive until you call `detours_handle_unhook_and_free`.
-- All thread safety guarantees (suspension, RIP redirection, stack scanning) apply equally when called from C/C++.
-
-**VTable FFI API:**
-
-- `detours_transaction_attach_vtable(tx, vtable, index, detour)` returns the previous slot pointer on success.
-
----
-
-### Module / PE Introspection
-
-Discover hook targets at runtime: enumerate loaded modules, a module's entry point,
-its exports (EAT) and imports, and resolve exports by name or ordinal.
-
-```rust
-use neohook::{enumerate_modules, enumerate_exports, get_module_handle, find_function_by_ordinal};
-
-// List loaded modules.
-for m in enumerate_modules() {
-    println!("{} @ {:p} ({} bytes)", m.name, m.base, m.size);
-}
-
-// Walk a module's exports.
-let h = get_module_handle("kernel32.dll").unwrap();
-for e in unsafe { enumerate_exports(h) }.unwrap() {
-    if let Some(name) = &e.name {
-        println!("#{} {} -> {:p}", e.ordinal, name, e.address);
-    }
-}
-
-// Resolve an export the linker only exposes by ordinal.
-let func = find_function_by_ordinal("ws2_32.dll", 1);
-```
-
-The C ABI mirrors this with the opaque-handle pattern
-(`detours_enumerate_modules` / `detours_enumerate_exports` / `detours_enumerate_imports`,
-each paired with `_len` / per-field getters / `_free`), plus `detours_get_entry_point`
-and `detours_find_function` / `detours_find_function_by_ordinal`. The C++ wrapper
-(`neohook::enumerate_modules()`, etc.) returns owning `std::vector`s. See
-[`examples/introspect.rs`](examples/introspect.rs).
-
----
-
-### Symbol-Based Resolution (`dbghelp`)
-
-Direct pointers, export names, and [signatures](#pattern--signature-scanning)
-all fail on a function that is **not exported** - an internal routine, a `static`
-helper, a private `ntdll` chokepoint. When a PDB is available (next to the
-binary, or via a symbol server / `_NT_SYMBOL_PATH`), the Debug Help library can
-map such a name straight to an address. `resolve_symbol` wraps that lookup.
-
-```rust
-use neohook::resolve_symbol;
-
-// With ntdll symbols available, resolve a private, unexported routine by name.
-if let Some(addr) = resolve_symbol("ntdll.dll", "LdrpInitializeProcess") {
-    // feed `addr` straight into DetourTransaction::attach
-    println!("resolved at {addr:p}");
-}
-
-// Even without a PDB, dbghelp synthesizes symbols from the export table, so a
-// well-known export resolves to the same address find_function would return.
-let get_proc = resolve_symbol("kernel32.dll", "GetProcAddress").unwrap();
-```
-
-The module is loaded if necessary, and `dbghelp` (which is single-threaded by
-contract) is serialized through one process-wide lock. The C ABI exposes
-`detours_resolve_symbol(module, symbol)`.
-
----
-
-### Anti-Tamper / Re-Hook Watchdog
-
-Some code verifies its own integrity: a periodic self-check scans the bytes it
-shipped with and **restores the original bytes**, silently removing a hook some
-time after it was installed. A `Watchdog` keeps a hook stable across such a check -
-it snapshots the bytes a hook left at the target and watches a background thread
-for tampering. What it does next is **your choice**: re-apply the patch
-(`WatchMode::Restore`, the default) or just report it (`WatchMode::DetectOnly`).
-An optional `on_tamper` callback fires once per tamper episode either way.
-
-```rust
-use neohook::{DetourTransaction, Hook, Watchdog, WatchMode};
-use std::time::Duration;
-
-let mut tx = DetourTransaction::begin();
-tx.update_all_threads();
-tx.attach(target as *mut u8, detour as *const u8).unwrap();
-let hooks = tx.commit().unwrap();
-
-// Snapshot the patched prologue and guard it.
-let (addr, len) = match &hooks[0] {
-    Hook::Inline(h) => (h.target as *const u8, h.orig_bytes.len()),
-    _ => unreachable!(),
-};
-let wd = Watchdog::with_interval(Duration::from_millis(50));
-
-// Get notified on tamper (runs on the watchdog thread).
-wd.on_tamper(|e| eprintln!("tamper at {:p}, restored={}", e.target, e.restored));
-
-// Default re-applies the patch; switch to "detect, do not re-patch" with:
-// wd.set_mode(WatchMode::DetectOnly);
-
-let id = unsafe { wd.guard(addr, len) }.unwrap();
-// wd.restorations() counts how many times Restore mode stepped in.
-
-wd.unguard(id); // stop guarding *before* you unhook
-```
-
-It works at the byte level, so it is agnostic to *how* the patch was made: it
-guards inline-hook jumps, the single `0xCC` of an INT3 hook, or any run of bytes
-you point it at. In `Restore` mode, guard a region **after** the hook is
-installed and **unguard it before** you unhook - otherwise the watchdog would
-faithfully re-install the very patch you are trying to remove. The C ABI exposes
-`detours_watchdog_create`, `detours_watchdog_guard`, `detours_watchdog_unguard`,
-`detours_watchdog_set_mode`, `detours_watchdog_set_on_tamper`,
-`detours_watchdog_restorations`, and `detours_watchdog_destroy`. See
-[`examples/watchdog.rs`](examples/watchdog.rs).
-
----
-
-### Hook Detection
-
-Before hooking a function - or to see what else in the process has - check
-whether it is already hooked and where the hook leads:
-
-```rust
-use neohook::{check_export, scan_module_hooks};
-
-if let Some(hook) = check_export("user32.dll", "MessageBoxW").unwrap() {
-    // e.g. InlineJump -> Some(0x7ff6...) in Some("overlay.dll"); None = private memory
-    println!("{:?} -> {:?} in {:?}", hook.kind, hook.destination, hook.destination_module);
-}
-
-for hook in scan_module_hooks("ntdll.dll").unwrap() {
-    println!("{:?} {:?}", hook.kind, hook.function);
-}
-
-// Any function pointer, e.g. one found by a signature scan:
-// let hook = unsafe { neohook::check_function(found) }?;
-```
-
-| Kind | Found by |
-| ---- | -------- |
-| `InlineJump` | A jump at the function's start that the module's file does not have (`jmp rel32`, `jmp [mem]`, `push imm; ret`, `mov rax, imm; jmp rax`), followed to its destination |
-| `Breakpoint` | An `int3` the file does not have (an INT3 hook) |
-| `HardwareBreakpoint` | A thread's debug register armed on the function (a VEH hook) |
-| `ModifiedCode` | Other changed bytes at the function's start |
-| `ImportRedirect` | An import slot that does not hold the export it imports |
-| `ExportRedirect` | An export table entry that differs from the file |
-
-The comparison uses the module's file on disk with its base relocations applied
-for where the module was loaded, and covers the first instructions of a
-function - at least 16 bytes, up to its first `ret` or jump - which is where
-hooks are placed. What Windows itself rewrites at load time is not reported:
-system DLLs that point their routines at CPU-specific variants within the same
-DLL, imports bound through API sets and forwarders, and exports Windows points
-at another system DLL. Code outside a module image (JIT code, manually mapped
-images) has no file to compare with and is reported as `DetectError::NotInModule`.
-
-The C ABI exposes `detours_check_function` / `detours_check_export`, which fill a
-caller-allocated `DetoursDetectedHook` and return `1` (hooked), `0` (clean) or
-`-1` (error), and `detours_scan_module_hooks` with the usual `_len` / `_get` /
-`_free` handle functions; kinds are the `DETOURS_DETECTED_*` constants. The C++
-wrapper has `neohook::check_function`, `neohook::check_export` and
-`neohook::scan_module_hooks`. See
-[`examples/cpp/hook_detection.cpp`](examples/cpp/hook_detection.cpp).
-
----
-
-### Tracing Detours - `detour_trace!`
-
-Writing a detour whose only job is to log "this function was called with these
-arguments and returned this" is pure boilerplate. `detour_trace!` generates it:
-give it a target and its signature and it installs an inline hook that
-`Debug`-formats every call's arguments and return value, emits a record, and
-forwards to the original unchanged.
-
-```rust
-use neohook::{detour_trace, trace};
-
-#[inline(never)]
-extern "system" fn add(a: i32, b: i32) -> i32 { a + b }
-
-fn main() {
-    // Optional: route records into your logger instead of the default stderr.
-    trace::set_sink(|r| println!("[trace] {}({}) => {}", r.function, r.args, r.ret));
-
-    let _hooks = detour_trace!(add, "system" fn(a: i32, b: i32) -> i32)
-        .expect("trace hook failed");
-
-    assert_eq!(add(2, 3), 5); // logs: add(2, 3) => 5, returns the real result
-}
-```
-
-Every argument type and the return type must implement `Debug` (integers,
-pointers, and most FFI types already do). Where records go is decided by a
-process-wide sink: the default writes one line per call to standard error;
-`trace::set_sink` overrides it and `trace::clear_sink` restores the default.
-
-When you do **not** want to spell out a signature, `trace_raw!` builds the tracer
-on the `MidHook` / `HookContext` register-context bridge instead. It needs only
-the target, hooks the entry, and dumps the integer argument registers as hex:
-
-```rust
-use neohook::trace_raw;
-
-// No ABI, no argument types - just the function. Dumps the first 2 integer args.
-let _hook = trace_raw!(some_function, args = 2).expect("raw trace failed");
-// emits e.g.:  some_function(0x10, 0x20) -> <entry>
-```
-
-The trade-off mirrors the two foundations: `detour_trace!` (closure engine) gives
-**typed arguments and the return value** but needs the signature; `trace_raw!`
-(`HookContext`) needs **no signature** but only sees raw integer registers at
-entry and has no return value to report, so its record's return field is the
-literal `<entry>`. On **x86_64** those registers *are* the first four integer
-arguments (`rcx`/`rdx`/`r8`/`r9`); on **x86**, where arguments are stack-passed
-and not reachable from a mid-hook context, it dumps the general-purpose registers
-as a snapshot instead (use `detour_trace!` for typed x86 arguments).
-
-Like the [named registry](#named-hook-registry), tracing is a Rust-side ergonomic
-layer (no C ABI), because formatting arbitrary argument types is a Rust-language
-feature. See [`examples/trace_detour.rs`](examples/trace_detour.rs).
-
----
-
-### Control Flow Guard (CFG) Awareness
-
-[Control Flow Guard](https://learn.microsoft.com/en-us/windows/win32/secbp/control-flow-guard)
-validates every **indirect** call (through a function pointer, a vtable slot, or
-an import thunk) against a per-process bitmap of legal targets. A rejected target
-ends the process with a non-catchable `RtlFailFast`.
-
-Most hooking survives default CFG untouched, because the default configuration is
-permissive in two ways that happen to cover the common cases: private executable
-memory (where trampolines live) is allowed, and modules without a Guard CF table
-are allowed wholesale. The stricter configurations a process can opt into are
-where registration becomes load-bearing:
-
-- **Strict mode** removes the private-memory exemption - trampolines, gateways,
-  and export stubs must be registered.
-- **Export suppression** drops exports from the valid set unless re-validated.
-- A detour that points *inside* a CFG image at a non-entry address is rejected in
-  any mode.
-
-neohook registers its generated entry points and its IAT/EAT/VTable detours
-through `SetProcessValidCallTargets` automatically. The layer auto-detects the
-process's CFG mitigation policy and does nothing when CFG is not enforced, so it
-costs nothing in the common case and hardens the strict ones.
-
-```rust
-use neohook::cfg;
-
-// Usually nothing to do - registration is automatic inside the hook engines.
-// Query or override the behaviour if you need to:
-if cfg::is_enforced() {
-    // Mark your own runtime-generated (e.g. JIT-emitted) code as callable
-    // through a guarded indirect call.
-    cfg::register_valid_target(my_generated_code_ptr);
-}
-
-// Force the handling on/off (e.g. for deterministic tests); None = auto-detect.
-cfg::set_enforcement(None);
-```
-
-`GetProcessMitigationPolicy` / `SetProcessValidCallTargets` are resolved from
-kernel32 at runtime, so neohook adds no static import on these APIs and still
-loads on systems that predate them.
-
-The C ABI exposes `detours_cfg_is_enforced`, `detours_cfg_set_enforcement`, and
-`detours_cfg_register_valid_target`; the C++ wrapper mirrors them under
-`neohook::cfg`.
-
----
-
-## How It Works - Under the Hood
-
-### The Problem with Naive Patching
-
-Writing a `JMP` takes multiple bytes. On a live system, another CPU core may be executing those exact bytes as you overwrite them - causing an immediate crash. Even if you get lucky and avoid the race, a relative jump instruction (`E9 xx xx xx xx`) encodes a _distance from its own address_. Copy it verbatim to a new location and it jumps to the wrong place.
-
-### The NeoHook Commit Sequence
-
-For every inline hook, NeoHook builds a trampoline near the target function.
-
-That trampoline contains two parts:
-
-1. a managed gateway
-2. a relocated body
-   The managed gateway is a small NeoHook-owned jump stub that acts as a stable original_ptr() and can itself be hooked again later.
-
-```
-Original target
-    │
-    ├── patched to detour
-    │
-    └── trampoline
-         ├── managed gateway
-         └── relocated original instructions + jump back
-```
-
-Conceptually, the trampoline looks like this:
-
-```
-trampoline:
-+-------------------------------+
-| managed gateway               |  -> jumps to relocated body
-+-------------------------------+
-| relocated stolen instructions |
-| jump back to target+stolen    |
-+-------------------------------+
-```
+Every inline hook gets a trampoline near the target: a **managed gateway** (a
+small jump stub that is the stable `original_ptr()` and can itself be hooked)
+followed by the **relocated stolen instructions** and a jump back.
 
 ```
 DetourTransaction::commit()
 │
-├─ 1. FREEZE  ──── SuspendThread() on every tracked process thread
-│                   (except the calling thread)
-│
-├─ 2. SCAN    ──── For each suspended thread:
-│                   a. Read thread context with GetThreadContext()
-│                   b. If RIP/EIP points into the bytes that will be overwritten:
-│                        redirect it to trampoline/body + offset
-│                   c. Scan the top part of the stack for stale return addresses
-│                      that still point into the soon-to-be-patched range
-│                   d. Rewrite those return addresses to the relocated body
-│
-├─ 3. PATCH   ──── For each queued hook:
-│                   a. If needed, build or prepare the trampoline
-│                   b. Write the detour jump into the original target
-│                   c. Register the trampoline gateway as the new managed gateway
-│                   d. If the patched target was itself a managed gateway:
-│                        remove the old gateway from the registry
-│                   If any step fails:
-│                        rollback applied hooks and restore redirected threads
-│
-└─ 4. THAW    ──── ResumeThread() on every suspended thread
+├─ 1. PREPARE ── allocate and build everything that needs memory, take the
+│                code-write lock (nothing may allocate while threads are frozen)
+├─ 2. FREEZE  ── SuspendThread() on every tracked thread
+├─ 3. REDIRECT ─ an instruction pointer inside the stolen bytes moves to the
+│                trampoline; so does a return address into them anywhere on the stack
+├─ 4. PATCH   ── write the jump into each target; on any failure roll back
+│                every patch and redirection
+├─ 5. THAW    ── ResumeThread()
+└─ 6. PUBLISH ── register the new gateways for chaining, finalize detaches
 ```
 
-### Instruction Relocation
+### Relocation and allocation
 
-The bytes overwritten at the hook site are copied to a trampoline buffer. Because these instructions often contain position-dependent encodings (RIP-relative loads, short branches, `CALL` targets), they cannot simply be copied verbatim. `iced-x86` decodes each stolen instruction, recomputes all relative offsets relative to the new trampoline address, and re-encodes the result.
+`iced-x86` decodes the stolen instructions and re-encodes them for the
+trampoline's address (RIP-relative operands, branches, calls). On x64 the
+trampoline is placed within ±2 GB of the target so a 5-byte `E9 rel32` reaches
+it; otherwise a 14-byte `FF 25` absolute jump is used.
 
-A back-jump is appended at the end of the trampoline to return execution to the first un-stolen instruction in the original function. Calling through the trampoline is therefore equivalent to calling the original function.
+### Unwinding (x64)
 
-### Smart Trampoline Allocation
-
-On x86_64, a 5-byte `E9 rel32` jump can only reach ±2 GB. `TrampolineAlloc::alloc_nearby` scans free memory regions outward from the target using `VirtualQuery` and allocates within that window. If no suitable region exists within ±2 GB, the engine upgrades to a 14-byte indirect absolute jump (`FF 25 00000000 <abs64>`).
-
-### Unwinding Through Stubs (x64)
-
-x64 Windows unwinds a stack - to dispatch an exception, for a debugger's call
-stack, for a profiler - through table-based unwind data: every frame's
-instruction pointer must lie in a function with a `RUNTIME_FUNCTION` entry that
-describes what its prologue did to the stack. A trampoline runs a relocated
-copy of the target's prologue in memory NeoHook allocated, which has no such
-entry. While a call made by those stolen instructions is running, its return
-address points into the trampoline; without unwind data the unwinder treats
-the trampoline as a leaf, reads the wrong return address, and an exception
-raised below it never reaches a handler above it.
-
-So every stub gets unwind data, written next to its code and registered with
-`RtlAddFunctionTable`:
-
-- **Trampolines and VEH/INT3 gateways** reuse the target's own unwind codes for
-  the prologue instructions they run, with each code's offset translated through
-  the relocation map (a relocated instruction can change length). Codes for the
-  rest of the prologue, which runs in the original function after the jump back,
-  are left out.
-- **Mid-hook stubs** describe their own frame. The stub first stores the hooked
-  address where a return address would be, so an unwind that starts in the
-  handler continues in the hooked function at the patched instruction and on to
-  its caller.
-
-The tables are deleted before a retired stub's memory is released. x86 unwinds
-through frame-pointer chains and exception registration records rather than
-tables, so it needs none of this.
+x64 unwinding needs a `RUNTIME_FUNCTION` for every frame. Each stub gets one,
+registered with `RtlAddFunctionTable`: trampolines and gateways reuse the
+target's prologue unwind codes with their offsets translated through the
+relocation; mid-hook stubs describe their own frame and store the hooked address
+where a return address would be. Exceptions and stack walks then pass through
+stubs to the caller. x86 unwinds through frame chains and needs none of this.
 
 ### Hook chaining
 
-A managed gateway can itself be used as the target of another inline hook. This is how hook chaining works.
-
-Suppose we hook target with detour_A.
-
-```
-Before:
-target
-  |
-  v
-[ original function ]
-```
-
-After the first hook:
+To layer a second detour, attach it to the first hook's managed gateway - the
+trampoline `attach` returned. Each detour calls the next through its own
+gateway:
 
 ```
-target -----------------------> detour_A
-
-gateway_A --------------------> trampoline_body_A
-                                  |
-                                  v
-                         relocated stolen bytes
-                                  |
-                                  v
-                            target + stolen_len
+target ──► detour_A ──► gateway_A (hooked) ──► detour_B ──► gateway_B ──► original body
 ```
 
-Now suppose `target` is hooked again with `detour_B`. That means the new target is no longer the real function entry. The new target is `gateway_A`. NeoHook reads the destination of gateway_A, then creates a new gateway:
-
-```
-gateway_B --------------------> previous target of gateway_A
-                              = trampoline_body_A
-```
+See [`managed_gateway_chain.rs`](examples/managed_gateway_chain.rs).
 
 ---
 
-## Architecture Overview
+## Architecture
 
 ```
-neohook/
-├── src/
-│   ├── lib.rs          - Public API surface, macros (detour_inline!, detour_helper!)
-│   ├── api.rs          - DetourTransaction: high-level Rust API + C FFI entry points
-│   ├── transaction.rs  - TransactionCore: commit/rollback engine
-│   ├── alloc.rs        - TrampolineAlloc: near-memory allocation (x86 + x86_64)
-│   ├── disasm.rs       - Disassembler: instruction length, relocation via iced-x86
-│   ├── iat.rs          - IatHook: IAT parsing and pointer rewriting
-│   ├── eat.rs          - EatHook: EAT parsing and export RVA rewriting (+ near stub)
-│   ├── veh.rs          - VehHook: hardware-breakpoint hooking via a vectored handler
-│   ├── int3.rs         - Int3Hook: INT3 software-breakpoint hooking via a vectored handler
-│   ├── inflight.rs     - Checks for traps still being dispatched before a handler is removed
-│   ├── gateway.rs      - Call-original gateway builder for VEH / INT3 hooks
-│   ├── midhook.rs      - MidHook: mid-function detours + register-context bridge
-│   ├── pe.rs           - Shared bounds-checked PE parsing primitives
-│   ├── scan.rs         - Pattern: signature parsing + memory/module scanning
-│   ├── resolve.rs      - Resolve relative refs (call/jmp/rip) into absolute addresses
-│   ├── signature.rs    - Signature inference: argument count/types from machine code
-│   ├── symbols.rs      - Symbol-based resolution via dbghelp (resolve_symbol)
-│   ├── delay.rs        - DelayHook: on-load hooks via an ntdll!LdrLoadDll detour
-│   ├── detect.rs       - Hook detection: code vs. module file, debug registers, IAT/EAT
-│   ├── registry.rs     - Process-wide named hook registry (+ unhook_all)
-│   ├── watchdog.rs     - Watchdog: anti-tamper / re-hook byte-region guard
-│   ├── trace.rs        - Tracing detour sink for detour_trace!
-│   ├── unwind.rs       - x64 unwind data for trampolines, gateways and mid-hook stubs
-│   ├── introspect.rs   - Module / PE introspection (modules, exports, imports)
-│   ├── mem.rs          - Memory helpers: VirtualProtect wrapper, atomic write
-│   ├── module.rs       - Module utilities: find_function, get_module_handle
-│   └── threads.rs      - ThreadEnumerator: toolhelp32 snapshot, open/suspend threads
-└── include/
-    ├── neohook.h    - Auto-generated C header (cbindgen)
-    └── neohook.hpp  - C++ header
+src/
+├── lib.rs          - public API, macros
+├── code.rs         - follows jump thunks to the real function body
+├── api.rs          - DetourTransaction + C ABI
+├── transaction.rs  - commit / rollback engine, locks
+├── alloc.rs        - near-target trampoline allocation
+├── disasm.rs       - instruction length + relocation (iced-x86)
+├── iat.rs, eat.rs, vtable.rs, veh.rs, int3.rs, midhook.rs, delay.rs - hook kinds
+├── gateway.rs      - call-the-original gateway for VEH / INT3
+├── inflight.rs     - traps still dispatching before a handler is removed
+├── reclaim.rs      - quiescence-checked release of retired stubs
+├── unwind.rs       - x64 unwind data for stubs
+├── pe.rs, introspect.rs, module.rs, symbols.rs - PE parsing, enumeration, lookup
+├── scan.rs, resolve.rs, signature.rs, detect.rs - finding and analysing targets
+├── registry.rs, watchdog.rs, trace.rs, cfg.rs, reentrancy.rs - tooling
+└── mem.rs, threads.rs - memory writes, thread enumeration
+include/
+├── neohook.h       - generated C header
+└── neohook.hpp     - C++ wrapper
 ```
 
 ---
 
 ## Error Handling
 
-All fallible operations return `Result<T, DetourError>`:
+Fallible operations return `Result<T, DetourError>` (`std::error::Error` + `Display`):
 
-| Variant                         | When it occurs                                                                                           |
-| :------------------------------ | :------------------------------------------------------------------------------------------------------- |
-| `DetourError::NotStarted`       | Method called on a transaction that was already committed or aborted                                     |
-| `DetourError::AllocationFailed` | No suitable free memory region found near the target address                                             |
-| `DetourError::RelocationFailed` | `iced-x86` could not relocate the stolen instructions (e.g., RIP-relative target > 2 GB from trampoline) |
-| `DetourError::InvalidParameter` | Null pointer passed, or the requested IAT import was not found in the module                             |
-| `DetourError::Pattern`          | A byte signature passed to `attach_pattern` could not be parsed                                          |
-| `DetourError::PatternNotFound`  | A valid signature did not match anywhere in the target module                                            |
-
-`DetourError` implements `std::error::Error` and `Display`, so it works with `?`, `anyhow`, `thiserror`, etc.
+| Variant | When |
+| :------ | :--- |
+| `NotStarted` | The transaction was already committed or aborted |
+| `AllocationFailed` | No free memory near the target |
+| `RelocationFailed` | The stolen instructions cannot be relocated, or a thread could not be redirected |
+| `InvalidParameter` | Null pointer, target too short, overlapping or duplicate hook |
+| `Pattern` / `PatternNotFound` | A signature does not parse / does not match |
+| `Iat` / `Eat` / `Vtable` | The table hook failed (missing import or export, protection change) |
+| `CommitFailed { index, kind, source }` | Which queued hook failed, after the commit rolled back |
 
 ---
 
 ## Development
 
-### Running tests
-
 ```bash
-cargo test -- --test-threads=1
+cargo test   # tests run single-threaded (set in .cargo/config.toml)
 ```
 
-You have to make sure that you use one thread or you risk race conditions.
-
-### Fuzzing the relocator
-
-Instruction relocation is the most safety-critical component (it re-encodes
-build-controlled prologue bytes), so it has a dedicated fuzz harness. A fast,
-deterministic invariant pass runs as part of the normal suite; the deep,
-mutation-based fuzzer is `#[ignore]`d so it can be run on demand or on a
-schedule:
+The relocator has a mutation fuzzer, ignored by default:
 
 ```bash
-# millions of corpus-seeded mutations; reproducible via the seed
 NEOHOOK_FUZZ_ITERS=5000000 cargo test --release fuzz_relocate_deep -- --ignored --nocapture
 ```
 
-It asserts the relocator never panics, never writes past the trampoline budget
-(canary-guarded), keeps the old→new instruction-offset map consistent, and
-preserves absolute branch / RIP-relative targets. Set `NEOHOOK_FUZZ_SEED` to
-reproduce a specific run.
+`NEOHOOK_FUZZ_SEED` reproduces a run.
+
+### Roadmap
+
+- ARM64 inline hooking (planned)
 
 ---
 
