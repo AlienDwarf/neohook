@@ -474,6 +474,12 @@ fn release_idle_handler(mgr: &mut Int3Manager) {
     }
 }
 
+/// Whether the vectored handler is registered.
+#[cfg(test)]
+pub(crate) fn handler_registered() -> bool {
+    lock_manager().handler != 0
+}
+
 /// Returns the detour of the live slot hooking `addr`, if any.
 fn find_detour(addr: usize) -> Option<usize> {
     SLOT_TARGET

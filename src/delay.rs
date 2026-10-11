@@ -617,6 +617,28 @@ mod tests {
         assert_eq!(read_entry_byte(page), None);
     }
 
+    #[test]
+    fn int3_handler_goes_with_a_delay_hook_whose_module_was_unloaded() {
+        use windows_sys::Win32::Foundation::FreeLibrary;
+        // A module nothing else in the test process loads, so it really
+        // unloads.
+        let name = wide("msimg32.dll");
+        let module = unsafe { LoadLibraryW(name.as_ptr()) };
+        assert!(!module.is_null(), "msimg32.dll loads");
+        let hook =
+            unsafe { DelayHook::register("msimg32.dll", "AlphaBlend", fake_time as *const u8) }
+                .expect("register");
+        assert!(hook.is_active(), "installed right away");
+        assert_ne!(unsafe { FreeLibrary(module) }, 0);
+        assert!(!hook.is_active(), "dropped back to pending by the unload");
+
+        drop(hook);
+        assert!(
+            !crate::int3::handler_registered(),
+            "the INT3 handler outlived the last delay hook"
+        );
+    }
+
     unsafe extern "system" fn fake_tick_count() -> u32 {
         0x1234_5678
     }
