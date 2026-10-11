@@ -807,6 +807,10 @@ impl TransactionCore {
     /// padding. Patching it would overwrite the code that follows, typically
     /// the next function.
     ///
+    /// Returns `Err(DetourError::InvalidParameter)` if `target` is a managed
+    /// gateway that an installed hook is already chained on; chain onto that
+    /// hook's gateway instead.
+    ///
     /// # Safety
     /// The caller must ensure that `target` and `detour` are valid pointers. NeoHook performs basic validation but does not guarantee that the pointers are valid or that the memory they point to is properly aligned or accessible. Invalid pointers may cause undefined behavior, including crashes.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -830,6 +834,25 @@ impl TransactionCore {
         self.attach_inner(target, detour, false)
     }
 
+    /// Applies the same-target rule to an inline hook already queued on
+    /// `target`: the same detour reuses it, a different one is rejected.
+    fn queued_inline(
+        &self,
+        target: *mut u8,
+        detour: *const u8,
+    ) -> Option<Result<*mut u8, DetourError>> {
+        self.pending_hooks.iter().find_map(|pending| match pending {
+            PendingHook::Inline(existing) if existing.target == target => {
+                Some(if existing.detour == detour {
+                    Ok(existing.trampoline.ptr)
+                } else {
+                    Err(DetourError::InvalidParameter)
+                })
+            }
+            _ => None,
+        })
+    }
+
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn attach_inner(
         &mut self,
@@ -847,7 +870,20 @@ impl TransactionCore {
 
         // If the target function is a managed gateway, we use a special hooking method that does not require disassembly or stolen bytes, as the gateway is designed to be overwritten with a jump to the trampoline. This allows us to hook methods that would otherwise be difficult or impossible to hook.
         // The trampoline will contain a stub that jumps to the original target after executing the detour, allowing for proper chaining of hooks
+        //
+        // A gateway carries at most one chained hook: once one is installed the
+        // gateway holds its jump, and a second hook would either patch it again
+        // or follow that jump into the chained detour. Chain onto the installed
+        // hook's own gateway instead. Within one transaction the same-target
+        // rule below applies.
+        if follow_thunks && is_chained_gateway(target) {
+            return Err(DetourError::InvalidParameter);
+        }
         if follow_thunks && is_managed_gateway(target) {
+            if let Some(queued) = self.queued_inline(target, detour) {
+                return queued;
+            }
+
             let previous_target = unsafe {
                 read_managed_gateway_target(target as *const u8)
                     .ok_or(DetourError::InvalidParameter)?
@@ -927,17 +963,8 @@ impl TransactionCore {
         //   transaction. Reject it - stacking several detours on one function is
         //   done by chaining onto the returned gateway, not by re-attaching the
         //   same target.
-        for pending in &self.pending_hooks {
-            let PendingHook::Inline(existing) = pending else {
-                continue;
-            };
-            if existing.target != target {
-                continue;
-            }
-            if existing.detour == detour {
-                return Ok(existing.trampoline.ptr);
-            }
-            return Err(DetourError::InvalidParameter);
+        if let Some(queued) = self.queued_inline(target, detour) {
+            return queued;
         }
 
         // --- architecture ---
@@ -1401,7 +1428,12 @@ impl TransactionCore {
                     inline_count += 1;
                     // Another transaction may have hooked these bytes since
                     // `attach`; the lock held now keeps the answer current.
-                    if overlaps_live_patch(data.target, data.stolen_len) {
+                    // Two queued hooks must not patch the same bytes either.
+                    let overlaps_queued = pending[..index].iter().any(|earlier| {
+                        matches!(earlier, PendingHook::Inline(other)
+                            if ranges_overlap(other.target as usize, other.stolen_len, data.target as usize, data.stolen_len))
+                    });
+                    if overlaps_queued || overlaps_live_patch(data.target, data.stolen_len) {
                         Err((HookKind::Inline, DetourError::InvalidParameter))
                     } else {
                         inline_patch_bytes(data)
@@ -2612,6 +2644,14 @@ fn remove_gateway_dependent(gateway: *mut u8) -> (bool, Option<(usize, usize)>) 
     let orphan = entry.orphan;
     m.remove(&(gateway as usize));
     (owner_alive, orphan)
+}
+
+/// Whether an installed hook is chained on `gateway`.
+fn is_chained_gateway(gateway: *mut u8) -> bool {
+    chained_gateways()
+        .lock()
+        .map(|m| m.contains_key(&(gateway as usize)))
+        .unwrap_or(false)
 }
 
 /// Hands the trampoline of a dropped hook to the hooks chained on its gateway.
