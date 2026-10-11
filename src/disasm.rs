@@ -16,14 +16,17 @@ pub(crate) struct RelocationMapping {
 /// committed memory region that contains it.
 ///
 /// Returns 0 if the region cannot be queried or is not readable, so callers can
-/// avoid dereferencing unmapped memory.
+/// avoid dereferencing unmapped memory. A `PAGE_GUARD` page also counts as not
+/// readable: reading it would consume the guard and raise
+/// `STATUS_GUARD_PAGE_VIOLATION`.
 ///
 /// # Safety
 /// `address` only needs to be a value to query; it is never dereferenced here.
 pub(crate) unsafe fn readable_bytes_from(address: *const u8) -> usize {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
-        PAGE_EXECUTE_WRITECOPY, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+        PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+        PAGE_WRITECOPY, VirtualQuery,
     };
 
     const READABLE: u32 = PAGE_READONLY
@@ -45,7 +48,10 @@ pub(crate) unsafe fn readable_bytes_from(address: *const u8) -> usize {
         return 0;
     }
 
-    if mbi.State != MEM_COMMIT || (mbi.Protect & READABLE) == 0 {
+    if mbi.State != MEM_COMMIT
+        || (mbi.Protect & READABLE) == 0
+        || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0
+    {
         return 0;
     }
 
