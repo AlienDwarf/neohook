@@ -60,6 +60,8 @@ Function hooking is deceptively difficult to get right. Writing a `JMP` patch is
 
 - **Anti-Tamper / Re-Hook Watchdog** - A background `Watchdog` snapshots a hook's patched bytes and, on tamper, either **re-applies** them (`WatchMode::Restore`) or just **reports** the event (`WatchMode::DetectOnly`) via an `on_tamper` callback - keeping a hook in place across, or surfacing, periodic self-integrity checks that restore the original prologue. Works at the byte level, so it guards inline jumps, the INT3 `0xCC`, or any patch.
 
+- **Hook Detection** - Find out whether a function is already hooked, and where the hook leads: `check_function(ptr)`, `check_export("user32.dll", "MessageBoxW")`, or `scan_module_hooks("ntdll.dll")` for a whole module. Inline hooks are found by comparing the code in memory with the module's file on disk (relocations applied), VEH hooks in the threads' debug registers, IAT and EAT hooks in the import and export tables. Each finding names the destination's module - or reports private memory, where trampolines and injected code live.
+
 - **Control Flow Guard (CFG) Awareness** - On a process that enforces CFG, neohook registers the entry points it generates (inline trampolines, VEH/INT3 gateways, EAT jump stubs) and the IAT/EAT/VTable detours as valid indirect-call targets via `SetProcessValidCallTargets` - the same mechanism Microsoft Detours uses. Auto-detected and a no-op when CFG is off, so it is safe to leave on; it keeps hooks holding up under **strict CFG** and **export suppression**, where the default permit for private executable memory no longer applies. `cfg::register_valid_target` is public for your own runtime-generated code.
 
 - **Tracing Detours** - Two generators, no hand-written boilerplate: `detour_trace!` takes a signature and `Debug`-formats every call's arguments **and return value**; `trace_raw!` needs **no signature** and dumps the integer argument registers at entry via the `MidHook`/`HookContext` bridge. Both emit to a process-wide sink (stderr by default, or your own logger).
@@ -187,6 +189,7 @@ this as a feature comparison rather than a maturity one.
 | v0.10.0 |    ✅ Done | Anti-tamper / re-hook watchdog (`Watchdog`)            |
 | v0.10.0 |    ✅ Done | Tracing / logging detour generator (`detour_trace!`)   |
 | v0.10.0 |    ✅ Done | Control Flow Guard (CFG) awareness (`cfg`)             |
+| v0.16.0 |    ✅ Done | Hook detection (`check_function`, `scan_module_hooks`) |
 | v0.x   |    Planned | ARM64 inline hooking                                   |
 
 --
@@ -1014,6 +1017,55 @@ faithfully re-install the very patch you are trying to remove. The C ABI exposes
 
 ---
 
+### Hook Detection
+
+Before hooking a function - or to see what else in the process has - check
+whether it is already hooked and where the hook leads:
+
+```rust
+use neohook::{check_export, scan_module_hooks};
+
+if let Some(hook) = check_export("user32.dll", "MessageBoxW").unwrap() {
+    // e.g. InlineJump -> Some(0x7ff6...) in Some("overlay.dll"); None = private memory
+    println!("{:?} -> {:?} in {:?}", hook.kind, hook.destination, hook.destination_module);
+}
+
+for hook in scan_module_hooks("ntdll.dll").unwrap() {
+    println!("{:?} {:?}", hook.kind, hook.function);
+}
+
+// Any function pointer, e.g. one found by a signature scan:
+// let hook = unsafe { neohook::check_function(found) }?;
+```
+
+| Kind | Found by |
+| ---- | -------- |
+| `InlineJump` | A jump at the function's start that the module's file does not have (`jmp rel32`, `jmp [mem]`, `push imm; ret`, `mov rax, imm; jmp rax`), followed to its destination |
+| `Breakpoint` | An `int3` the file does not have (an INT3 hook) |
+| `HardwareBreakpoint` | A thread's debug register armed on the function (a VEH hook) |
+| `ModifiedCode` | Other changed bytes at the function's start |
+| `ImportRedirect` | An import slot that does not hold the export it imports |
+| `ExportRedirect` | An export table entry that differs from the file |
+
+The comparison uses the module's file on disk with its base relocations applied
+for where the module was loaded, and covers the first instructions of a
+function - at least 16 bytes, up to its first `ret` or jump - which is where
+hooks are placed. What Windows itself rewrites at load time is not reported:
+system DLLs that point their routines at CPU-specific variants within the same
+DLL, imports bound through API sets and forwarders, and exports Windows points
+at another system DLL. Code outside a module image (JIT code, manually mapped
+images) has no file to compare with and is reported as `DetectError::NotInModule`.
+
+The C ABI exposes `detours_check_function` / `detours_check_export`, which fill a
+caller-allocated `DetoursDetectedHook` and return `1` (hooked), `0` (clean) or
+`-1` (error), and `detours_scan_module_hooks` with the usual `_len` / `_get` /
+`_free` handle functions; kinds are the `DETOURS_DETECTED_*` constants. The C++
+wrapper has `neohook::check_function`, `neohook::check_export` and
+`neohook::scan_module_hooks`. See
+[`examples/cpp/hook_detection.cpp`](examples/cpp/hook_detection.cpp).
+
+---
+
 ### Tracing Detours - `detour_trace!`
 
 Writing a detour whose only job is to log "this function was called with these
@@ -1253,6 +1305,7 @@ neohook/
 │   ├── resolve.rs      - Resolve relative refs (call/jmp/rip) into absolute addresses
 │   ├── symbols.rs      - Symbol-based resolution via dbghelp (resolve_symbol)
 │   ├── delay.rs        - DelayHook: on-load hooks via an ntdll!LdrLoadDll detour
+│   ├── detect.rs       - Hook detection: code vs. module file, debug registers, IAT/EAT
 │   ├── registry.rs     - Process-wide named hook registry (+ unhook_all)
 │   ├── watchdog.rs     - Watchdog: anti-tamper / re-hook byte-region guard
 │   ├── trace.rs        - Tracing detour sink for detour_trace!
