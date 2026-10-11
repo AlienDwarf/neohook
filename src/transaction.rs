@@ -2779,6 +2779,14 @@ fn overlaps_live_patch(target: *mut u8, len: usize) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether an installed inline hook patches code starting at `target`.
+pub(crate) fn live_patch_starts_at(target: *const u8) -> bool {
+    live_patches()
+        .lock()
+        .map(|m| m.contains_key(&(target as usize)))
+        .unwrap_or(false)
+}
+
 fn ranges_overlap(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
     a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
 }
