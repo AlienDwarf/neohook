@@ -1779,7 +1779,8 @@ impl TransactionCore {
                     next_slot += WORD;
                     scanned += WORD;
                     if scanned > MAX_STACK_SCAN_BYTES {
-                        return Ok(());
+                        // A return address deeper than this would be missed.
+                        return Err(DetourError::RelocationFailed);
                     }
 
                     let mut stack_value: usize = 0;
