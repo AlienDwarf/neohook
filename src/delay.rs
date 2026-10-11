@@ -27,9 +27,6 @@
 //!   target; there is no trampoline to call the original through.
 //! * **Capacity.** Each installed delay hook consumes one INT3 slot
 //!   ([`crate::int3::MAX_HOOKS`]).
-//! * **Busy loads are skipped.** A load that completes while another thread is
-//!   inside a NeoHook transaction or code write leaves the hook pending; it is
-//!   installed on a later load.
 //!
 //! When the hooked module is unloaded, the hook drops back to pending (and is
 //! installed again on the next load) without writing to the old address. Unloads
@@ -509,12 +506,9 @@ fn install_ready_pending() {
             continue;
         }
         if let Some(target) = resolve_loaded(&pending.module, &pending.func) {
-            // This runs under the loader lock. Waiting for the transaction lock
-            // here could deadlock against a thread that holds it and is itself
-            // loading a library, so a busy lock leaves the hook pending for the
-            // next load instead.
-            pending.hook =
-                unsafe { Int3Hook::try_install(target, pending.detour) }.and_then(Result::ok);
+            // This runs under the loader lock. The INT3 install waits only for
+            // the code lock, whose holders never wait for the loader lock.
+            pending.hook = unsafe { Int3Hook::install(target, pending.detour) }.ok();
             pending.module_base = module_base_of(target).unwrap_or(0);
         }
     }

@@ -2408,13 +2408,6 @@ pub(crate) fn with_code_lock<R>(write: impl FnOnce() -> R) -> R {
     write()
 }
 
-/// Like [`with_code_lock`], but returns `None` instead of waiting while another
-/// thread holds the lock.
-pub(crate) fn try_with_code_lock<R>(write: impl FnOnce() -> R) -> Option<R> {
-    let _guard = try_hold_code_lock()?;
-    Some(write())
-}
-
 /// Tries to take the process-wide transaction lock without blocking.
 ///
 /// Returns `None` if a transaction currently holds it - including this thread

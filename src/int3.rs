@@ -236,18 +236,6 @@ impl Int3Hook {
         crate::transaction::with_code_lock(|| unsafe { Self::arm(target, detour, gateway) })
     }
 
-    /// Like [`Self::install`], but returns `None` without changing anything
-    /// instead of waiting while another thread holds the transaction lock.
-    pub(crate) unsafe fn try_install(
-        target: *const u8,
-        detour: *const u8,
-    ) -> Option<Result<Self, Int3HookError>> {
-        if target.is_null() || detour.is_null() {
-            return Some(Err(Int3HookError::InvalidParameter));
-        }
-        crate::transaction::try_with_code_lock(|| unsafe { Self::arm(target, detour, None) })
-    }
-
     /// Publishes a slot for `target` and patches its entry byte. The caller holds
     /// the code lock.
     unsafe fn arm(
