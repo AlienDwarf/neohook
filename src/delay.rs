@@ -511,6 +511,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unload_notification_is_unregistered_with_the_last_hook() {
+        // A module that unloads after removing its delay hooks must not leave
+        // the loader calling into its unmapped notification callback.
+        let hook =
+            unsafe { DelayHook::register("kernel32.dll", "GetTickCount", fake_time as *const u8) }
+                .expect("register");
+        assert!(
+            UNLOAD_NOTIFIED.load(Ordering::Acquire),
+            "notification registered while a delay hook exists"
+        );
+        drop(hook);
+        assert!(
+            !UNLOAD_NOTIFIED.load(Ordering::Acquire),
+            "notification unregistered with the last delay hook"
+        );
+    }
+
     unsafe extern "system" fn fake_tick_count() -> u32 {
         0x1234_5678
     }
