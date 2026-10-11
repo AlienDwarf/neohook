@@ -50,6 +50,11 @@ extern "system" fn mid_target(x: u64) -> u64 {
     std::hint::black_box(x).wrapping_add(1)
 }
 
+#[inline(never)]
+extern "system" fn null_handler_target(x: u64) -> u64 {
+    std::hint::black_box(x).wrapping_mul(3)
+}
+
 static MID_RAN: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "C" fn mid_handler(_ctx: *mut HookContext) {
@@ -697,6 +702,20 @@ fn ffi_midhook_install_runs_handler_and_unhooks() {
         assert!(detours_midhook_install(ptr::null(), handler).is_null());
         assert_eq!(detours_midhook_unhook(ptr::null_mut()), 0);
     }
+}
+
+#[test]
+fn ffi_midhook_install_rejects_null_handler() {
+    // C callers can pass NULL for the handler; it must be rejected instead of
+    // installing a hook that jumps to address zero.
+    let install: unsafe extern "C" fn(*const u8, usize) -> *mut core::ffi::c_void =
+        unsafe { core::mem::transmute(detours_midhook_install as *const ()) };
+    let hook = unsafe { install(null_handler_target as *const u8, 0) };
+    if !hook.is_null() {
+        // Remove the bogus hook before failing so other tests are unaffected.
+        unsafe { detours_midhook_unhook(hook.cast()) };
+    }
+    assert!(hook.is_null(), "a null handler must be rejected");
 }
 
 // --- delay / on-load ---------------------------------------------------------
