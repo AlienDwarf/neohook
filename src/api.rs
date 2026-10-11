@@ -14,9 +14,16 @@ use windows_sys::Win32::Foundation::HMODULE;
 /// A panic unwinding out of an `extern "C"` function aborts the whole host
 /// process. Most of NeoHook's internals return `Result` rather than panicking
 /// (and the relocation engine already contains its own panics), but a deep,
-/// unexpected panic in an engine path - commit, attach, install, teardown - would
-/// otherwise take the host down. Wrapping those entry points converts it into the
-/// function's normal failure value (a null pointer or `0`) instead.
+/// unexpected panic in an engine path would otherwise take the host down.
+/// Wrapping an entry point converts it into the function's normal failure value
+/// (a null pointer or `0`) instead.
+///
+/// The entry points that drive the hooking engine are wrapped: transaction
+/// begin, thread tracking, attach, detach, commit and abort; the hook-handle
+/// toggle and release; VEH, mid-function and INT3 install and unhook; delay-hook
+/// register and unhook; watchdog create, guard, unguard and destroy; and stub
+/// reclamation. Plain accessors and the read-only introspection functions are
+/// not wrapped.
 fn ffi_guard<T>(on_panic: T, body: impl FnOnce() -> T) -> T {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
         Ok(value) => value,
@@ -367,7 +374,9 @@ pub unsafe extern "C" fn detours_code_from_pointer(pointer: *const u8) -> *mut u
 /// Returns a non-null pointer on success.
 #[unsafe(no_mangle)]
 pub extern "C" fn detours_transaction_begin() -> *mut DetourTransaction<'static> {
-    Box::into_raw(Box::new(DetourTransaction::begin()))
+    ffi_guard(std::ptr::null_mut(), || {
+        Box::into_raw(Box::new(DetourTransaction::begin()))
+    })
 }
 
 /// Opens, suspends, and tracks the thread identified by `thread_id`.
@@ -386,12 +395,14 @@ pub unsafe extern "C" fn detours_transaction_update_thread(
     tx: *mut DetourTransaction<'static>,
     thread_id: u32,
 ) -> i32 {
-    if tx.is_null() {
-        return 0;
-    }
+    ffi_guard(0, || {
+        if tx.is_null() {
+            return 0;
+        }
 
-    let tx_ref = unsafe { &mut *tx };
-    tx_ref.update_thread(thread_id).map(|_| 1).unwrap_or(0)
+        let tx_ref = unsafe { &mut *tx };
+        tx_ref.update_thread(thread_id).map(|_| 1).unwrap_or(0)
+    })
 }
 
 /// Attaches an inline detour to the given transaction.
@@ -588,7 +599,7 @@ pub unsafe extern "C" fn detours_handle_set_enabled(
     idx: usize,
     enabled: i32,
 ) -> i32 {
-    unsafe {
+    ffi_guard(0, || unsafe {
         with_handle_slot(handle, idx, 0, |hook| {
             let result = if enabled != 0 {
                 hook.enable()
@@ -597,7 +608,7 @@ pub unsafe extern "C" fn detours_handle_set_enabled(
             };
             result.map(|_| 1).unwrap_or(0)
         })
-    }
+    })
 }
 
 /// Returns `1` if the hook at `idx` is currently enabled, `0` otherwise (also
@@ -789,17 +800,19 @@ pub unsafe extern "C" fn detours_transaction_attach_vtable_instance(
 pub unsafe extern "C" fn detours_transaction_update_all_threads(
     tx: *mut DetourTransaction<'static>,
 ) -> i32 {
-    if tx.is_null() {
-        return 0;
-    }
+    ffi_guard(0, || {
+        if tx.is_null() {
+            return 0;
+        }
 
-    let tx_ref = unsafe { &mut *tx };
-    if tx_ref.inner.is_none() {
-        return 0;
-    }
+        let tx_ref = unsafe { &mut *tx };
+        if tx_ref.inner.is_none() {
+            return 0;
+        }
 
-    tx_ref.update_all_threads();
-    1
+        tx_ref.update_all_threads();
+        1
+    })
 }
 
 /// Aborts the given transaction, discarding all pending hooks and resuming any
@@ -813,13 +826,15 @@ pub unsafe extern "C" fn detours_transaction_update_all_threads(
 /// function and it must not be used again afterwards.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn detours_transaction_abort(tx: *mut DetourTransaction<'static>) -> i32 {
-    if tx.is_null() {
-        return 0;
-    }
+    ffi_guard(0, || {
+        if tx.is_null() {
+            return 0;
+        }
 
-    let mut tx_box = unsafe { Box::from_raw(tx) };
-    tx_box.abort();
-    1
+        let mut tx_box = unsafe { Box::from_raw(tx) };
+        tx_box.abort();
+        1
+    })
 }
 
 // ----------------- FFI Entry Points: Module / PE Introspection -----------------
@@ -1512,13 +1527,15 @@ pub unsafe extern "C" fn detours_veh_original(hook: *const crate::veh::VehHook) 
 /// and must not be used afterwards.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn detours_veh_unhook(hook: *mut crate::veh::VehHook) -> i32 {
-    if hook.is_null() {
-        return 0;
-    }
-    let hook = unsafe { Box::from_raw(hook) };
-    // Dropping the box clears the breakpoint via RAII; be explicit for clarity.
-    let _ = hook.unhook();
-    1
+    ffi_guard(0, || {
+        if hook.is_null() {
+            return 0;
+        }
+        let hook = unsafe { Box::from_raw(hook) };
+        // Dropping the box clears the breakpoint via RAII; be explicit for clarity.
+        let _ = hook.unhook();
+        1
+    })
 }
 
 // ----------------- FFI Entry Points: mid-function detours --------------------
@@ -1585,13 +1602,15 @@ pub unsafe extern "C" fn detours_midhook_install(
 /// `detours_midhook_install` and must not be used afterwards.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn detours_midhook_unhook(hook: *mut crate::midhook::MidHook) -> i32 {
-    if hook.is_null() {
-        return 0;
-    }
-    let hook = unsafe { Box::from_raw(hook) };
-    // Dropping the box restores the original bytes via RAII; be explicit.
-    let _ = hook.unhook();
-    1
+    ffi_guard(0, || {
+        if hook.is_null() {
+            return 0;
+        }
+        let hook = unsafe { Box::from_raw(hook) };
+        // Dropping the box restores the original bytes via RAII; be explicit.
+        let _ = hook.unhook();
+        1
+    })
 }
 
 // ----------------- FFI Entry Points: INT3 software-breakpoint hooking --------
@@ -1674,13 +1693,15 @@ pub unsafe extern "C" fn detours_int3_original(hook: *const crate::int3::Int3Hoo
 /// and must not be used afterwards.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn detours_int3_unhook(hook: *mut crate::int3::Int3Hook) -> i32 {
-    if hook.is_null() {
-        return 0;
-    }
-    let hook = unsafe { Box::from_raw(hook) };
-    // Dropping the box restores the original byte via RAII; be explicit.
-    let _ = hook.unhook();
-    1
+    ffi_guard(0, || {
+        if hook.is_null() {
+            return 0;
+        }
+        let hook = unsafe { Box::from_raw(hook) };
+        // Dropping the box restores the original byte via RAII; be explicit.
+        let _ = hook.unhook();
+        1
+    })
 }
 
 // ----------------- FFI Entry Points: relative-reference resolving ------------
@@ -1744,19 +1765,21 @@ pub unsafe extern "C" fn detours_delay_register(
     func: *const c_char,
     detour: *const u8,
 ) -> *mut crate::delay::DelayHook {
-    if module.is_null() || func.is_null() {
-        return std::ptr::null_mut();
-    }
-    let Ok(module) = (unsafe { CStr::from_ptr(module) }).to_str() else {
-        return std::ptr::null_mut();
-    };
-    let Ok(func) = (unsafe { CStr::from_ptr(func) }).to_str() else {
-        return std::ptr::null_mut();
-    };
-    match unsafe { crate::delay::DelayHook::register(module, func, detour) } {
-        Ok(hook) => Box::into_raw(Box::new(hook)),
-        Err(_) => std::ptr::null_mut(),
-    }
+    ffi_guard(std::ptr::null_mut(), || {
+        if module.is_null() || func.is_null() {
+            return std::ptr::null_mut();
+        }
+        let Ok(module) = (unsafe { CStr::from_ptr(module) }).to_str() else {
+            return std::ptr::null_mut();
+        };
+        let Ok(func) = (unsafe { CStr::from_ptr(func) }).to_str() else {
+            return std::ptr::null_mut();
+        };
+        match unsafe { crate::delay::DelayHook::register(module, func, detour) } {
+            Ok(hook) => Box::into_raw(Box::new(hook)),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
 }
 
 /// Returns `1` if the delay hook's module has been loaded and the hook is now
@@ -1783,12 +1806,14 @@ pub unsafe extern "C" fn detours_delay_is_active(hook: *const crate::delay::Dela
 /// `detours_delay_register` and must not be used afterwards.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn detours_delay_unhook(hook: *mut crate::delay::DelayHook) -> i32 {
-    if hook.is_null() {
-        return 0;
-    }
-    let hook = unsafe { Box::from_raw(hook) };
-    let _ = hook.unhook();
-    1
+    ffi_guard(0, || {
+        if hook.is_null() {
+            return 0;
+        }
+        let hook = unsafe { Box::from_raw(hook) };
+        let _ = hook.unhook();
+        1
+    })
 }
 
 // ----------------- FFI Entry Points: anti-tamper watchdog --------------------
@@ -1821,14 +1846,16 @@ pub unsafe extern "C" fn detours_watchdog_guard(
     target: *const u8,
     len: usize,
 ) -> u64 {
-    if wd.is_null() {
-        return 0;
-    }
-    let wd = unsafe { &*wd };
-    match unsafe { wd.guard(target, len) } {
-        Ok(id) => id.raw(),
-        Err(_) => 0,
-    }
+    ffi_guard(0, || {
+        if wd.is_null() {
+            return 0;
+        }
+        let wd = unsafe { &*wd };
+        match unsafe { wd.guard(target, len) } {
+            Ok(id) => id.raw(),
+            Err(_) => 0,
+        }
+    })
 }
 
 /// Stops guarding the region identified by `id`.
@@ -1843,11 +1870,13 @@ pub unsafe extern "C" fn detours_watchdog_unguard(
     wd: *mut crate::watchdog::Watchdog,
     id: u64,
 ) -> i32 {
-    if wd.is_null() {
-        return 0;
-    }
-    let wd = unsafe { &*wd };
-    wd.unguard(crate::watchdog::GuardId::from_raw(id)) as i32
+    ffi_guard(0, || {
+        if wd.is_null() {
+            return 0;
+        }
+        let wd = unsafe { &*wd };
+        wd.unguard(crate::watchdog::GuardId::from_raw(id)) as i32
+    })
 }
 
 /// Returns how many times the watchdog has rewritten a tampered region since it
@@ -1964,12 +1993,14 @@ pub unsafe extern "C" fn detours_watchdog_set_on_tamper(
 /// `detours_watchdog_create` and must not be used afterwards.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn detours_watchdog_destroy(wd: *mut crate::watchdog::Watchdog) -> i32 {
-    if wd.is_null() {
-        return 0;
-    }
-    // Dropping the box stops and joins the background thread via RAII.
-    drop(unsafe { Box::from_raw(wd) });
-    1
+    ffi_guard(0, || {
+        if wd.is_null() {
+            return 0;
+        }
+        // Dropping the box stops and joins the background thread via RAII.
+        drop(unsafe { Box::from_raw(wd) });
+        1
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2023,7 +2054,9 @@ pub unsafe extern "C" fn detours_cfg_register_valid_target(entry: *const u8) -> 
 /// the memory held by the reclamation quarantine. See [`crate::reclaim`].
 #[unsafe(no_mangle)]
 pub extern "C" fn detours_reclaim() {
-    crate::reclaim::reclaim();
+    ffi_guard((), || {
+        crate::reclaim::reclaim();
+    })
 }
 
 #[cfg(test)]
