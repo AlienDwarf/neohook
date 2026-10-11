@@ -42,10 +42,12 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Mutex, TryLockError};
 
 use windows_sys::Win32::Foundation::HMODULE;
+use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
     GetModuleHandleExW, GetProcAddress,
 };
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use crate::int3::Int3Hook;
 use crate::transaction::{Hook, TransactionCore};
@@ -307,8 +309,25 @@ fn still_installed(target: *const u8, module_base: usize, check_byte: bool) -> b
     if module_base == 0 || module_base_of(target) != Some(module_base) {
         return false;
     }
-    // The image is mapped, so the entry byte is readable.
-    !check_byte || unsafe { std::ptr::read_volatile(target) } == 0xCC
+    !check_byte || read_entry_byte(target) == Some(0xCC)
+}
+
+/// Reads the byte at `target`, or `None` if it is not mapped. The module can be
+/// unloaded by another thread right after its base was looked up, so a plain
+/// read could fault.
+fn read_entry_byte(target: *const u8) -> Option<u8> {
+    let mut byte = 0u8;
+    let mut read = 0usize;
+    let ok = unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            target.cast(),
+            (&mut byte as *mut u8).cast(),
+            1,
+            &mut read,
+        )
+    };
+    (ok != 0 && read == 1).then_some(byte)
 }
 
 /// Base of the loaded module image containing `addr`, if any.
@@ -575,6 +594,28 @@ mod tests {
             !UNLOAD_NOTIFIED.load(Ordering::Acquire),
             "notification unregistered with the last delay hook"
         );
+    }
+
+    #[test]
+    fn stale_check_survives_a_module_unmapped_after_the_lookup() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // The module can be unloaded between finding its base and reading the
+        // entry byte; the read must then fail instead of faulting.
+        let page = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                0x1000,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        } as *mut u8;
+        assert!(!page.is_null());
+        unsafe { *page = 0xCC };
+        assert_eq!(read_entry_byte(page), Some(0xCC));
+        unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) };
+        assert_eq!(read_entry_byte(page), None);
     }
 
     unsafe extern "system" fn fake_tick_count() -> u32 {
