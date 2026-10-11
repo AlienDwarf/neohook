@@ -490,6 +490,63 @@ mod tests {
         }
     }
 
+    /// A target near the bottom of the address space makes the ±2 GB window
+    /// start at 0. Address 0 must never be chosen: `VirtualAlloc(0, ..)` means
+    /// "anywhere" and lands the trampoline out of rel32 range.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn alloc_nearby_low_target_stays_within_rel32_range() {
+        unsafe {
+            let mut target = ptr::null_mut();
+            for base in (0x10000usize..0x100_0000).step_by(0x10000) {
+                target = VirtualAlloc(base as _, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+                    as *mut u8;
+                if !target.is_null() {
+                    break;
+                }
+            }
+            if target.is_null() {
+                eprintln!("no free low page to test with; skipping");
+                return;
+            }
+
+            let tramp = TrampolineAlloc::alloc_nearby(target, 64);
+            let free_ok = VirtualFree(target as _, 0, MEM_RELEASE);
+            let tramp = tramp.expect("expected a nearby trampoline");
+            let distance = (tramp as usize).abs_diff(target as usize);
+            assert_ne!(VirtualFree(tramp as _, 0, MEM_RELEASE), 0);
+            assert_ne!(free_ok, 0, "failed to free target allocation");
+            assert!(
+                distance <= i32::MAX as usize,
+                "trampoline {tramp:p} too far from low target {target:p}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn nearest_aligned_candidate_edge_cases() {
+        use super::nearest_aligned_candidate as cand;
+        const G: usize = 0x10000;
+        const MAX: usize = 0x8000_0000;
+
+        // Free region at the very bottom with a window starting at 0: never 0.
+        assert_eq!(cand(0, G, G, 64, 0, MAX, G), None);
+        assert_eq!(cand(0, 4 * G, 4 * G, 64, 0, MAX, G), Some(3 * G));
+        // Target inside the region: the aligned start at or around it.
+        assert_eq!(cand(G, 8 * G, 3 * G + 5, 64, 0, MAX, G), Some(3 * G));
+        // Target above the region: the highest aligned start that fits.
+        assert_eq!(cand(G, 4 * G, 10 * G, 64, 0, MAX, G), Some(3 * G));
+        // Target below the region: its first aligned start.
+        assert_eq!(cand(2 * G + 1, 8 * G, 0, 64, 0, MAX, G), Some(3 * G));
+        // Region narrower than one alignment step with no aligned start in it.
+        assert_eq!(cand(G + 1, 2 * G - 1, G, 64, 0, MAX, G), None);
+        // Region entirely outside the window.
+        assert_eq!(cand(MAX, MAX + 4 * G, MAX, 64, 0, MAX, G), None);
+        // Size larger than the region.
+        assert_eq!(cand(G, 2 * G, G, 2 * G, 0, MAX, G), None);
+    }
+
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn align_up_works() {
