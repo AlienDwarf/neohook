@@ -51,6 +51,18 @@ mod imp_x86 {
     ) {
     }
 
+    /// No table-based unwinding on x86.
+    pub(crate) unsafe fn register_codes(
+        _region: *mut u8,
+        _area_offset: usize,
+        _begin: usize,
+        _end: usize,
+        _prolog_size: u8,
+        _frame: u8,
+        _slots: &[u16],
+    ) {
+    }
+
     pub(crate) fn suspend(_bases: &[usize]) {}
 
     pub(crate) fn settle(_bases: &[usize], _still_busy: &[usize]) {}
@@ -128,9 +140,39 @@ mod imp {
         let Some(codes) = (unsafe { translate(target, mapping, stolen_len) }) else {
             return;
         };
+        unsafe {
+            register_codes(
+                region,
+                area_offset,
+                code_offset,
+                code_offset + mapping.written_len,
+                codes.prolog_size,
+                codes.frame,
+                &codes.slots,
+            )
+        };
+    }
+
+    /// Writes unwind data for the code at `[region + begin, region + end)` -
+    /// `slots` in the unwinder's order, the prologue size and the frame
+    /// register byte - at `region + area_offset` and registers it.
+    ///
+    /// # Safety
+    ///
+    /// `region` must be a live stub allocation, writable for
+    /// `area_offset + UNWIND_AREA` bytes.
+    pub(crate) unsafe fn register_codes(
+        region: *mut u8,
+        area_offset: usize,
+        begin: usize,
+        end: usize,
+        prolog_size: u8,
+        frame: u8,
+        slots: &[u16],
+    ) {
         let info_offset = area_offset + std::mem::size_of::<IMAGE_RUNTIME_FUNCTION_ENTRY>();
-        let info_len = 4 + codes.slots.len().next_multiple_of(2) * 2;
-        if info_offset - area_offset + info_len > UNWIND_AREA {
+        let info_len = 4 + slots.len().next_multiple_of(2) * 2;
+        if info_offset - area_offset + info_len > UNWIND_AREA || slots.len() > u8::MAX as usize {
             return;
         }
 
@@ -139,21 +181,21 @@ mod imp {
             // Version 1, no flags: handlers and epilogue descriptions belong to
             // the original function, not to the stub.
             info.write(1);
-            info.add(1).write(codes.prolog_size);
-            info.add(2).write(codes.slots.len() as u8);
-            info.add(3).write(codes.frame);
-            let slots = info.add(4) as *mut u16;
-            for (i, slot) in codes.slots.iter().enumerate() {
-                slots.add(i).write_unaligned(*slot);
+            info.add(1).write(prolog_size);
+            info.add(2).write(slots.len() as u8);
+            info.add(3).write(frame);
+            let out = info.add(4) as *mut u16;
+            for (i, slot) in slots.iter().enumerate() {
+                out.add(i).write_unaligned(*slot);
             }
-            if codes.slots.len() % 2 == 1 {
-                slots.add(codes.slots.len()).write_unaligned(0);
+            if slots.len() % 2 == 1 {
+                out.add(slots.len()).write_unaligned(0);
             }
 
             let entry = region.add(area_offset) as *mut IMAGE_RUNTIME_FUNCTION_ENTRY;
             entry.write(std::mem::zeroed());
-            (*entry).BeginAddress = code_offset as u32;
-            (*entry).EndAddress = (code_offset + mapping.written_len) as u32;
+            (*entry).BeginAddress = begin as u32;
+            (*entry).EndAddress = end as u32;
             (*entry).Anonymous.UnwindData = info_offset as u32;
 
             if RtlAddFunctionTable(entry, 1, region as u64) {

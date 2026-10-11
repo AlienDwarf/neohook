@@ -255,8 +255,12 @@ impl MidHook {
         // Reserve the context-bridge stub near the target so the inline patch
         // can reach it with a compact relative jump.
         let stub = unsafe {
-            TrampolineAlloc::alloc_nearby_trampoline(target, STUB_CAPACITY)
-                .ok_or(DetourError::AllocationFailed)?
+            // The unwind data follows the code (see crate::unwind).
+            TrampolineAlloc::alloc_nearby_trampoline(
+                target,
+                STUB_CAPACITY + crate::unwind::UNWIND_AREA,
+            )
+            .ok_or(DetourError::AllocationFailed)?
         };
 
         let mut tx = TransactionCore::begin();
@@ -275,12 +279,24 @@ impl MidHook {
 
         // The stub is private memory not yet referenced by anything, so it is
         // safe to fill in while threads are suspended and before the commit.
-        let stub_bytes = build_stub(stub.ptr, handler_addr, gateway);
-        if stub_bytes.len() > stub.size {
+        let built = build_stub(target, handler_addr, gateway);
+        let stub_bytes = built.bytes;
+        if stub_bytes.len() > STUB_CAPACITY {
             return Err(DetourError::AllocationFailed);
         }
         unsafe {
             std::ptr::copy_nonoverlapping(stub_bytes.as_ptr(), stub.ptr, stub_bytes.len());
+            if let Some(unwind) = &built.unwind {
+                crate::unwind::register_codes(
+                    stub.ptr,
+                    STUB_CAPACITY,
+                    0,
+                    unwind.end,
+                    unwind.prolog_size,
+                    unwind.frame,
+                    &unwind.slots,
+                );
+            }
             windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache(
                 windows_sys::Win32::System::Threading::GetCurrentProcess(),
                 stub.ptr as _,
@@ -344,6 +360,25 @@ impl MidHook {
 // thread holding the hook; mirror the rest of the crate by not auto-deriving
 // Send/Sync (callers move the guard into their own synchronization).
 
+/// A built context-bridge stub.
+struct Stub {
+    bytes: Vec<u8>,
+    /// Its unwind description (x64 only).
+    unwind: Option<StubUnwind>,
+}
+
+/// Unwind codes for an x64 stub, in the order the unwinder reads them (last
+/// prologue instruction first).
+#[cfg_attr(target_arch = "x86", allow(dead_code))]
+struct StubUnwind {
+    slots: Vec<u16>,
+    prolog_size: u8,
+    /// `FrameRegister | FrameOffset << 4`.
+    frame: u8,
+    /// Offset just past the code the unwind data covers.
+    end: usize,
+}
+
 /// Emits the context-bridge stub: snapshot the SSE state (XMM + MXCSR) and all
 /// GPRs + flags, call `handler` with a pointer to that block, restore the
 /// (possibly modified) state, then jump either to `gateway` (which runs the
@@ -359,17 +394,31 @@ impl MidHook {
 /// `movups` is used so the stack need not be 16-byte aligned for the spill.
 ///
 /// After the handler returns, the stub overwrites the `redirect_rip` slot with
-/// the chosen target (`redirect_rip` if non-zero, else `gateway`); that slot is
-/// the very top of the frame, so once the registers are restored `rsp` lands on
-/// it and a single indirect `jmp` transfers control.
+/// the chosen target (`redirect_rip` if non-zero, else `gateway`); once the
+/// registers are restored `rsp` lands on it and a single indirect `jmp`
+/// transfers control.
+///
+/// Above the redirect slot the stub first stores `site`, the hooked address,
+/// where a called function would have its return address. The stub is
+/// entered by a jump, so nothing else marks where it came from; with that slot
+/// and the unwind codes recorded alongside the prologue, an unwind that starts
+/// in the handler continues in the hooked function at `site`. The codes end in
+/// `rbp` as the frame pointer, since the stub aligns `rsp` for the call.
 #[cfg(target_arch = "x86_64")]
-fn build_stub(stub_addr: *mut u8, handler: *const u8, gateway: *mut u8) -> Vec<u8> {
-    let _ = stub_addr; // x64 stub is position-independent.
+fn build_stub(site: *const u8, handler: *const u8, gateway: *mut u8) -> Stub {
     let mut c = Vec::with_capacity(STUB_CAPACITY);
+    // (offset just past the instruction, unwind op | op info << 4), in
+    // prologue order.
+    let mut unwind: Vec<(usize, u16)> = Vec::new();
+    const UWOP_PUSH_NONVOL: u16 = 0;
+    const UWOP_ALLOC_SMALL: u16 = 2;
+    const UWOP_SET_FPREG: u16 = 3;
+    let alloc = |bytes: u16| UWOP_ALLOC_SMALL | ((bytes / 8 - 1) << 4);
 
     // lea rsp,[rsp-16] ; movups [rsp], xmmN   (REX.R for xmm8..15).
-    let save_xmm = |c: &mut Vec<u8>, n: u8| {
+    let save_xmm = |c: &mut Vec<u8>, unwind: &mut Vec<(usize, u16)>, n: u8| {
         c.extend_from_slice(&[0x48, 0x8D, 0x64, 0x24, 0xF0]); // lea rsp, [rsp - 16]
+        unwind.push((c.len(), alloc(16)));
         if n >= 8 {
             c.push(0x44); // REX.R
         }
@@ -384,49 +433,55 @@ fn build_stub(stub_addr: *mut u8, handler: *const u8, gateway: *mut u8) -> Vec<u
         c.extend_from_slice(&[0x48, 0x8D, 0x64, 0x24, 0x10]); // lea rsp, [rsp + 16]
     };
 
+    // Where a return address would be: the hooked site, for unwinding. r11
+    // carries it without touching the flags and is restored by the exchange.
+    c.extend_from_slice(&[0x41, 0x53]); // push r11
+    c.extend_from_slice(&[0x49, 0xBB]); // mov r11, imm64
+    c.extend_from_slice(&(site as u64).to_le_bytes());
+    c.extend_from_slice(&[0x4C, 0x87, 0x1C, 0x24]); // xchg [rsp], r11
+
     // Every stack adjustment outside the pushfq/popfq window uses `lea`, which
     // leaves the flags alone; `sub`/`add` would clobber them on the way in and out.
     // Reserve and zero the redirect slot at the very top of the frame. The
     // handler sees it as `HookContext::redirect_rip` (0 == "do not redirect");
     // after the handler returns this slot holds the address the stub jumps to.
     c.extend_from_slice(&[0x48, 0x8D, 0x64, 0x24, 0xF8]); // lea rsp, [rsp - 8]
+    unwind.push((c.len(), alloc(8)));
     c.extend_from_slice(&[0x48, 0xC7, 0x04, 0x24, 0x00, 0x00, 0x00, 0x00]); // mov qword [rsp], 0
 
     // --- save: xmm15..xmm0 (xmm0 ends lowest), MXCSR, GPRs, flags last ---
     for n in (0..16u8).rev() {
-        save_xmm(&mut c, n);
+        save_xmm(&mut c, &mut unwind, n);
     }
     c.extend_from_slice(&[0x48, 0x8D, 0x64, 0x24, 0xF8]); // lea rsp, [rsp - 8]   (mxcsr + 4 pad bytes)
+    unwind.push((c.len(), alloc(8)));
     c.extend_from_slice(&[0x0F, 0xAE, 0x1C, 0x24]); // stmxcsr [rsp]
-    c.extend_from_slice(&[
-        0x41, 0x57, // push r15
-        0x41, 0x56, // push r14
-        0x41, 0x55, // push r13
-        0x41, 0x54, // push r12
-        0x41, 0x53, // push r11
-        0x41, 0x52, // push r10
-        0x41, 0x51, // push r9
-        0x41, 0x50, // push r8
-        0x57, // push rdi
-        0x56, // push rsi
-        0x55, // push rbp
-        0x53, // push rbx
-        0x52, // push rdx
-        0x51, // push rcx
-        0x50, // push rax
-        0x9C, // pushfq
-    ]);
+    // push r15 .. r8, then rdi, rsi, rbp, rbx, rdx, rcx, rax (register numbers).
+    for reg in [15u8, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 3, 2, 1, 0] {
+        if reg >= 8 {
+            c.push(0x41); // REX.B
+        }
+        c.push(0x50 | (reg & 7)); // push reg
+        unwind.push((c.len(), UWOP_PUSH_NONVOL | ((reg as u16) << 4)));
+    }
+    c.push(0x9C); // pushfq
+    unwind.push((c.len(), alloc(8)));
     c.push(0xFC); // cld  (the ABI requires DF=0 at calls; popfq restores it)
 
     // --- call handler(&context) ---
     c.extend_from_slice(&[0x48, 0x89, 0xE1]); // mov rcx, rsp   (arg1 = &context)
     c.extend_from_slice(&[0x48, 0x89, 0xE5]); // mov rbp, rsp   (rbp is callee-saved: survives the call)
+    unwind.push((c.len(), UWOP_SET_FPREG));
+    let prolog_size = c.len();
     c.extend_from_slice(&[0x48, 0x83, 0xE4, 0xF0]); // and rsp, -16  (16-byte align for the call)
     c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]); // sub rsp, 32   (Win64 shadow space)
     c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
     c.extend_from_slice(&(handler as u64).to_le_bytes());
     c.extend_from_slice(&[0xFF, 0xD0]); // call rax
     c.extend_from_slice(&[0x48, 0x89, 0xEC]); // mov rsp, rbp  (back to the context block)
+    // The unwind data covers the stub up to here, the handler's return
+    // address included; past it the frame is taken apart.
+    let unwind_end = c.len();
 
     // --- pick the jump target: redirect_rip if the handler set it, else gateway ---
     // redirect_rip lives at the top of the frame, offset 392 from the context
@@ -466,17 +521,33 @@ fn build_stub(stub_addr: *mut u8, handler: *const u8, gateway: *mut u8) -> Vec<u
         restore_xmm(&mut c, n);
     }
     // After the XMM reloads rsp points at the redirect slot (= the chosen
-    // target). Drop it back to the entry rsp and jump through it. Using an
-    // indirect `jmp` (not `ret`) keeps the CET shadow stack intact; the operand
-    // sits 8 bytes below rsp only for this single instruction.
-    c.extend_from_slice(&[0x48, 0x8D, 0x64, 0x24, 0x08]); // lea rsp, [rsp + 8]   (rsp = entry rsp)
-    c.extend_from_slice(&[0xFF, 0x64, 0x24, 0xF8]); // jmp qword [rsp - 8]
+    // target), with the site slot above it. Drop both, back to the entry rsp,
+    // and jump through the redirect slot. Using an indirect `jmp` (not `ret`)
+    // keeps the CET shadow stack intact; the operand sits 16 bytes below rsp
+    // only for this single instruction.
+    c.extend_from_slice(&[0x48, 0x8D, 0x64, 0x24, 0x10]); // lea rsp, [rsp + 16]   (rsp = entry rsp)
+    c.extend_from_slice(&[0xFF, 0x64, 0x24, 0xF0]); // jmp qword [rsp - 16]
 
-    c
+    // The unwinder reads the codes last instruction first.
+    let slots = unwind
+        .iter()
+        .rev()
+        .map(|&(offset, op)| (op << 8) | offset as u16)
+        .collect();
+    Stub {
+        bytes: c,
+        unwind: Some(StubUnwind {
+            slots,
+            prolog_size: prolog_size as u8,
+            // rbp (5) is the frame register, at offset 0 from rsp.
+            frame: 5,
+            end: unwind_end,
+        }),
+    }
 }
 
 #[cfg(target_arch = "x86")]
-fn build_stub(stub_addr: *mut u8, handler: *const u8, gateway: *mut u8) -> Vec<u8> {
+fn build_stub(site: *const u8, handler: *const u8, gateway: *mut u8) -> Stub {
     let mut c = Vec::with_capacity(STUB_CAPACITY);
 
     // lea esp,[esp-16] ; movups [esp], xmmN
@@ -545,9 +616,12 @@ fn build_stub(stub_addr: *mut u8, handler: *const u8, gateway: *mut u8) -> Vec<u
     c.extend_from_slice(&[0x8D, 0x64, 0x24, 0x08]); // lea esp, [esp + 8]   (esp = entry esp)
     c.extend_from_slice(&[0xFF, 0x64, 0x24, 0xF8]); // jmp dword [esp - 8]
 
-    let _ = stub_addr; // position-independent now; kept for signature symmetry.
-
-    c
+    // x86 unwinds through frame chains, not tables: no unwind data.
+    let _ = site;
+    Stub {
+        bytes: c,
+        unwind: None,
+    }
 }
 
 #[cfg(test)]
@@ -557,10 +631,11 @@ mod tests {
     #[test]
     fn stub_fits_within_capacity() {
         let bytes = build_stub(
-            0x1000 as *mut u8,
+            0x1000 as *const u8,
             0xDEAD_BEEF as *const u8,
             0x2000 as *mut u8,
-        );
+        )
+        .bytes;
         assert!(
             bytes.len() <= STUB_CAPACITY,
             "stub ({} bytes) must fit in the reserved buffer",
@@ -574,7 +649,12 @@ mod tests {
     fn x64_stub_embeds_handler_and_gateway() {
         let handler = 0x1122_3344_5566_7788u64;
         let gateway = 0x99AA_BBCC_DDEE_FF00u64;
-        let bytes = build_stub(0x4000 as *mut u8, handler as *const u8, gateway as *mut u8);
+        let bytes = build_stub(
+            0x4000 as *const u8,
+            handler as *const u8,
+            gateway as *mut u8,
+        )
+        .bytes;
 
         // The handler appears as an imm64 after `mov rax, imm64` (48 B8); the
         // gateway after `movabs rcx, imm64` (48 B9). Neither pair occurs in the
@@ -593,13 +673,13 @@ mod tests {
         let gw = u64::from_le_bytes(bytes[movabs_rcx + 2..movabs_rcx + 10].try_into().unwrap());
         assert_eq!(gw, gateway);
 
-        // The stub ends with `lea rsp, [rsp + 8]` then an indirect `jmp [rsp - 8]`
-        // (FF 64 24 F8) - a jmp, never a `ret`, to keep the CET shadow stack
-        // intact.
+        // The stub ends with `lea rsp, [rsp + 16]` then an indirect
+        // `jmp [rsp - 16]` (FF 64 24 F0) - a jmp, never a `ret`, to keep the
+        // CET shadow stack intact.
         assert_eq!(
             &bytes[bytes.len() - 4..],
-            &[0xFF, 0x64, 0x24, 0xF8],
-            "stub tail must be jmp qword [rsp-8]"
+            &[0xFF, 0x64, 0x24, 0xF0],
+            "stub tail must be jmp qword [rsp-16]"
         );
         assert!(!bytes.contains(&0xC3), "stub must not contain a ret (0xC3)");
 
@@ -671,10 +751,11 @@ mod tests {
     fn x86_stub_redirects_through_slot_without_ret() {
         let gateway = 0x0050_0000u32;
         let bytes = build_stub(
-            0x0040_0000 as *mut u8,
+            0x0040_0000 as *const u8,
             0xCAFE as *const u8,
             gateway as *mut u8,
-        );
+        )
+        .bytes;
 
         // First op reserves the 8-byte redirect slot (lea esp, [esp - 8]).
         assert_eq!(
