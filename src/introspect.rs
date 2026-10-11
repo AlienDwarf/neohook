@@ -22,6 +22,10 @@ const IMAGE_ORDINAL_FLAG: usize = 0x8000_0000;
 #[cfg(target_arch = "x86_64")]
 const IMAGE_ORDINAL_FLAG: usize = 1usize << 63;
 
+// How many times `enumerate_modules` retries a snapshot that raced a module
+// load or unload.
+const SNAPSHOT_ATTEMPTS: usize = 10;
+
 /// A module loaded in the current process.
 #[derive(Clone, Debug)]
 pub struct ModuleInfo {
@@ -67,8 +71,15 @@ pub fn enumerate_modules() -> Vec<ModuleInfo> {
 
     // Snapshot the modules of the current process (pid 0 == self). Both the
     // native and 32-bit module lists are requested so a WoW64 process sees all
-    // of its modules.
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, 0) };
+    // of its modules. The snapshot fails with ERROR_BAD_LENGTH while another
+    // thread is loading or unloading a module, so retry a bounded number of times.
+    let mut snapshot = INVALID_HANDLE_VALUE;
+    for _ in 0..SNAPSHOT_ATTEMPTS {
+        snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, 0) };
+        if snapshot != INVALID_HANDLE_VALUE || unsafe { GetLastError() } != ERROR_BAD_LENGTH {
+            break;
+        }
+    }
     if snapshot == INVALID_HANDLE_VALUE {
         return modules;
     }
