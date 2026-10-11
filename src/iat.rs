@@ -95,7 +95,6 @@ struct ModuleImage {
     /// Validated base/size view, shared with the generic PE helpers.
     image: PeImage,
     import_dir_rva: usize,
-    import_dir_size: usize,
 }
 
 pub struct IatHook;
@@ -206,17 +205,15 @@ unsafe fn parse_loaded_module(h_module: HMODULE) -> Result<ModuleImage, Internal
     // already bounds the data directory lookup below to the image size.
     let image = pe::parse_module_image(h_module)?;
 
-    // Get the Import Directory entry from the Data Directory. `data_directory`
-    // returns `None` when the directory is absent, empty, or extends beyond the
-    // image bounds, all of which mean there is no usable import table.
-    let (import_dir_rva, import_dir_size) =
-        pe::data_directory(&image, IMAGE_DIRECTORY_ENTRY_IMPORT as usize)
-            .ok_or(InternalIatHookError::NoImportDirectory)?;
+    // Get the Import Directory RVA from the Data Directory. Its `Size` is not
+    // used: the loader walks descriptors up to the zero terminator, so an
+    // understated size must not hide later DLLs.
+    let import_dir_rva = pe::data_directory_rva(&image, IMAGE_DIRECTORY_ENTRY_IMPORT as usize)
+        .ok_or(InternalIatHookError::NoImportDirectory)?;
 
     Ok(ModuleImage {
         image,
         import_dir_rva,
-        import_dir_size,
     })
 }
 
@@ -233,18 +230,9 @@ unsafe fn find_import_thunk(
     // Its error is reported only if no later descriptor has the import.
     let mut not_found = InternalIatHookError::TargetNotFound;
 
-    // Calculate the end RVA of the import directory
-    let desc_end = image
-        .import_dir_rva
-        .checked_add(image.import_dir_size)
-        .ok_or(InternalIatHookError::MalformedImportDirectory)?;
-
-    // Loop through the IMAGE_IMPORT_DESCRIPTORs until we find the target DLL or reach the end
-    while desc_rva
-        .checked_add(std::mem::size_of::<IMAGE_IMPORT_DESCRIPTOR>())
-        .ok_or(InternalIatHookError::MalformedImportDirectory)?
-        <= desc_end
-    {
+    // Loop through the IMAGE_IMPORT_DESCRIPTORs until we find the target DLL or
+    // reach the zero terminator. A descriptor outside the image ends the walk.
+    loop {
         // Get a pointer to the current IMAGE_IMPORT_DESCRIPTOR
         let import_desc = pe::rva_to_ptr::<IMAGE_IMPORT_DESCRIPTOR>(&image.image, desc_rva)
             .ok_or(InternalIatHookError::MalformedImportDirectory)?;
@@ -278,8 +266,6 @@ unsafe fn find_import_thunk(
             .checked_add(std::mem::size_of::<IMAGE_IMPORT_DESCRIPTOR>())
             .ok_or(InternalIatHookError::MalformedImportDirectory)?;
     }
-
-    Err(InternalIatHookError::MalformedImportDirectory)
 }
 
 /// Searches the import name table of one descriptor for `target_func` and

@@ -226,8 +226,9 @@ pub unsafe fn enumerate_imports(h_module: HMODULE) -> Result<Vec<ImportInfo>, Pe
 
     let mut imports = Vec::new();
 
-    let Some((import_rva, _import_size)) =
-        pe::data_directory(&image, IMAGE_DIRECTORY_ENTRY_IMPORT as usize)
+    // The descriptor array ends at its zero terminator, not at the directory
+    // `Size`; each descriptor read below is bounded by the image instead.
+    let Some(import_rva) = pe::data_directory_rva(&image, IMAGE_DIRECTORY_ENTRY_IMPORT as usize)
     else {
         return Ok(imports);
     };

@@ -194,6 +194,29 @@ pub fn data_directory(image: &ModuleImage, entry_index: usize) -> Option<(usize,
     Some((rva, size))
 }
 
+/// Returns the RVA of the requested Data Directory entry, ignoring its `Size`.
+///
+/// For directories such as imports, which are walked up to a terminating
+/// entry, the loader does not rely on `Size` and linkers may understate it.
+/// Returns `None` when the directory is absent or starts outside the image.
+pub fn data_directory_rva(image: &ModuleImage, entry_index: usize) -> Option<usize> {
+    let dos = image.base_address as *const IMAGE_DOS_HEADER;
+    let e_lfanew = unsafe { (*dos).e_lfanew } as usize;
+    let nt = (image.base_address + e_lfanew) as *const IMAGE_NT_HEADERS;
+
+    let number_of_dirs = unsafe { (*nt).OptionalHeader.NumberOfRvaAndSizes as usize };
+    if number_of_dirs <= entry_index {
+        return None;
+    }
+
+    let rva = unsafe { (*nt).OptionalHeader.DataDirectory[entry_index] }.VirtualAddress as usize;
+    if rva == 0 || rva >= image.size {
+        return None;
+    }
+
+    Some(rva)
+}
+
 /// Translates an RVA into a `*const T`, ensuring the whole `T` lies inside the
 /// image bounds.
 pub fn rva_to_ptr<T>(image: &ModuleImage, rva: usize) -> Option<*const T> {
