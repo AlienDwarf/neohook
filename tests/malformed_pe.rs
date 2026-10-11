@@ -6,7 +6,7 @@
 //! before being fixed run in a child process so a crash is reported as a
 //! failure instead of taking down the test run.
 
-use neohook::{DetourError, DetourTransaction, IatHookError, get_module_size};
+use neohook::{DetourError, DetourTransaction, IatHookError, enumerate_exports, get_module_size};
 use std::process::{Command, Stdio};
 use windows_sys::Win32::Foundation::HMODULE;
 use windows_sys::Win32::System::Diagnostics::Debug::*;
@@ -92,6 +92,12 @@ impl FakeImage {
         unsafe { self.base.add(NT_OFFSET) }.cast()
     }
 
+    fn set_directory(&self, index: u16, rva: usize, size: usize) {
+        let dir = &mut unsafe { &mut *self.nt() }.OptionalHeader.DataDirectory[index as usize];
+        dir.VirtualAddress = rva as u32;
+        dir.Size = size as u32;
+    }
+
     fn write<T>(&self, rva: usize, value: T) {
         assert!(rva + std::mem::size_of::<T>() <= IMAGE_SIZE);
         unsafe { self.base.add(rva).cast::<T>().write_unaligned(value) };
@@ -151,5 +157,39 @@ fn get_module_size_rejects_malformed_headers() {
         let image = FakeImage::new();
         unsafe { (*image.nt()).OptionalHeader.Magic = !IMAGE_OPTIONAL_MAGIC };
         assert_eq!(get_module_size(image.handle()), 0, "wrong optional magic");
+    });
+}
+
+const EXPORT_DIR: usize = 0x400;
+const EXPORT_FUNCTIONS: usize = 0x500;
+
+/// Adds an export directory with two exported functions and no names.
+fn with_exports(image: &FakeImage, base: u32, number_of_functions: u32) {
+    image.set_directory(IMAGE_DIRECTORY_ENTRY_EXPORT, EXPORT_DIR, 0x28);
+    image.write(EXPORT_DIR + 16, base);
+    image.write(EXPORT_DIR + 20, number_of_functions);
+    image.write(EXPORT_DIR + 28, EXPORT_FUNCTIONS as u32);
+    image.write(EXPORT_FUNCTIONS, 0x600u32);
+    image.write(EXPORT_FUNCTIONS + 4, 0x610u32);
+}
+
+#[test]
+fn enumerate_exports_rejects_oversized_function_table() {
+    in_child("enumerate_exports_rejects_oversized_function_table", || {
+        let image = FakeImage::new();
+        with_exports(&image, 1, u32::MAX);
+        let exports = unsafe { enumerate_exports(image.handle()) }.expect("valid headers");
+        assert!(exports.is_empty(), "table runs past the image");
+    });
+}
+
+#[test]
+fn enumerate_exports_skips_overflowing_ordinals() {
+    in_child("enumerate_exports_skips_overflowing_ordinals", || {
+        let image = FakeImage::new();
+        with_exports(&image, u32::MAX, 2);
+        let exports = unsafe { enumerate_exports(image.handle()) }.expect("valid headers");
+        let ordinals: Vec<u32> = exports.iter().map(|e| e.ordinal).collect();
+        assert_eq!(ordinals, [u32::MAX]);
     });
 }
