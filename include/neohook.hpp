@@ -453,7 +453,8 @@ namespace neohook
          * @brief Queues one hook from an existing HookGuard to be removed on commit.
          *
          * The other hooks in @p guard keep their indices; the removed slot stays
-         * empty and cannot be detached again.
+         * empty and cannot be detached again. @p guard must stay alive and must
+         * not be moved-assigned until this transaction is committed or aborted.
          */
         void detach(HookGuard &guard, size_t index)
         {

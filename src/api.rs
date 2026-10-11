@@ -453,7 +453,10 @@ pub unsafe extern "C" fn detours_transaction_attach(
 /// # Safety
 /// `tx` must be a valid transaction pointer returned by
 /// `detours_transaction_begin()`. `handle` must be a valid handle returned by
-/// `detours_transaction_commit()`.
+/// `detours_transaction_commit()`, and it must stay valid until `tx` is
+/// committed or aborted: freeing it in between (for example with
+/// `detours_handle_unhook_and_free`) leaves the queued detach pointing at freed
+/// memory.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn detours_transaction_detach(
     tx: *mut DetourTransaction<'static>,

@@ -308,7 +308,10 @@ uint8_t *detours_transaction_attach(DetourTransaction *tx, uint8_t *target, cons
  * # Safety
  * `tx` must be a valid transaction pointer returned by
  * `detours_transaction_begin()`. `handle` must be a valid handle returned by
- * `detours_transaction_commit()`.
+ * `detours_transaction_commit()`, and it must stay valid until `tx` is
+ * committed or aborted: freeing it in between (for example with
+ * `detours_handle_unhook_and_free`) leaves the queued detach pointing at freed
+ * memory.
  */
 int32_t detours_transaction_detach(DetourTransaction *tx, void *handle, uintptr_t idx);
 
