@@ -70,11 +70,13 @@
 //!   target that is valid for that stack state (e.g. a same-ABI replacement of
 //!   the function whose entry you hooked, or [`MidHook::resume_address`]).
 //! - General-purpose registers, the flags register, all XMM registers and the
-//!   `MXCSR` word are captured and restored. The legacy **x87** stack registers
-//!   (`st0`-`st7`) and MMX state are **not** snapshotted; if your handler runs
-//!   x87 floating-point code at a site where the interrupted routine has live
-//!   x87 state, that state may be disturbed. Modern code passes floating-point
-//!   and SIMD values in XMM registers, which are fully covered.
+//!   `MXCSR` word are captured and restored. On CPUs with AVX the upper halves
+//!   of the YMM registers are preserved across the handler as well (but not
+//!   exposed in the context). The legacy **x87** stack registers (`st0`-`st7`),
+//!   MMX state and AVX-512 state (`zmm16`-`zmm31`, the upper halves of
+//!   `zmm0`-`zmm15`, the `k` mask registers) are **not** snapshotted; if your
+//!   handler touches them at a site where the interrupted routine has them
+//!   live, that state may be disturbed.
 //! - SSE support is assumed (guaranteed on x86_64, and universal on any x86 CPU
 //!   running a supported Windows version).
 //! - `target` must sit on a real instruction boundary. Patching mid-instruction
@@ -85,9 +87,35 @@ use crate::alloc::{Trampoline, TrampolineAlloc};
 use crate::transaction::{Hook, TransactionCore};
 
 /// Capacity reserved for the generated context-bridge stub. With the XMM /
-/// MXCSR save-restore block and the redirect dispatch the real stub is ~420
-/// bytes on x86_64 and ~180 on x86; this leaves generous headroom.
-const STUB_CAPACITY: usize = 512;
+/// MXCSR save-restore block, the YMM upper-half spill and the redirect dispatch
+/// the real stub is ~790 bytes on x86_64 and ~400 on x86; this leaves
+/// headroom.
+const STUB_CAPACITY: usize = 1024;
+
+/// Emits `vextractf128 [esp/rsp + disp], ymmN, 1` (`insert == false`) or
+/// `vinsertf128 ymmN, ymmN, [esp/rsp + disp], 1` (`insert == true`): spills or
+/// reloads the upper 128 bits of `ymmN`.
+fn ymm_upper(c: &mut Vec<u8>, n: u8, disp: i32, insert: bool) {
+    // Three-byte VEX: inverted R (ymm8..15), no X/B extension, map 0F3A.
+    c.push(0xC4);
+    c.push(if n < 8 { 0xE3 } else { 0x63 });
+    // W0, vvvv = the source register for the insert (unused otherwise), L1, 66.
+    c.push(if insert {
+        ((!n & 0xF) << 3) | 0x05
+    } else {
+        0x7D
+    });
+    c.push(if insert { 0x18 } else { 0x19 });
+    c.push(0x84 | ((n & 7) << 3)); // [rsp + disp32]
+    c.push(0x24);
+    c.extend_from_slice(&disp.to_le_bytes());
+    c.push(0x01); // the upper lane
+}
+
+/// Whether the CPU and OS support AVX, so YMM upper halves exist to preserve.
+fn has_avx() -> bool {
+    std::arch::is_x86_feature_detected!("avx")
+}
 
 /// A 128-bit XMM register, captured for a [`MidHook`] handler.
 ///
@@ -474,10 +502,27 @@ fn build_stub(site: *const u8, handler: *const u8, gateway: *mut u8) -> Stub {
     unwind.push((c.len(), UWOP_SET_FPREG));
     let prolog_size = c.len();
     c.extend_from_slice(&[0x48, 0x83, 0xE4, 0xF0]); // and rsp, -16  (16-byte align for the call)
+    // The handler may clobber the YMM upper halves (any AVX code ends in
+    // `vzeroupper`); the context only holds the lower halves, so spill the
+    // upper ones around the call.
+    let avx = has_avx();
+    if avx {
+        c.extend_from_slice(&[0x48, 0x81, 0xEC, 0x00, 0x01, 0x00, 0x00]); // sub rsp, 256
+        for n in 0..16u8 {
+            ymm_upper(&mut c, n, i32::from(n) * 16, false);
+        }
+    }
     c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]); // sub rsp, 32   (Win64 shadow space)
     c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
     c.extend_from_slice(&(handler as u64).to_le_bytes());
     c.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    if avx {
+        // The lower halves are reloaded from the context below; the legacy
+        // `movups` leaves the upper ones in place.
+        for n in 0..16u8 {
+            ymm_upper(&mut c, n, 32 + i32::from(n) * 16, true);
+        }
+    }
     c.extend_from_slice(&[0x48, 0x89, 0xEC]); // mov rsp, rbp  (back to the context block)
     // The unwind data covers the stub up to here, the handler's return
     // address included; past it the frame is taken apart.
@@ -594,11 +639,28 @@ fn build_stub(site: *const u8, handler: *const u8, gateway: *mut u8) -> Stub {
     c.extend_from_slice(&[0x89, 0xFC]); // mov esp, edi   (the copy sits right above esp)
     c.extend_from_slice(&[0x6A, CONTEXT_DWORDS, 0x59]); // push 44 ; pop ecx
     c.extend_from_slice(&[0xF3, 0xA5]); // rep movsd      (context -> copy; DF is clear)
-    c.push(0x54); // push esp        (arg = &copy)
+    // Spill the YMM upper halves below the copy (see the x64 stub).
+    let avx = has_avx();
+    if avx {
+        c.extend_from_slice(&[0x8D, 0x64, 0x24, 0x80]); // lea esp, [esp - 128]
+        for n in 0..8u8 {
+            ymm_upper(&mut c, n, i32::from(n) * 16, false);
+        }
+        c.extend_from_slice(&[0x8D, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00]); // lea eax, [esp + 128]
+        c.push(0x50); // push eax        (arg = &copy)
+    } else {
+        c.push(0x54); // push esp        (arg = &copy)
+    }
     c.push(0xB8); // mov eax, imm32
     c.extend_from_slice(&(handler as u32).to_le_bytes());
     c.extend_from_slice(&[0xFF, 0xD0]); // call eax
     c.extend_from_slice(&[0x83, 0xC4, 0x04]); // add esp, 4  (cdecl: the caller pops the arg)
+    if avx {
+        for n in 0..8u8 {
+            ymm_upper(&mut c, n, i32::from(n) * 16, true);
+        }
+        c.extend_from_slice(&[0x8D, 0xA4, 0x24, 0x80, 0x00, 0x00, 0x00]); // lea esp, [esp + 128]
+    }
     c.extend_from_slice(&[0x89, 0xE6]); // mov esi, esp
     c.extend_from_slice(&[0x89, 0xDF]); // mov edi, ebx
     c.extend_from_slice(&[0x6A, CONTEXT_DWORDS, 0x59]); // push 44 ; pop ecx

@@ -515,3 +515,54 @@ mod x86_alignment {
         assert_eq!(MISALIGNED.load(Ordering::SeqCst), 0);
     }
 }
+
+/// The handler runs ordinary code, which may end in `vzeroupper` and wipe the
+/// YMM upper halves the interrupted routine still needs.
+mod ymm_upper_halves {
+    use neohook::{HookContext, MidHook};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+
+    unsafe extern "C" fn clobbering_handler(_: *mut HookContext) {
+        unsafe { std::arch::asm!("vzeroupper") };
+    }
+
+    #[test]
+    fn ymm_upper_halves_survive_the_handler() {
+        if !std::arch::is_x86_feature_detected!("avx") {
+            return;
+        }
+        // vmovdqu ymm1, [ecx/rcx] ; 3x nop5 (hooked at +4) ;
+        // vmovdqu [edx/rdx], ymm1 ; vzeroupper ; ret
+        let mut code = vec![0xC5, 0xFE, 0x6F, 0x09];
+        for _ in 0..3 {
+            code.extend_from_slice(&[0x0F, 0x1F, 0x44, 0x00, 0x00]);
+        }
+        code.extend_from_slice(&[0xC5, 0xFE, 0x7F, 0x0A, 0xC5, 0xF8, 0x77, 0xC3]);
+        let page = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            )
+        } as *mut u8;
+        assert!(!page.is_null());
+        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), page, code.len()) };
+
+        #[cfg(target_arch = "x86_64")]
+        let copy: extern "C" fn(*const u8, *mut u8) = unsafe { std::mem::transmute(page) };
+        #[cfg(target_arch = "x86")]
+        let copy: extern "fastcall" fn(*const u8, *mut u8) = unsafe { std::mem::transmute(page) };
+
+        let src: [u8; 32] = std::array::from_fn(|i| i as u8 + 1);
+        let mut dst = [0u8; 32];
+        let hook = unsafe { MidHook::install(page.add(4), clobbering_handler) }.unwrap();
+        copy(src.as_ptr(), dst.as_mut_ptr());
+        hook.unhook().unwrap();
+        assert_eq!(dst, src);
+
+        unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) };
+    }
+}
