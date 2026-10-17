@@ -252,16 +252,20 @@ impl VTableHook {
             .into());
         }
 
+        let previous = unsafe { *slot };
         unsafe {
             *slot = value;
         }
 
         let mut ignored = 0u32;
         if unsafe { VirtualProtect(slot.cast(), slot_size, old_protect, &mut ignored) } == 0 {
-            return Err(map_err(InternalVTableHookError::ProtectFailed(
-                std::io::Error::last_os_error(),
-            ))
-            .into());
+            // Leave the slot as it was, so `enabled` still describes it.
+            let err = std::io::Error::last_os_error();
+            unsafe {
+                *slot = previous;
+            }
+            let _ = unsafe { VirtualProtect(slot.cast(), slot_size, old_protect, &mut ignored) };
+            return Err(map_err(InternalVTableHookError::ProtectFailed(err)).into());
         }
 
         Ok(())
