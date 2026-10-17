@@ -320,11 +320,12 @@ impl VehHook {
             // disarm it, so it must stay.
             mgr.keep_handler = true;
         }
-        SLOT_TARGET[self.slot].store(0, Ordering::Release);
-        SLOT_DETOUR[self.slot].store(0, Ordering::Release);
-
+        // Record the target as retired before clearing the slot, so a trap
+        // reaching the handler in between still matches one of the two.
         let next = RETIRED_NEXT.fetch_add(1, Ordering::Relaxed) % RETIRED_COUNT;
         RETIRED[next].store(self.target as usize, Ordering::Release);
+        SLOT_TARGET[self.slot].store(0, Ordering::Release);
+        SLOT_DETOUR[self.slot].store(0, Ordering::Release);
 
         release_idle_handler(&mut mgr);
     }
