@@ -389,9 +389,13 @@ impl InlineHook {
 impl Drop for InlineHook {
     fn drop(&mut self) {
         with_code_lock(|| {
-            if self.active {
-                // auto unhook when dropped, best effort, ignore errors
-                let _ = self.perform_unhook();
+            // auto unhook when dropped, best effort
+            if self.active && self.perform_unhook().is_err() {
+                // The target still jumps to the detour, which may call the
+                // original through the trampoline: leave both in place, and the
+                // patch registered so no other hook is written over it.
+                self.trampoline.ptr = std::ptr::null_mut();
+                return;
             }
             self.release();
             unregister_managed_gateway(self.trampoline.ptr);
