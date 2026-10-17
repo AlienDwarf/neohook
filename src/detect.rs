@@ -46,7 +46,9 @@
 
 use std::fmt;
 
-use iced_x86::{Code, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind};
+use iced_x86::{
+    Code, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register,
+};
 use windows_sys::Win32::Foundation::{CloseHandle, HMODULE, MAX_PATH};
 use windows_sys::Win32::System::Diagnostics::Debug::{
     CONTEXT, GetThreadContext, IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_EXPORT,
@@ -163,6 +165,15 @@ pub unsafe fn check_function(func: *const u8) -> Result<Option<DetectedHook>, De
     let found = check_code(func)?;
     if found.is_some() {
         return Ok(found);
+    }
+    // An unchanged import thunk (`jmp [__imp_X]`): its slot may be redirected.
+    if let Some(slot) = thunk_slot(func)
+        && let Some(h_module) = module_of(func)
+        && let Some(hook) = unsafe { import_redirects(h_module) }
+            .into_iter()
+            .find(|hook| hook.address == slot)
+    {
+        return Ok(Some(hook));
     }
     // An unchanged jump stub: check where it leads.
     let target = unsafe { crate::detour_code_from_pointer(func) } as *const u8;
@@ -406,6 +417,25 @@ fn is_immediate(kind: OpKind) -> bool {
 }
 
 /// Decodes the live instruction at `at`.
+/// The pointer slot a `jmp [slot]` at `func` jumps through, as import thunks
+/// do (`jmp [rip + __imp_X]` on x64, `jmp [__imp_X]` on x86).
+fn thunk_slot(func: *const u8) -> Option<*const u8> {
+    let instr = decode_live(func)?;
+    if instr.mnemonic() != Mnemonic::Jmp
+        || instr.op0_kind() != OpKind::Memory
+        || instr.memory_index() != Register::None
+    {
+        return None;
+    }
+    if instr.is_ip_rel_memory_operand() {
+        Some(instr.ip_rel_memory_address() as usize as *const u8)
+    } else if instr.memory_base() == Register::None {
+        Some(instr.memory_displacement64() as usize as *const u8)
+    } else {
+        None
+    }
+}
+
 fn decode_live(at: *const u8) -> Option<Instruction> {
     let readable = unsafe { crate::disasm::readable_bytes_from(at) };
     if readable == 0 {

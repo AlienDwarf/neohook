@@ -283,3 +283,32 @@ fn push_ret_destination_is_sign_extended() {
         Some(0xFFFF_FFFF_8000_1000usize as *const u8)
     );
 }
+
+unsafe extern "system" fn sleep_detour(_ms: u32) {}
+
+#[test]
+fn iat_redirect_behind_an_import_thunk_is_reported() {
+    let _guard = serial();
+    // kernel32!Sleep is a `jmp [__imp_Sleep]` thunk into kernelbase.
+    let sleep = neohook::find_function("kernel32.dll", "Sleep").unwrap();
+    let thunk = unsafe { std::slice::from_raw_parts(sleep, 3) };
+    if !(thunk.starts_with(&[0xFF, 0x25]) || thunk.starts_with(&[0x48, 0xFF, 0x25])) {
+        return; // not a thunk on this Windows build
+    }
+    let kernel32 = get_module_handle("kernel32.dll").unwrap();
+    let imports = unsafe { neohook::enumerate_imports(kernel32) }.unwrap();
+    let Some(import) = imports.iter().find(|i| i.name.as_deref() == Some("Sleep")) else {
+        return;
+    };
+
+    let mut tx = DetourTransaction::begin();
+    tx.attach_iat(kernel32, &import.dll, "Sleep", sleep_detour as *const u8)
+        .expect("attach_iat should succeed");
+    let hooks = tx.commit().expect("commit should succeed");
+    let hook = unsafe_check(sleep);
+    drop(hooks);
+
+    let hook = hook.expect("check succeeds").expect("redirect is reported");
+    assert_eq!(hook.kind, DetectedHookKind::ImportRedirect);
+    assert_eq!(hook.destination, Some(sleep_detour as *const u8));
+}
