@@ -555,13 +555,20 @@ unsafe fn restore_quiescent(targets: &[(usize, &[u8])], restored: &mut [bool]) {
             handles.push(h);
         }
 
+        // A thread whose position cannot be read might be inside any region,
+        // so nothing is rewritten this sweep.
+        let mut position_unknown = false;
         for &h in &handles {
-            if let Some(ip) = thread_ip(h) {
-                ips.push(ip);
+            match thread_ip(h) {
+                Some(ip) => ips.push(ip),
+                None => position_unknown = true,
             }
         }
 
         for (&(target, bytes), restored) in targets.iter().zip(restored.iter_mut()) {
+            if position_unknown {
+                break;
+            }
             let end = target.saturating_add(bytes.len());
             if ips.iter().any(|&ip| ip >= target && ip < end) {
                 continue;
