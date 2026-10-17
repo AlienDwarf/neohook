@@ -2172,6 +2172,11 @@ impl TransactionCore {
         let Reserved::Patch(patch) = reserved else {
             return Err(DetourError::InvalidParameter);
         };
+        // An INT3 hook may have been armed since `attach`; arming takes the code
+        // lock, which this commit holds now.
+        if crate::int3::armed_in_range(data.target as usize, data.stolen_len) {
+            return Err(DetourError::InvalidParameter);
+        }
         if patch.len() != data.stolen_len
             || !unsafe { crate::mem::write_code_bytes(data.target, patch.as_ptr(), patch.len()) }
         {
@@ -2936,14 +2941,17 @@ fn unregister_live_patch(target: *mut u8) {
     });
 }
 
-fn overlaps_live_patch(target: *mut u8, len: usize) -> bool {
-    live_patches()
-        .lock()
-        .map(|m| {
-            m.iter()
-                .any(|(&start, &patched)| ranges_overlap(start, patched, target as usize, len))
-        })
-        .unwrap_or(false)
+/// Whether an installed inline or INT3 hook patches a byte in
+/// `[target, target + len)`.
+pub(crate) fn overlaps_live_patch(target: *mut u8, len: usize) -> bool {
+    crate::int3::armed_in_range(target as usize, len)
+        || live_patches()
+            .lock()
+            .map(|m| {
+                m.iter()
+                    .any(|(&start, &patched)| ranges_overlap(start, patched, target as usize, len))
+            })
+            .unwrap_or(false)
 }
 
 /// Whether an installed inline hook patches code starting at `target`.
