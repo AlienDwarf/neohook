@@ -125,7 +125,7 @@ typedef struct DetourTransaction DetourTransaction;
  * Minimum number of bytes compared at a function's start: enough for the
  * longest jump patch (`FF 25` + 8-byte address) plus a hot-patch prefix.
  */
-#define COMPARE_BYTES 16
+#define DETECT_COMPARE_BYTES 16
 
 /**
  * Maximum number of simultaneously installed INT3 hooks.
@@ -180,7 +180,8 @@ typedef struct VehHook VehHook;
  * Created with [`Self::with_interval`], it spawns a thread that wakes every
  * `interval`, compares each guarded region against its snapshot, and - per the
  * active [`WatchMode`] - rewrites or merely reports any that differ. The thread
- * is stopped and joined when the `Watchdog` is dropped.
+ * is stopped and joined when the `Watchdog` is dropped; dropped from its own
+ * tamper callback, it is stopped and exits once the callback returns.
  */
 typedef struct Watchdog Watchdog;
 
