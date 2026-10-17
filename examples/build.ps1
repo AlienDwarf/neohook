@@ -1,3 +1,6 @@
+# Copyright (c) 2026 NeoHook Authors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 <#
 .SYNOPSIS
     Builds (and optionally runs) the C and C++ examples against the NeoHook C ABI.

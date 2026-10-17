@@ -1,3 +1,5 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Demonstrates a closure detour - a hook whose body is a Rust closure that
 // captures environment. No C/C++ hooking library can express this well: their detours
 // must be bare function pointers. The closure receives the original function as

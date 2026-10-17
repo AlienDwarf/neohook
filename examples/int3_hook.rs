@@ -1,3 +1,5 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Demonstrates INT3 software-breakpoint hooking.
 //
 // An INT3 hook patches a single 0xCC byte at the target entry and routes the

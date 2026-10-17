@@ -1,3 +1,5 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Demonstrates the anti-tamper / re-hook watchdog.
 //
 // Some code periodically verifies its own integrity and restores the original

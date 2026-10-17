@@ -1,3 +1,5 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Pattern (signature) scanning and signature-based hook resolution.
 //
 // Many hook targets are unexported or stripped functions whose address moves

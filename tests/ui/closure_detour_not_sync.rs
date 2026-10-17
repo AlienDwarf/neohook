@@ -1,3 +1,5 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // expect: E0277
 use neohook::detour_closure;
 use std::cell::Cell;

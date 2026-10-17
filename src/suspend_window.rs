@@ -1,3 +1,6 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! While a commit holds the other threads suspended it must not wait on any
 //! lock one of them could own: not one of neohook's own mutexes, and not the
 //! process heap lock. Otherwise a thread frozen mid-unhook or mid-allocation

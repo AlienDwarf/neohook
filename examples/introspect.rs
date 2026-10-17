@@ -1,3 +1,5 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Module / PE introspection example.
 //
 // Lists the modules loaded in this process, then shows the entry point and a

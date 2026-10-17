@@ -1,3 +1,5 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Demonstrates resolving relative references found by a signature scan.
 //
 // On x86_64, a sig-scan match usually lands on an instruction that *references*

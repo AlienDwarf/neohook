@@ -1,3 +1,5 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // build.rs
 
 #[cfg(feature = "generate-headers")]
@@ -15,7 +17,7 @@ fn generate_headers() {
 
     // --- Config ---
     let mut base_config = Config {
-    autogen_warning: Some(
+    header: Some(
         "/* 
 Copyright (c) 2026 NeoHook Authors
 SPDX-License-Identifier: MIT OR Apache-2.0

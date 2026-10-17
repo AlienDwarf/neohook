@@ -1,3 +1,6 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /*
  * NeoHook C++ example: mid-function detour with a full register context.
  *

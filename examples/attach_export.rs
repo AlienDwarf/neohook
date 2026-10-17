@@ -1,3 +1,5 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Demonstrates hooking a named export in one call with `attach_export`.
 //
 // Instead of resolving the address yourself (GetModuleHandle + GetProcAddress)
