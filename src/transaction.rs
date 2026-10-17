@@ -519,8 +519,9 @@ impl Drop for IatHook {
 /// detour. Like [`IatHook`], it changes a lookup table rather than the function
 /// body, so code that already cached the resolved address is unaffected.
 ///
-/// On x86_64 an out-of-range detour is reached through a small owned jump stub,
-/// which is released when the hook is dropped or unhooked.
+/// On x86_64 an out-of-range detour is reached through a small jump stub. Its
+/// address may have been handed out by `GetProcAddress`, so the stub is never
+/// freed: once the hook is removed it jumps to the original export.
 #[derive(Debug)]
 pub struct EatHook {
     pub module: HMODULE,
@@ -529,9 +530,9 @@ pub struct EatHook {
     original_rva: u32,
     detour_rva: u32,
     original_ptr: *mut u8,
-    /// Jump stub keeping an out-of-range detour reachable. Only held so its
-    /// `Drop` releases the allocation when the hook goes away.
-    #[allow(dead_code)]
+    /// Jump stub keeping an out-of-range detour reachable. Handed to
+    /// [`Self::retire_stub`] when the hook goes away, never freed.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     stub: Option<crate::alloc::Trampoline>,
     /// Whether this hook still holds the claim on its export slot (see
     /// [`claim_table_slot`]).
@@ -579,7 +580,7 @@ impl EatHook {
     }
 
     /// Unhooks this EAT hook by restoring the original export RVA. The jump stub
-    /// (if any) is released when the guard is dropped.
+    /// (if any) is then pointed at the original export and kept.
     pub fn unhook(mut self) -> Result<(), DetourError> {
         if !self.active {
             return Ok(());
@@ -602,6 +603,18 @@ impl EatHook {
         if restored && self.claimed {
             release_table_slot(self.slot_ptr as usize);
             self.claimed = false;
+            self.retire_stub();
+        }
+    }
+
+    /// Leaks the jump stub, pointed at the original export: addresses resolved
+    /// while the hook was installed lead to the stub, and must keep working.
+    /// Only called once the export slot no longer points at the stub.
+    fn retire_stub(&mut self) {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(stub) = self.stub.take() {
+            unsafe { crate::eat::retarget_abs_jump_stub(stub.ptr, self.original_ptr) };
+            std::mem::forget(stub);
         }
     }
 }
@@ -612,9 +625,12 @@ impl Drop for EatHook {
         // detour stays claimed, so no later hook stacks on it.
         if self.claimed && (!self.active || self.perform_unhook().is_ok()) {
             release_table_slot(self.slot_ptr as usize);
+            self.retire_stub();
         }
-        // `stub` is released here via its own Drop, after the slot no longer
-        // points at it.
+        // A stub the slot may still point at is leaked as it is.
+        if let Some(stub) = self.stub.take() {
+            std::mem::forget(stub);
+        }
     }
 }
 

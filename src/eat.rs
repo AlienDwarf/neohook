@@ -10,6 +10,8 @@
 //! EAT itself) is redirected to the detour. Code that already cached the
 //! resolved address keeps calling the original function, exactly like IAT
 //! hooking, because only the lookup table is changed - not the function body.
+//! Conversely, an address resolved *while* the hook is installed leads to the
+//! detour, and keeps doing so after the unhook on x86 (see below for x86_64).
 //!
 //! ## How the redirect is encoded
 //!
@@ -23,7 +25,9 @@
 //!   target module. When the difference does not fit in a `u32`, NeoHook
 //!   allocates a tiny jump stub within 2 GB *above* the module base and points
 //!   the EAT slot at the stub, which performs an absolute jump to the detour.
-//!   The stub is owned by the installed hook and released when it is unhooked.
+//!   A consumer may have cached the stub's address, so the stub is never
+//!   freed: the unhook points it at the original export instead, and its few
+//!   bytes stay allocated for the life of the process.
 //!
 //! All PE parsing is bounds-checked through [`crate::pe`].
 
@@ -333,6 +337,33 @@ unsafe fn write_abs_jump_stub(src: *mut u8, dst: *const u8) {
         src.add(5).write(0x00);
         std::ptr::copy_nonoverlapping((dst as u64).to_le_bytes().as_ptr(), src.add(6), 8);
     }
+}
+
+/// Points an existing [`write_abs_jump_stub`] thunk at `dst`. The 8-byte target
+/// is replaced with one store, so a thread jumping through the stub at that
+/// moment sees either the old or the new destination.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn retarget_abs_jump_stub(src: *mut u8, dst: *const u8) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+
+    crate::transaction::with_code_lock(|| unsafe {
+        let operand = src.add(6);
+        let mut old = 0u32;
+        if VirtualProtect(operand.cast(), 8, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+            return false;
+        }
+        // Allocation-granular stubs keep the operand inside one cache line,
+        // where an unaligned 8-byte store is a single access.
+        std::ptr::write_unaligned(operand.cast::<u64>(), dst as u64);
+        let mut ignored = 0u32;
+        VirtualProtect(operand.cast(), 8, old, &mut ignored);
+        windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            src as _,
+            14,
+        );
+        true
+    })
 }
 
 /// Signature of `VirtualProtect`, injectable so tests can simulate failures.
