@@ -469,4 +469,36 @@ mod tests {
             .expect("FuncB is in the second descriptor");
         assert_eq!(slot_b as usize, image.0 as usize + 0x3C0);
     }
+
+    extern "C" fn dummy() {}
+
+    #[test]
+    fn slot_write_keeps_a_shared_code_page_executable() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // The import slot shares its page with code (`ret`) another thread runs.
+        let image = FakeImage::two_descriptors_for_one_dll();
+        unsafe {
+            *image.0.add(0x340).cast::<*const u8>() = dummy as *const u8;
+            *image.0.add(0x800) = 0xC3;
+        }
+        let mut old = 0u32;
+        unsafe { VirtualProtect(image.0.cast(), 0x1000, PAGE_EXECUTE_READ, &mut old) };
+
+        static STOP: AtomicBool = AtomicBool::new(false);
+        let code = image.0 as usize + 0x800;
+        let runner = std::thread::spawn(move || {
+            let f: extern "C" fn() = unsafe { std::mem::transmute(code) };
+            while !STOP.load(Ordering::Relaxed) {
+                f();
+            }
+        });
+        let mut current = dummy as *const u8;
+        for _ in 0..20_000u32 {
+            current = unsafe { IatHook::hook_import(image.module(), "fake.dll", "FuncA", current) }
+                .expect("slot write");
+        }
+        STOP.store(true, Ordering::Relaxed);
+        runner.join().expect("code on the page kept running");
+    }
 }
