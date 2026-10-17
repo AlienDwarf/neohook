@@ -137,6 +137,10 @@ pub enum DelayHookError {
     InvalidParameter,
     /// `ntdll!LdrLoadDll` could not be resolved or inline-hooked.
     LdrHookFailed,
+    /// The module is already loaded, but the hook on the export could not be
+    /// installed (for example, it is already hooked or every INT3 slot is in
+    /// use).
+    InstallFailed(crate::int3::Int3HookError),
 }
 
 impl fmt::Display for DelayHookError {
@@ -144,6 +148,7 @@ impl fmt::Display for DelayHookError {
         match self {
             Self::InvalidParameter => write!(f, "invalid delay-hook parameters"),
             Self::LdrHookFailed => write!(f, "failed to hook ntdll!LdrLoadDll"),
+            Self::InstallFailed(e) => write!(f, "failed to hook the loaded export: {e}"),
         }
     }
 }
@@ -174,6 +179,8 @@ impl DelayHook {
     ///   empty.
     /// * [`DelayHookError::LdrHookFailed`] if the one-time `LdrLoadDll` hook could
     ///   not be installed.
+    /// * [`DelayHookError::InstallFailed`] if `module` is already loaded but the
+    ///   hook on `func` could not be installed.
     ///
     /// # Safety
     ///
@@ -280,8 +287,22 @@ unsafe fn register_locked(
 
     // If the module is already loaded, install right away.
     if let Some(target) = resolve_loaded(&pending.module, &pending.func) {
-        pending.hook = unsafe { Int3Hook::install(target, detour) }.ok();
-        pending.module_base = module_base_of(target).unwrap_or(0);
+        match unsafe { install_in_module(target, detour) } {
+            Ok((hook, module_base)) => {
+                pending.hook = Some(hook);
+                pending.module_base = module_base;
+            }
+            Err(e) => {
+                // Nothing was registered: retire the LdrLoadDll hook if no
+                // other request needs it.
+                if mgr.pending.is_empty()
+                    && let Some(hook) = mgr.ldr_hook.take()
+                {
+                    let _ = hook.unhook();
+                }
+                return Err(DelayHookError::InstallFailed(e));
+            }
+        }
     }
 
     mgr.pending.push(pending);
@@ -336,6 +357,18 @@ fn read_entry_byte(target: *const u8) -> Option<u8> {
 }
 
 /// Base of the loaded module image containing `addr`, if any.
+/// Installs the INT3 hook on `target` and returns it with the base of the
+/// module holding it. The base is looked up first: a hook without one would
+/// count as stale and be forgotten with its `0xCC` still in place.
+unsafe fn install_in_module(
+    target: *const u8,
+    detour: *const u8,
+) -> Result<(Int3Hook, usize), crate::int3::Int3HookError> {
+    let module_base = module_base_of(target).ok_or(crate::int3::Int3HookError::InvalidParameter)?;
+    let hook = unsafe { Int3Hook::install(target, detour) }?;
+    Ok((hook, module_base))
+}
+
 fn module_base_of(addr: *const u8) -> Option<usize> {
     let mut module: HMODULE = std::ptr::null_mut();
     let ok = unsafe {
@@ -517,9 +550,12 @@ fn install_ready_pending() {
         }
         if let Some(target) = resolve_loaded(&pending.module, &pending.func) {
             // This runs under the loader lock. The INT3 install waits only for
-            // the code lock, whose holders never wait for the loader lock.
-            pending.hook = unsafe { Int3Hook::install(target, pending.detour) }.ok();
-            pending.module_base = module_base_of(target).unwrap_or(0);
+            // the code lock, whose holders never wait for the loader lock. A
+            // failed install stays pending and is retried on the next load.
+            if let Ok((hook, module_base)) = unsafe { install_in_module(target, pending.detour) } {
+                pending.hook = Some(hook);
+                pending.module_base = module_base;
+            }
         }
     }
 }
@@ -547,6 +583,22 @@ mod tests {
             unsafe { DelayHook::register("", "timeGetTime", fake_time as *const u8) },
             Err(DelayHookError::InvalidParameter)
         ));
+    }
+
+    #[test]
+    fn register_reports_a_failed_install() {
+        // Loaded, so the install is attempted right away; already INT3-hooked,
+        // so it fails, and nothing may stay pending.
+        let target = resolve_loaded("kernel32.dll", "Beep").expect("kernel32!Beep");
+        let blocker = unsafe { Int3Hook::install(target, fake_time as *const u8) }.unwrap();
+        let result = unsafe { DelayHook::register("kernel32.dll", "Beep", fake_time as *const u8) };
+        assert!(matches!(
+            result,
+            Err(DelayHookError::InstallFailed(
+                crate::int3::Int3HookError::AlreadyHooked
+            ))
+        ));
+        drop(blocker);
     }
 
     #[test]

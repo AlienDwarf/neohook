@@ -147,6 +147,7 @@ fn delay_hook_error_display() {
     for err in [
         DelayHookError::InvalidParameter,
         DelayHookError::LdrHookFailed,
+        DelayHookError::InstallFailed(Int3HookError::NoFreeSlot),
     ] {
         assert!(!err.to_string().is_empty());
     }
