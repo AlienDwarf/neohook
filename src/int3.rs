@@ -31,7 +31,10 @@
 //!   `0xCC` write, or for code guarded by an integrity check.
 //! * **Debugger interaction.** The handler claims `STATUS_BREAKPOINT`
 //!   exceptions whose address matches a registered target and passes every other
-//!   breakpoint straight through, so an attached debugger keeps working.
+//!   breakpoint straight through, so the debugger's own breakpoints keep
+//!   working. An attached debugger is notified of every exception before any
+//!   vectored handler, though, so it stops at each call of a hooked function
+//!   unless told to pass `STATUS_BREAKPOINT` on.
 
 use std::fmt;
 use std::sync::Mutex;
