@@ -1,3 +1,6 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #![cfg(windows)]
 
 //! A delay hook whose module is unloaded must drop its stale INT3 hook: it is

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #![cfg(windows)]
 
 //! Coverage for enabling/disabling hooks without a full unhook.
@@ -115,8 +118,8 @@ fn instance_vtable_disable_enable_roundtrip() {
 
     hooks[0].disable().expect("disable should succeed");
     assert!(!hooks[0].is_enabled());
-    // The object dispatches through its original table again.
-    assert_eq!(obj.vptr, vtable.as_mut_ptr() as *mut u8);
+    // The slot in the clone holds the original method again; the clone stays,
+    // as other instance hooks on the object may still use it.
     assert_eq!(unsafe { call_slot0(obj.vptr) }, 1);
 
     hooks[0].enable().expect("enable should succeed");

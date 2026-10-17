@@ -233,6 +233,11 @@ macro_rules! detour_inline {
 /// Convenience macro for installing a hook and storing a typed trampoline
 /// pointer to the original function.
 ///
+/// The `OnceLock` is set before the commit, so the detour finds the original
+/// as soon as the patch lands. A `OnceLock` can be set only once: after a
+/// failed commit, or once the hook is gone, the same static cannot be used for
+/// another hook, and the macro returns [`DetourError::InvalidParameter`].
+///
 /// # Examples
 ///
 /// ```rust,ignore
@@ -267,6 +272,13 @@ macro_rules! detour_helper {
             Err(e) => Err(e),
         }
     }};
+}
+
+/// Whether an inline hook is installed at `target`, enabled or not. Used by
+/// [`detour_closure!`]; not part of the public API.
+#[doc(hidden)]
+pub fn __inline_hook_installed_at(target: *const u8) -> bool {
+    crate::transaction::live_patch_starts_at(target)
 }
 
 /// Installs an inline hook whose detour is a **Rust closure** - so it can
@@ -330,13 +342,6 @@ macro_rules! detour_helper {
 ///
 /// assert_eq!(add(2, 3), 50);
 /// ```
-/// Whether an inline hook is installed at `target`, enabled or not. Used by
-/// [`detour_closure!`]; not part of the public API.
-#[doc(hidden)]
-pub fn __inline_hook_installed_at(target: *const u8) -> bool {
-    crate::transaction::live_patch_starts_at(target)
-}
-
 #[macro_export]
 macro_rules! detour_closure {
     (

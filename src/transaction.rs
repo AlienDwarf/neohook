@@ -93,11 +93,15 @@ pub enum PendingHook {
         target_dll: String,
         target_func: String,
         detour: *const u8,
+        /// Address of the import slot, resolved by `attach_iat`.
+        slot: usize,
     },
     Eat {
         module: HMODULE,
         target_func: String,
         detour: *const u8,
+        /// Address of the export slot, resolved by `attach_eat`.
+        slot: usize,
     },
     Vtable {
         vtable: *mut *mut u8,
@@ -284,8 +288,12 @@ impl InlineHook {
     /// Re-installs the detour jump at the target after a [`Self::disable`].
     ///
     /// Like [`Self::disable`], this rewrites the target in place without thread
-    /// redirection.
+    /// redirection. Fails with [`DetourError::InvalidParameter`] once the hook
+    /// has been detached.
     pub fn enable(&mut self) -> Result<(), DetourError> {
+        if !self.active {
+            return Err(DetourError::InvalidParameter);
+        }
         if self.enabled {
             return Ok(());
         }
@@ -311,6 +319,9 @@ impl InlineHook {
 
     /// Unhooks this inline hook by restoring the original bytes at the target address.
     pub fn unhook(mut self) -> Result<(), DetourError> {
+        if !self.active {
+            return Ok(());
+        }
         with_code_lock(|| {
             self.perform_unhook()?;
             self.release();
@@ -378,9 +389,13 @@ impl InlineHook {
 impl Drop for InlineHook {
     fn drop(&mut self) {
         with_code_lock(|| {
-            if self.active {
-                // auto unhook when dropped, best effort, ignore errors
-                let _ = self.perform_unhook();
+            // auto unhook when dropped, best effort
+            if self.active && self.perform_unhook().is_err() {
+                // The target still jumps to the detour, which may call the
+                // original through the trampoline: leave both in place, and the
+                // patch registered so no other hook is written over it.
+                self.trampoline.ptr = std::ptr::null_mut();
+                return;
             }
             self.release();
             unregister_managed_gateway(self.trampoline.ptr);
@@ -400,6 +415,10 @@ pub struct IatHook {
     pub dll_name: String,
     pub func_name: String,
     pub original_ptr: *mut u8,
+    /// The import slot this hook claimed (see [`claim_table_slot`]).
+    slot: usize,
+    /// Whether the claim on `slot` is still held.
+    claimed: bool,
     active: bool,
     /// Detour pointer currently written into the import slot when enabled.
     detour: *mut u8,
@@ -409,6 +428,9 @@ pub struct IatHook {
 
 impl IatHook {
     pub fn unhook(mut self) -> Result<(), DetourError> {
+        if !self.active {
+            return Ok(());
+        }
         self.perform_unhook()?;
         self.active = false;
 
@@ -439,7 +461,12 @@ impl IatHook {
     }
 
     /// Re-points the import slot at the detour after a [`Self::disable`].
+    /// Fails with [`DetourError::InvalidParameter`] once the hook has been
+    /// detached.
     pub fn enable(&mut self) -> Result<(), DetourError> {
+        if !self.active {
+            return Err(DetourError::InvalidParameter);
+        }
         if self.enabled {
             return Ok(());
         }
@@ -468,19 +495,23 @@ impl IatHook {
     }
 
     fn detach_finalize(&mut self) {
-        if self.enabled {
-            let _ = self.disable();
-        }
+        let restored = !self.enabled || self.disable().is_ok();
         self.active = false;
         self.enabled = false;
+        // A detached hook frees its slot for the next hook right away.
+        if restored && self.claimed {
+            release_table_slot(self.slot);
+            self.claimed = false;
+        }
     }
 }
 
 impl Drop for IatHook {
     fn drop(&mut self) {
-        if self.active {
-            // auto unhook when dropped, best effort, ignore errors
-            let _ = self.perform_unhook();
+        // auto unhook when dropped, best effort. A slot still pointing at the
+        // detour stays claimed, so no later hook stacks on it.
+        if self.claimed && (!self.active || self.perform_unhook().is_ok()) {
+            release_table_slot(self.slot);
         }
     }
 }
@@ -492,8 +523,9 @@ impl Drop for IatHook {
 /// detour. Like [`IatHook`], it changes a lookup table rather than the function
 /// body, so code that already cached the resolved address is unaffected.
 ///
-/// On x86_64 an out-of-range detour is reached through a small owned jump stub,
-/// which is released when the hook is dropped or unhooked.
+/// On x86_64 an out-of-range detour is reached through a small jump stub. Its
+/// address may have been handed out by `GetProcAddress`, so the stub is never
+/// freed: once the hook is removed it jumps to the original export.
 #[derive(Debug)]
 pub struct EatHook {
     pub module: HMODULE,
@@ -502,10 +534,13 @@ pub struct EatHook {
     original_rva: u32,
     detour_rva: u32,
     original_ptr: *mut u8,
-    /// Jump stub keeping an out-of-range detour reachable. Only held so its
-    /// `Drop` releases the allocation when the hook goes away.
-    #[allow(dead_code)]
+    /// Jump stub keeping an out-of-range detour reachable. Handed to
+    /// [`Self::retire_stub`] when the hook goes away, never freed.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     stub: Option<crate::alloc::Trampoline>,
+    /// Whether this hook still holds the claim on its export slot (see
+    /// [`claim_table_slot`]).
+    claimed: bool,
     active: bool,
     /// Whether the export slot currently points at the detour.
     enabled: bool,
@@ -534,7 +569,12 @@ impl EatHook {
     }
 
     /// Re-points the export slot at the detour after a [`Self::disable`].
+    /// Fails with [`DetourError::InvalidParameter`] once the hook has been
+    /// detached.
     pub fn enable(&mut self) -> Result<(), DetourError> {
+        if !self.active {
+            return Err(DetourError::InvalidParameter);
+        }
         if self.enabled {
             return Ok(());
         }
@@ -544,8 +584,11 @@ impl EatHook {
     }
 
     /// Unhooks this EAT hook by restoring the original export RVA. The jump stub
-    /// (if any) is released when the guard is dropped.
+    /// (if any) is then pointed at the original export and kept.
     pub fn unhook(mut self) -> Result<(), DetourError> {
+        if !self.active {
+            return Ok(());
+        }
         self.perform_unhook()?;
         self.active = false;
         Ok(())
@@ -557,22 +600,41 @@ impl EatHook {
     }
 
     fn detach_finalize(&mut self) {
-        if self.enabled {
-            let _ = self.disable();
-        }
+        let restored = !self.enabled || self.disable().is_ok();
         self.active = false;
         self.enabled = false;
+        // A detached hook frees its slot for the next hook right away.
+        if restored && self.claimed {
+            release_table_slot(self.slot_ptr as usize);
+            self.claimed = false;
+            self.retire_stub();
+        }
+    }
+
+    /// Leaks the jump stub, pointed at the original export: addresses resolved
+    /// while the hook was installed lead to the stub, and must keep working.
+    /// Only called once the export slot no longer points at the stub.
+    fn retire_stub(&mut self) {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(stub) = self.stub.take() {
+            unsafe { crate::eat::retarget_abs_jump_stub(stub.ptr, self.original_ptr) };
+            std::mem::forget(stub);
+        }
     }
 }
 
 impl Drop for EatHook {
     fn drop(&mut self) {
-        if self.active {
-            // auto unhook when dropped, best effort, ignore errors
-            let _ = self.perform_unhook();
+        // auto unhook when dropped, best effort. A slot still pointing at the
+        // detour stays claimed, so no later hook stacks on it.
+        if self.claimed && (!self.active || self.perform_unhook().is_ok()) {
+            release_table_slot(self.slot_ptr as usize);
+            self.retire_stub();
         }
-        // `stub` is released here via its own Drop, after the slot no longer
-        // points at it.
+        // A stub the slot may still point at is leaked as it is.
+        if let Some(stub) = self.stub.take() {
+            std::mem::forget(stub);
+        }
     }
 }
 
@@ -968,6 +1030,11 @@ impl TransactionCore {
                 .map_err(|_| DetourError::InvalidParameter)
         }?;
 
+        // A later branch into the stolen bytes would land inside the jump.
+        if unsafe { disasm::Disassembler::branches_into(target, stolen_len) } {
+            return Err(DetourError::InvalidParameter);
+        }
+
         // The stolen bytes must not overlap another inline hook, queued here or
         // already installed: one jump would be written over the other, or the
         // live jump relocated into this trampoline. `commit` checks installed
@@ -1102,8 +1169,11 @@ impl TransactionCore {
         // Check if we can find the import
         // if find_import_address returns None it means there is no such dll or function in the IAT, so we return an error
 
-        unsafe {
-            crate::iat::IatHook::find_import_address(h_module, target_dll, target_func)?;
+        let slot =
+            unsafe { crate::iat::IatHook::find_import_address(h_module, target_dll, target_func)? }
+                as usize;
+        if self.table_slot_taken(slot) {
+            return Err(DetourError::InvalidParameter);
         }
 
         // NOW WE CAN SAFELY PUSH THE HOOK TO THE PENDING LIST, THE COMMIT FUNCTION WILL TAKE CARE OF INSTALLING IT
@@ -1113,6 +1183,7 @@ impl TransactionCore {
             target_dll: target_dll.to_string(),
             target_func: target_func.to_string(),
             detour,
+            slot,
         });
         Ok(())
     }
@@ -1176,14 +1247,17 @@ impl TransactionCore {
 
         // Validate up front that the export exists and is hookable (not a
         // forwarder), so we fail before any thread is suspended.
-        unsafe {
-            crate::eat::EatHook::find_export_address(h_module, target_func)?;
+        let slot =
+            unsafe { crate::eat::EatHook::find_export_address(h_module, target_func)? } as usize;
+        if self.table_slot_taken(slot) {
+            return Err(DetourError::InvalidParameter);
         }
 
         self.pending_hooks.push(PendingHook::Eat {
             module: h_module,
             target_func: target_func.to_string(),
             detour,
+            slot,
         });
         Ok(())
     }
@@ -1243,6 +1317,10 @@ impl TransactionCore {
             }
         }
 
+        if self.table_slot_taken(slot as usize) {
+            return Err(DetourError::InvalidParameter);
+        }
+
         let original_ptr = unsafe { *slot };
 
         self.pending_hooks.push(PendingHook::Vtable {
@@ -1291,6 +1369,14 @@ impl TransactionCore {
             return Err(DetourError::InvalidParameter);
         }
 
+        let queued = self.pending_hooks.iter().any(|hook| {
+            matches!(hook, PendingHook::VtableInstance { object_vptr: queued, index: queued_index, .. }
+                if *queued == object_vptr && *queued_index == index)
+        });
+        if queued || crate::vtable::instance_slot_hooked(object_vptr, index) {
+            return Err(DetourError::InvalidParameter);
+        }
+
         let original_ptr = unsafe { *(original_vtable as *mut *mut u8).add(index) };
 
         self.pending_hooks.push(PendingHook::VtableInstance {
@@ -1301,6 +1387,21 @@ impl TransactionCore {
         });
 
         Ok(original_ptr)
+    }
+
+    /// Whether a live hook or one queued in this transaction already redirects
+    /// the table slot at `slot`.
+    fn table_slot_taken(&self, slot: usize) -> bool {
+        let queued = self.pending_hooks.iter().any(|hook| match hook {
+            PendingHook::Iat { slot: queued, .. } | PendingHook::Eat { slot: queued, .. } => {
+                *queued == slot
+            }
+            PendingHook::Vtable { vtable, index, .. } => {
+                vtable.wrapping_add(*index) as usize == slot
+            }
+            _ => false,
+        });
+        queued || table_slot_claimed(slot)
     }
 
     /// Queues an installed hook to be detached when the transaction commits.
@@ -1438,6 +1539,7 @@ impl TransactionCore {
                     module,
                     target_func,
                     detour,
+                    ..
                 } => unsafe { crate::eat::EatHook::prepare_export(*module, target_func, *detour) }
                     .map(Reserved::Eat)
                     .map_err(|e| (HookKind::Eat, e.into())),
@@ -1476,6 +1578,29 @@ impl TransactionCore {
         // before the first suspension, so no frozen thread can hold it.
         let code_guard = hold_code_lock();
 
+        // Table hooks claim their slot and VTable instance hooks may register a
+        // clone inside the suspend window; make room now, while allocating is
+        // still safe. Nothing else inserts while the code lock is held.
+        reserve_table_slots(
+            pending
+                .iter()
+                .filter(|hook| {
+                    matches!(
+                        hook,
+                        PendingHook::Iat { .. }
+                            | PendingHook::Eat { .. }
+                            | PendingHook::Vtable { .. }
+                    )
+                })
+                .count(),
+        );
+        crate::vtable::reserve_instance_clones(
+            pending
+                .iter()
+                .filter(|hook| matches!(hook, PendingHook::VtableInstance { .. }))
+                .count(),
+        );
+
         // A gateway queued for chaining may have lost its owner since `attach`
         // (dropping a hook only waits for this lock, not for the transaction):
         // it is retired and will be freed, so it must not be patched. Checked
@@ -1512,8 +1637,17 @@ impl TransactionCore {
                     target_dll,
                     target_func,
                     detour,
-                } => unsafe {
-                    crate::iat::IatHook::hook_import(*module, target_dll, target_func, *detour)
+                    slot,
+                } => {
+                    if claim_table_slot(*slot) {
+                        unsafe {
+                            crate::iat::IatHook::hook_import(
+                                *module,
+                                target_dll,
+                                target_func,
+                                *detour,
+                            )
+                        }
                         .map(|original| {
                             Some(Hook::Iat(IatHook {
                                 module: *module,
@@ -1522,13 +1656,21 @@ impl TransactionCore {
                                 dll_name: std::mem::take(target_dll),
                                 func_name: std::mem::take(target_func),
                                 original_ptr: original,
+                                slot: *slot,
+                                claimed: true,
                                 active: true,
                                 detour: *detour as *mut u8,
                                 enabled: true,
                             }))
                         })
-                        .map_err(|err| (HookKind::Iat, err.into()))
-                },
+                        .map_err(|err| {
+                            release_table_slot(*slot);
+                            (HookKind::Iat, err.into())
+                        })
+                    } else {
+                        Err((HookKind::Iat, DetourError::InvalidParameter))
+                    }
+                }
                 PendingHook::Eat {
                     module,
                     target_func,
@@ -2055,6 +2197,11 @@ impl TransactionCore {
         let Reserved::Patch(patch) = reserved else {
             return Err(DetourError::InvalidParameter);
         };
+        // An INT3 hook may have been armed since `attach`; arming takes the code
+        // lock, which this commit holds now.
+        if crate::int3::armed_in_range(data.target as usize, data.stolen_len) {
+            return Err(DetourError::InvalidParameter);
+        }
         if patch.len() != data.stolen_len
             || !unsafe { crate::mem::write_code_bytes(data.target, patch.as_ptr(), patch.len()) }
         {
@@ -2593,10 +2740,16 @@ fn install_eat(
     let Reserved::Eat(prepared) = reserved else {
         return Err(DetourError::InvalidParameter);
     };
-    // Re-read the slot: an earlier hook in this commit may have redirected the
-    // same export since it was prepared.
+    if !claim_table_slot(prepared.slot_ptr as usize) {
+        return Err(DetourError::InvalidParameter);
+    }
     let original_rva = unsafe { prepared.slot_ptr.read() };
-    unsafe { crate::eat::EatHook::write_export_rva(prepared.slot_ptr, prepared.detour_rva) }?;
+    if let Err(err) =
+        unsafe { crate::eat::EatHook::write_export_rva(prepared.slot_ptr, prepared.detour_rva) }
+    {
+        release_table_slot(prepared.slot_ptr as usize);
+        return Err(err.into());
+    }
 
     let Reserved::Eat(prepared) = std::mem::replace(reserved, Reserved::Nothing) else {
         unreachable!("checked above");
@@ -2611,6 +2764,7 @@ fn install_eat(
         detour_rva: prepared.detour_rva,
         original_ptr: (module as usize).wrapping_add(original_rva as usize) as *mut u8,
         stub: prepared.stub,
+        claimed: true,
         active: true,
         enabled: true,
     }))
@@ -2760,6 +2914,39 @@ fn orphan_chained_gateway(gateway: *mut u8, size: usize) -> bool {
         .unwrap_or(false)
 }
 
+/// Table slots (import, export and VTable entries) redirected by a live hook.
+/// A second hook on a slot is refused: unhooking the two in the wrong order
+/// would put a released detour or stub back into the table.
+///
+/// Only touched under the code lock, so no suspended thread can hold it while a
+/// commit claims slots inside its suspend window. Claiming there does not
+/// allocate, as [`reserve_table_slots`] made room beforehand.
+fn table_slots() -> &'static Mutex<HashSet<usize>> {
+    static SLOTS: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+    SLOTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn reserve_table_slots(additional: usize) {
+    with_code_lock(|| {
+        let _ = table_slots().lock().map(|mut s| s.reserve(additional));
+    });
+}
+
+/// Claims `slot` for a new hook. Returns `false` if a live hook owns it.
+pub(crate) fn claim_table_slot(slot: usize) -> bool {
+    with_code_lock(|| table_slots().lock().is_ok_and(|mut s| s.insert(slot)))
+}
+
+pub(crate) fn release_table_slot(slot: usize) {
+    with_code_lock(|| {
+        let _ = table_slots().lock().map(|mut s| s.remove(&slot));
+    });
+}
+
+fn table_slot_claimed(slot: usize) -> bool {
+    with_code_lock(|| table_slots().lock().is_ok_and(|s| s.contains(&slot)))
+}
+
 /// Code ranges patched by installed inline hooks, as start -> length. Updated
 /// only outside the suspend window, under the transaction lock.
 fn live_patches() -> &'static Mutex<HashMap<usize, usize>> {
@@ -2779,14 +2966,17 @@ fn unregister_live_patch(target: *mut u8) {
     });
 }
 
-fn overlaps_live_patch(target: *mut u8, len: usize) -> bool {
-    live_patches()
-        .lock()
-        .map(|m| {
-            m.iter()
-                .any(|(&start, &patched)| ranges_overlap(start, patched, target as usize, len))
-        })
-        .unwrap_or(false)
+/// Whether an installed inline or INT3 hook patches a byte in
+/// `[target, target + len)`.
+pub(crate) fn overlaps_live_patch(target: *mut u8, len: usize) -> bool {
+    crate::int3::armed_in_range(target as usize, len)
+        || live_patches()
+            .lock()
+            .map(|m| {
+                m.iter()
+                    .any(|(&start, &patched)| ranges_overlap(start, patched, target as usize, len))
+            })
+            .unwrap_or(false)
 }
 
 /// Whether an installed inline hook patches code starting at `target`.

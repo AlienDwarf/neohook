@@ -208,6 +208,55 @@ impl Disassembler {
         )
     }
 
+    /// Whether the code following the `len` bytes at `address`, up to where the
+    /// function visibly ends, branches into those bytes past their first one -
+    /// a loop jumping back to its head just after a mid-function hook site,
+    /// say. Such a branch would land inside the jump the hook writes there.
+    /// Branches from code before `address` cannot be seen from here.
+    ///
+    /// # Safety
+    /// The caller must ensure that `address` is a valid pointer.
+    pub unsafe fn branches_into(address: *const u8, len: usize) -> bool {
+        /// How far past the patched bytes to look.
+        const WINDOW: usize = 512;
+        let start = address as u64;
+        let end = start + len as u64;
+        let readable = unsafe { readable_bytes_from(address) };
+        if readable <= len {
+            return false;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(address, readable.min(len + WINDOW)) };
+        let mut decoder = Decoder::with_ip(Self::bitness(), bytes, start, DecoderOptions::NONE);
+
+        // Furthest address a conditional jump decoded so far jumps to; the
+        // function continues at least that far (see `get_instruction_len`).
+        let mut branch_reach = 0u64;
+        while decoder.can_decode() {
+            let instr = decoder.decode();
+            if instr.is_invalid() {
+                break;
+            }
+            let near_branch = matches!(
+                instr.op0_kind(),
+                OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+            );
+            if instr.ip() >= end
+                && near_branch
+                && instr.near_branch_target() > start
+                && instr.near_branch_target() < end
+            {
+                return true;
+            }
+            if Self::is_conditional_jump(&instr) {
+                branch_reach = branch_reach.max(instr.near_branch_target());
+            }
+            if instr.ip() >= end && Self::ends_function(&instr) && branch_reach < instr.next_ip() {
+                break;
+            }
+        }
+        false
+    }
+
     /// Emulates a relative `call` whose target lies inside the stolen range
     /// `[start, end]` (typically the get-PC idiom `call $+5; pop reg`).
     ///
@@ -425,6 +474,21 @@ mod tests {
         ]);
         // A 14-byte patch would run into the next function.
         assert!(unsafe { Disassembler::get_instruction_len(code.as_ptr(), 14) }.is_err());
+    }
+
+    #[test]
+    fn branches_into_finds_a_loop_back_into_the_patch() {
+        // xor eax,eax ; L: inc eax ; cmp eax,10 ; jne L ; ret
+        let code = [
+            0x31, 0xC0, 0xFF, 0xC0, 0x83, 0xF8, 0x0A, 0x75, 0xF9, 0xC3, 0xCC, 0xCC,
+        ];
+        assert!(unsafe { Disassembler::branches_into(code.as_ptr(), 7) });
+        // A loop back to the very first byte is fine: the jump starts there.
+        let code = [0xFF, 0xC0, 0x83, 0xF8, 0x0A, 0x75, 0xF9, 0xC3, 0xCC, 0xCC];
+        assert!(!unsafe { Disassembler::branches_into(code.as_ptr(), 5) });
+        // Code after the function's end is not looked at.
+        let code = [0x90, 0x90, 0x90, 0x90, 0x90, 0xC3, 0x75, 0xF9, 0xCC];
+        assert!(!unsafe { Disassembler::branches_into(code.as_ptr(), 5) });
     }
 
     #[test]

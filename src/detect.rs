@@ -46,7 +46,9 @@
 
 use std::fmt;
 
-use iced_x86::{Code, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind};
+use iced_x86::{
+    Code, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register,
+};
 use windows_sys::Win32::Foundation::{CloseHandle, HMODULE, MAX_PATH};
 use windows_sys::Win32::System::Diagnostics::Debug::{
     CONTEXT, GetThreadContext, IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_EXPORT,
@@ -163,6 +165,15 @@ pub unsafe fn check_function(func: *const u8) -> Result<Option<DetectedHook>, De
     let found = check_code(func)?;
     if found.is_some() {
         return Ok(found);
+    }
+    // An unchanged import thunk (`jmp [__imp_X]`): its slot may be redirected.
+    if let Some(slot) = thunk_slot(func)
+        && let Some(h_module) = module_of(func)
+        && let Some(hook) = unsafe { import_redirects(h_module) }
+            .into_iter()
+            .find(|hook| hook.address == slot)
+    {
+        return Ok(Some(hook));
     }
     // An unchanged jump stub: check where it leads.
     let target = unsafe { crate::detour_code_from_pointer(func) } as *const u8;
@@ -350,7 +361,8 @@ fn classify(at: *const u8, live: &[u8]) -> DetectedHook {
         Mnemonic::Push if is_push_imm(&instr) => {
             if live.get(instr.len()) == Some(&0xC3) {
                 hook.kind = DetectedHookKind::InlineJump;
-                destination = Some(instr.immediate(0) as u32 as usize as *const u8);
+                // Sign-extended to 64 bits on x64, as the CPU does.
+                destination = Some(instr.immediate(0) as usize as *const u8);
             }
         }
         // mov rax/eax, imm; jmp rax/eax
@@ -405,6 +417,25 @@ fn is_immediate(kind: OpKind) -> bool {
 }
 
 /// Decodes the live instruction at `at`.
+/// The pointer slot a `jmp [slot]` at `func` jumps through, as import thunks
+/// do (`jmp [rip + __imp_X]` on x64, `jmp [__imp_X]` on x86).
+fn thunk_slot(func: *const u8) -> Option<*const u8> {
+    let instr = decode_live(func)?;
+    if instr.mnemonic() != Mnemonic::Jmp
+        || instr.op0_kind() != OpKind::Memory
+        || instr.memory_index() != Register::None
+    {
+        return None;
+    }
+    if instr.is_ip_rel_memory_operand() {
+        Some(instr.ip_rel_memory_address() as usize as *const u8)
+    } else if instr.memory_base() == Register::None {
+        Some(instr.memory_displacement64() as usize as *const u8)
+    } else {
+        None
+    }
+}
+
 fn decode_live(at: *const u8) -> Option<Instruction> {
     let readable = unsafe { crate::disasm::readable_bytes_from(at) };
     if readable == 0 {
@@ -606,25 +637,29 @@ impl HardwareBreakpoints {
         #[repr(align(16))]
         struct AlignedContext(CONTEXT);
 
-        let mut addresses = Vec::new();
-        let mut read = |h_thread| {
+        // The execute breakpoints armed in a thread, 0 for an unused register.
+        // Allocates nothing: it runs while the thread is suspended, and that
+        // thread may hold the heap lock.
+        let read = |h_thread| {
+            let mut found = [0usize; 4];
             let mut ctx: AlignedContext = unsafe { std::mem::zeroed() };
             ctx.0.ContextFlags = CONTEXT_DEBUG;
             if unsafe { GetThreadContext(h_thread, &mut ctx.0) } == 0 {
-                return;
+                return found;
             }
             let ctx = ctx.0;
             for (slot, dr) in [ctx.Dr0, ctx.Dr1, ctx.Dr2, ctx.Dr3].into_iter().enumerate() {
                 // Locally or globally enabled, with an execute condition (R/W = 00).
                 let enabled = ctx.Dr7 & (0b11 << (slot * 2)) != 0;
                 let execute = (ctx.Dr7 >> (16 + slot * 4)) & 0b11 == 0;
-                if enabled && execute && dr != 0 {
-                    addresses.push(dr as usize);
+                if enabled && execute {
+                    found[slot] = dr as usize;
                 }
             }
+            found
         };
 
-        read(unsafe { GetCurrentThread() });
+        let mut addresses: Vec<usize> = read(unsafe { GetCurrentThread() }).to_vec();
         let _freeze = crate::threads::hold_freeze_lock();
         for tid in crate::threads::ThreadEnumerator::enumerate_process_threads() {
             let h = unsafe { OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME, 0, tid) };
@@ -632,11 +667,13 @@ impl HardwareBreakpoints {
                 continue;
             }
             if unsafe { SuspendThread(h) } != u32::MAX {
-                read(h);
+                let found = read(h);
                 unsafe { ResumeThread(h) };
+                addresses.extend(found);
             }
             unsafe { CloseHandle(h) };
         }
+        addresses.retain(|&address| address != 0);
         addresses.sort_unstable();
         addresses.dedup();
         Self { addresses }

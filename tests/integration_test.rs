@@ -1,3 +1,6 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #[cfg(all(test, windows))]
 mod tests {
     use neohook::{DetourError, DetourTransaction};

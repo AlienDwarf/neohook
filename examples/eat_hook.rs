@@ -1,3 +1,5 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Demonstrates EAT (Export Address Table) hooking.
 //
 // Unlike an IAT hook, which rewrites one *caller's* import slot, an EAT hook

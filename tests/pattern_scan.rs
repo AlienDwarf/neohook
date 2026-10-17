@@ -1,3 +1,6 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #![cfg(windows)]
 
 //! Integration tests for pattern (signature) scanning and signature-based hook

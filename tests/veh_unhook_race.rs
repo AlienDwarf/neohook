@@ -1,3 +1,6 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #![cfg(windows)]
 
 //! Removing a VEH hook while other threads keep calling the target must not

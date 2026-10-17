@@ -1,3 +1,5 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Mid-function / arbitrary-address detour with full register context.
 //
 // Unlike an entry-point hook, a mid-function detour can be placed at *any*

@@ -10,6 +10,8 @@
 //! EAT itself) is redirected to the detour. Code that already cached the
 //! resolved address keeps calling the original function, exactly like IAT
 //! hooking, because only the lookup table is changed - not the function body.
+//! Conversely, an address resolved *while* the hook is installed leads to the
+//! detour, and keeps doing so after the unhook on x86 (see below for x86_64).
 //!
 //! ## How the redirect is encoded
 //!
@@ -23,13 +25,15 @@
 //!   target module. When the difference does not fit in a `u32`, NeoHook
 //!   allocates a tiny jump stub within 2 GB *above* the module base and points
 //!   the EAT slot at the stub, which performs an absolute jump to the detour.
-//!   The stub is owned by the installed hook and released when it is unhooked.
+//!   A consumer may have cached the stub's address, so the stub is never
+//!   freed: the unhook points it at the original export instead, and its few
+//!   bytes stay allocated for the life of the process.
 //!
 //! All PE parsing is bounds-checked through [`crate::pe`].
 
 use std::fmt;
 use windows_sys::Win32::System::Diagnostics::Debug::*;
-use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+use windows_sys::Win32::System::Memory::PAGE_READWRITE;
 use windows_sys::Win32::System::SystemServices::*;
 
 use crate::pe::{self, ModuleImage, PeError};
@@ -335,6 +339,33 @@ unsafe fn write_abs_jump_stub(src: *mut u8, dst: *const u8) {
     }
 }
 
+/// Points an existing [`write_abs_jump_stub`] thunk at `dst`. The 8-byte target
+/// is replaced with one store, so a thread jumping through the stub at that
+/// moment sees either the old or the new destination.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn retarget_abs_jump_stub(src: *mut u8, dst: *const u8) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+
+    crate::transaction::with_code_lock(|| unsafe {
+        let operand = src.add(6);
+        let mut old = 0u32;
+        if VirtualProtect(operand.cast(), 8, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+            return false;
+        }
+        // Allocation-granular stubs keep the operand inside one cache line,
+        // where an unaligned 8-byte store is a single access.
+        std::ptr::write_unaligned(operand.cast::<u64>(), dst as u64);
+        let mut ignored = 0u32;
+        VirtualProtect(operand.cast(), 8, old, &mut ignored);
+        windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            src as _,
+            14,
+        );
+        true
+    })
+}
+
 /// Signature of `VirtualProtect`, injectable so tests can simulate failures.
 type ProtectFn = unsafe extern "system" fn(*const core::ffi::c_void, usize, u32, *mut u32) -> i32;
 
@@ -343,8 +374,21 @@ type ProtectFn = unsafe extern "system" fn(*const core::ffi::c_void, usize, u32,
 /// (see `transaction::with_code_lock`).
 unsafe fn write_export_slot(slot_ptr: *mut u32, rva: u32) -> Result<(), EatHookError> {
     crate::transaction::with_code_lock(|| unsafe {
-        write_export_slot_with(slot_ptr, rva, VirtualProtect)
+        write_export_slot_with(slot_ptr, rva, protect_same_execute)
     })
+}
+
+/// `VirtualProtect` that leaves execute permission as it is: the export
+/// directory can share a page with code another thread is running.
+unsafe extern "system" fn protect_same_execute(
+    address: *const core::ffi::c_void,
+    size: usize,
+    new_protect: u32,
+    old_protect: *mut u32,
+) -> i32 {
+    unsafe {
+        crate::mem::virtual_protect_same_execute(address as *mut u8, size, new_protect, old_protect)
+    }
 }
 
 unsafe fn write_export_slot_with(
@@ -399,6 +443,45 @@ mod tests {
 
     thread_local! {
         static PROTECT_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn slot_write_keeps_a_shared_code_page_executable() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+            VirtualAlloc, VirtualFree, VirtualProtect,
+        };
+
+        // One page holding both code (`ret`) and an export-table-like slot.
+        let page = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            )
+        } as *mut u8;
+        assert!(!page.is_null());
+        unsafe { *page = 0xC3 };
+        let mut old = 0u32;
+        unsafe { VirtualProtect(page.cast(), 4096, PAGE_EXECUTE_READ, &mut old) };
+        let slot = unsafe { page.add(0x800) }.cast::<u32>();
+
+        static STOP: AtomicBool = AtomicBool::new(false);
+        let code = page as usize;
+        let runner = std::thread::spawn(move || {
+            let f: extern "C" fn() = unsafe { std::mem::transmute(code) };
+            while !STOP.load(Ordering::Relaxed) {
+                f();
+            }
+        });
+        for i in 0..20_000u32 {
+            unsafe { write_export_slot(slot, i) }.expect("slot write");
+        }
+        STOP.store(true, Ordering::Relaxed);
+        runner.join().expect("code on the page kept running");
+        unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) };
     }
 
     /// Succeeds on the first call (making the slot "writable") and fails every

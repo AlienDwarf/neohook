@@ -1,3 +1,6 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #![cfg(windows)]
 
 //! Integration tests for mid-function / arbitrary-address detours.
@@ -464,4 +467,135 @@ fn handler_runs_with_direction_flag_clear() {
         DF,
         "DF must reach the resumed code unchanged (got {flags:#x})"
     );
+}
+
+#[cfg(target_arch = "x86")]
+mod x86_alignment {
+    use neohook::{HookContext, MidHook};
+    use std::hint::black_box;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static MISALIGNED: AtomicUsize = AtomicUsize::new(0);
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[inline(never)]
+    extern "C" fn target(x: u32) -> u32 {
+        black_box(x)
+            .wrapping_mul(black_box(3))
+            .wrapping_add(black_box(2))
+    }
+
+    unsafe extern "C" fn handler(ctx: *mut HookContext) {
+        CALLS.fetch_add(1, Ordering::SeqCst);
+        if !(ctx as usize).is_multiple_of(std::mem::align_of::<HookContext>()) {
+            MISALIGNED.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn handler_context_is_aligned_for_any_entry_esp() {
+        let hook = unsafe { MidHook::install(target as *const u8, handler) }.unwrap();
+        for shift in [0u32, 4, 8, 12] {
+            let mut result: u32;
+            unsafe {
+                std::arch::asm!(
+                    "sub esp, {s}",
+                    "push 5",
+                    "call {f}",
+                    "add esp, 4",
+                    "add esp, {s}",
+                    s = in(reg) shift,
+                    f = in(reg) target as *const () as usize,
+                    out("eax") result,
+                    out("ecx") _,
+                    out("edx") _,
+                );
+            }
+            assert_eq!(result, 17);
+        }
+        hook.unhook().unwrap();
+        assert_eq!(CALLS.load(Ordering::SeqCst), 4);
+        assert_eq!(MISALIGNED.load(Ordering::SeqCst), 0);
+    }
+}
+
+/// The handler runs ordinary code, which may end in `vzeroupper` and wipe the
+/// YMM upper halves the interrupted routine still needs.
+mod ymm_upper_halves {
+    use neohook::{HookContext, MidHook};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+
+    unsafe extern "C" fn clobbering_handler(_: *mut HookContext) {
+        unsafe { std::arch::asm!("vzeroupper") };
+    }
+
+    #[test]
+    fn ymm_upper_halves_survive_the_handler() {
+        if !std::arch::is_x86_feature_detected!("avx") {
+            return;
+        }
+        // vmovdqu ymm1, [ecx/rcx] ; 3x nop5 (hooked at +4) ;
+        // vmovdqu [edx/rdx], ymm1 ; vzeroupper ; ret
+        let mut code = vec![0xC5, 0xFE, 0x6F, 0x09];
+        for _ in 0..3 {
+            code.extend_from_slice(&[0x0F, 0x1F, 0x44, 0x00, 0x00]);
+        }
+        code.extend_from_slice(&[0xC5, 0xFE, 0x7F, 0x0A, 0xC5, 0xF8, 0x77, 0xC3]);
+        let page = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            )
+        } as *mut u8;
+        assert!(!page.is_null());
+        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), page, code.len()) };
+
+        #[cfg(target_arch = "x86_64")]
+        let copy: extern "C" fn(*const u8, *mut u8) = unsafe { std::mem::transmute(page) };
+        #[cfg(target_arch = "x86")]
+        let copy: extern "fastcall" fn(*const u8, *mut u8) = unsafe { std::mem::transmute(page) };
+
+        let src: [u8; 32] = std::array::from_fn(|i| i as u8 + 1);
+        let mut dst = [0u8; 32];
+        let hook = unsafe { MidHook::install(page.add(4), clobbering_handler) }.unwrap();
+        copy(src.as_ptr(), dst.as_mut_ptr());
+        hook.unhook().unwrap();
+        assert_eq!(dst, src);
+
+        unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) };
+    }
+}
+
+#[test]
+fn hook_site_a_loop_jumps_back_into_is_refused() {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+    unsafe extern "C" fn handler(_: *mut neohook::HookContext) {}
+
+    // xor eax,eax ; L: inc eax ; cmp eax,10 ; jne L ; ret - the patch at the
+    // first byte would cover L.
+    let code = [0x31, 0xC0, 0xFF, 0xC0, 0x83, 0xF8, 0x0A, 0x75, 0xF9, 0xC3];
+    let page = unsafe {
+        VirtualAlloc(
+            std::ptr::null(),
+            4096,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_EXECUTE_READWRITE,
+        )
+    } as *mut u8;
+    assert!(!page.is_null());
+    unsafe {
+        std::ptr::write_bytes(page, 0xCC, 4096);
+        std::ptr::copy_nonoverlapping(code.as_ptr(), page, code.len());
+    }
+
+    assert!(unsafe { MidHook::install(page, handler) }.is_err());
+    let count: extern "C" fn() -> u32 = unsafe { std::mem::transmute(page) };
+    assert_eq!(count(), 10);
+    unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) };
 }

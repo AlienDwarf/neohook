@@ -1,3 +1,5 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Demonstrates VEH (Vectored Exception Handler) hooking.
 //
 // A VEH hook does not patch a single byte of the target. It arms a hardware

@@ -1,8 +1,12 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #![cfg(windows)]
 
 //! Misuse that must be rejected at compile time.
 //!
-//! Each `tests/ui/*.rs` file starts with `// expect: E####`. The file is built
+//! Each `tests/ui/*.rs` file has a `// expect: E####` line in its leading
+//! comments. The file is built
 //! as a binary against this crate and must fail with that error code. Only the
 //! code is checked, not the full message, so new compiler releases that reword
 //! diagnostics do not break the test.
@@ -47,9 +51,9 @@ fn compile_fail() {
         let source = fs::read_to_string(case).unwrap();
         let expected = source
             .lines()
-            .next()
-            .and_then(|l| l.strip_prefix("// expect: "))
-            .unwrap_or_else(|| panic!("{name}: first line must be `// expect: E####`"))
+            .take_while(|l| l.starts_with("//"))
+            .find_map(|l| l.strip_prefix("// expect: "))
+            .unwrap_or_else(|| panic!("{name}: the leading comments must hold `// expect: E####`"))
             .trim();
 
         let out = Command::new(&cargo)

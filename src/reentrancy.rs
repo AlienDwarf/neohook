@@ -10,6 +10,7 @@
 //! typically forwarding straight to the original.
 
 use std::cell::Cell;
+use std::marker::PhantomData;
 use std::thread::LocalKey;
 
 /// RAII guard that marks a region as "entered" on the current thread.
@@ -28,9 +29,12 @@ use std::thread::LocalKey;
 /// }
 /// ```
 ///
-/// The flag is cleared automatically when the guard is dropped.
+/// The flag is cleared automatically when the guard is dropped. The guard
+/// cannot leave its thread: dropped elsewhere, it would clear that thread's
+/// flag and leave this one set for good.
 pub struct ReentrancyGuard {
     key: &'static LocalKey<Cell<bool>>,
+    _not_send: PhantomData<*const ()>,
 }
 
 impl ReentrancyGuard {
@@ -47,7 +51,10 @@ impl ReentrancyGuard {
                 None
             } else {
                 flag.set(true);
-                Some(Self { key })
+                Some(Self {
+                    key,
+                    _not_send: PhantomData,
+                })
             }
         })
     }

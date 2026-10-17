@@ -31,7 +31,10 @@
 //!   `0xCC` write, or for code guarded by an integrity check.
 //! * **Debugger interaction.** The handler claims `STATUS_BREAKPOINT`
 //!   exceptions whose address matches a registered target and passes every other
-//!   breakpoint straight through, so an attached debugger keeps working.
+//!   breakpoint straight through, so the debugger's own breakpoints keep
+//!   working. An attached debugger is notified of every exception before any
+//!   vectored handler, though, so it stops at each call of a hooked function
+//!   unless told to pass `STATUS_BREAKPOINT` on.
 
 use std::fmt;
 use std::sync::Mutex;
@@ -100,7 +103,8 @@ pub enum Int3HookError {
     InvalidParameter,
     /// All [`MAX_HOOKS`] slots are already in use.
     NoFreeSlot,
-    /// The target address is already hooked.
+    /// The target address is already hooked, by an INT3 hook or by an inline
+    /// hook whose patch covers it.
     AlreadyHooked,
     /// `AddVectoredExceptionHandler` failed.
     HandlerRegistrationFailed,
@@ -118,7 +122,7 @@ impl fmt::Display for Int3HookError {
         match self {
             Self::InvalidParameter => write!(f, "invalid INT3 hook parameters"),
             Self::NoFreeSlot => write!(f, "all {MAX_HOOKS} INT3 hook slots are in use"),
-            Self::AlreadyHooked => write!(f, "target address is already INT3-hooked"),
+            Self::AlreadyHooked => write!(f, "target address is already hooked"),
             Self::HandlerRegistrationFailed => {
                 write!(f, "failed to register the vectored exception handler")
             }
@@ -169,7 +173,8 @@ impl Int3Hook {
     /// # Errors
     ///
     /// * [`Int3HookError::InvalidParameter`] if `target` or `detour` is null.
-    /// * [`Int3HookError::AlreadyHooked`] if `target` is already hooked.
+    /// * [`Int3HookError::AlreadyHooked`] if `target` is already INT3-hooked or
+    ///   lies inside the patch of an installed inline hook.
     /// * [`Int3HookError::NoFreeSlot`] if all [`MAX_HOOKS`] slots are used.
     /// * [`Int3HookError::HandlerRegistrationFailed`] if the handler could not be
     ///   registered.
@@ -245,6 +250,13 @@ impl Int3Hook {
     ) -> Result<Self, Int3HookError> {
         let target_addr = target as usize;
         let detour_addr = detour as usize;
+
+        // An inline patch over the target would be torn by the `0xCC`, and its
+        // unhook would later overwrite the breakpoint. Inline hooks publish
+        // their patch under the code lock, which the caller holds.
+        if crate::transaction::overlaps_live_patch(target as *mut u8, 1) {
+            return Err(Int3HookError::AlreadyHooked);
+        }
 
         let mut mgr = lock_manager();
 
@@ -370,6 +382,15 @@ impl Int3Hook {
             SLOT_TARGET[self.slot].store(0, Ordering::Release);
         }
     }
+}
+
+/// Whether an installed INT3 hook patches a byte in `[start, start + len)`.
+/// Lock-free, so a commit may ask inside its suspend window.
+pub(crate) fn armed_in_range(start: usize, len: usize) -> bool {
+    SLOT_TARGET.iter().any(|target| {
+        let addr = target.load(Ordering::Acquire);
+        addr != 0 && addr >= start && addr - start < len
+    })
 }
 
 impl Drop for Int3Hook {

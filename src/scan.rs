@@ -344,8 +344,10 @@ pub unsafe fn scan_range_all(start: *const u8, len: usize, pattern: &Pattern) ->
 ///
 /// The module headers are validated through [`crate::pe`], and only committed,
 /// executable regions within the image are scanned - the natural home of the
-/// code a signature describes. Returns `None` if the module is invalid or the
-/// signature does not appear.
+/// code a signature describes. Each region (a run of pages with the same
+/// protection) is scanned on its own, so a match that spans a protection
+/// boundary - a page another patcher left writable, say - is not found.
+/// Returns `None` if the module is invalid or the signature does not appear.
 ///
 /// # Safety
 /// `h_module` must be the base address of a PE image currently mapped in this

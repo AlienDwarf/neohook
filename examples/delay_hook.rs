@@ -1,3 +1,5 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Demonstrates a delay / on-load hook: hooking a function in a module that is
 // not loaded yet. NeoHook inline-hooks ntdll!LdrLoadDll once, and installs the
 // real (INT3) hook the moment the target module is brought into the process.

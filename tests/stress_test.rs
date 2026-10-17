@@ -1,3 +1,6 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #![cfg(all(windows, target_arch = "x86_64"))]
 
 use neohook::DetourTransaction;

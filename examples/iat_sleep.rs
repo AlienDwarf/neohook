@@ -1,3 +1,5 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Demonstrates IAT hooking by replacing this module's imported Sleep() entry.
 // Unlike an inline hook, this only affects calls that go through the current
 // module's import table.

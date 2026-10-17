@@ -1,3 +1,6 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #![cfg(windows)]
 
 //! Hook detection against hooks whose kind and destination are known:
@@ -242,4 +245,73 @@ fn unhooked_modules_scan_clean() {
     for module in ["ntdll.dll", "kernel32.dll", "kernelbase.dll"] {
         assert!(scan_module_hooks(module).is_ok(), "{module}");
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+extern "system" fn push_ret_target(x: u32) -> u32 {
+    black_box(x).wrapping_mul(17).wrapping_add(4)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn push_ret_destination_is_sign_extended() {
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+
+    let _guard = serial();
+    let target = push_ret_target as *mut u8;
+    // push 0x80001000 ; ret - the CPU pushes 0xFFFFFFFF80001000.
+    let patch = [0x68u8, 0x00, 0x10, 0x00, 0x80, 0xC3];
+    let mut saved = [0u8; 6];
+    let mut old = 0;
+    unsafe {
+        assert_ne!(
+            VirtualProtect(target.cast(), 6, PAGE_EXECUTE_READWRITE, &mut old),
+            0
+        );
+        std::ptr::copy_nonoverlapping(target, saved.as_mut_ptr(), 6);
+        std::ptr::copy_nonoverlapping(patch.as_ptr(), target, 6);
+    }
+
+    let hook = unsafe_check(target);
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(saved.as_ptr(), target, 6);
+        VirtualProtect(target.cast(), 6, old, &mut old);
+    }
+    let hook = hook.expect("check succeeds").expect("hook is reported");
+    assert_eq!(hook.kind, DetectedHookKind::InlineJump);
+    assert_eq!(
+        hook.destination,
+        Some(0xFFFF_FFFF_8000_1000usize as *const u8)
+    );
+}
+
+unsafe extern "system" fn sleep_detour(_ms: u32) {}
+
+#[test]
+fn iat_redirect_behind_an_import_thunk_is_reported() {
+    let _guard = serial();
+    // kernel32!Sleep is a `jmp [__imp_Sleep]` thunk into kernelbase.
+    let sleep = neohook::find_function("kernel32.dll", "Sleep").unwrap();
+    let thunk = unsafe { std::slice::from_raw_parts(sleep, 3) };
+    if !(thunk.starts_with(&[0xFF, 0x25]) || thunk.starts_with(&[0x48, 0xFF, 0x25])) {
+        return; // not a thunk on this Windows build
+    }
+    let kernel32 = get_module_handle("kernel32.dll").unwrap();
+    let imports = unsafe { neohook::enumerate_imports(kernel32) }.unwrap();
+    let Some(import) = imports.iter().find(|i| i.name.as_deref() == Some("Sleep")) else {
+        return;
+    };
+
+    let mut tx = DetourTransaction::begin();
+    tx.attach_iat(kernel32, &import.dll, "Sleep", sleep_detour as *const u8)
+        .expect("attach_iat should succeed");
+    let hooks = tx.commit().expect("commit should succeed");
+    let hook = unsafe_check(sleep);
+    drop(hooks);
+
+    let hook = hook.expect("check succeeds").expect("redirect is reported");
+    assert_eq!(hook.kind, DetectedHookKind::ImportRedirect);
+    assert_eq!(hook.destination, Some(sleep_detour as *const u8));
 }

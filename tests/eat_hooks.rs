@@ -1,3 +1,6 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #![cfg(windows)]
 
 //! Integration tests for EAT (Export Address Table) hooking.
@@ -7,7 +10,9 @@
 //! after installation observe the detour. That makes these tests self-contained:
 //! they only affect lookups they perform themselves.
 
-use neohook::{TransactionCore, enumerate_exports, get_module_handle};
+use neohook::{
+    DetourTransaction, TransactionCore, enumerate_exports, find_function, get_module_handle,
+};
 use std::ffi::CString;
 use windows_sys::Win32::Foundation::HMODULE;
 use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
@@ -194,4 +199,35 @@ fn enumerate_exports_reports_a_hooked_export() {
         Some(resolved),
         "the listed address is where GetProcAddress resolves the hooked export"
     );
+}
+
+/// Far enough from any module that the x64 slot needs a jump stub.
+unsafe extern "system" fn processor_detour() -> u32 {
+    4242
+}
+
+#[test]
+fn address_resolved_while_hooked_survives_the_unhook() {
+    let ntdll = get_module_handle("ntdll.dll").expect("ntdll is loaded");
+    let mut tx = DetourTransaction::begin();
+    tx.attach_eat(
+        ntdll,
+        "RtlGetCurrentProcessorNumber",
+        processor_detour as *const u8,
+    )
+    .expect("attach_eat should succeed");
+    let hooks = tx.commit().expect("commit should succeed");
+
+    let cached = find_function("ntdll.dll", "RtlGetCurrentProcessorNumber").unwrap();
+    let cached: GetTickCountFn = unsafe { std::mem::transmute(cached) };
+    assert_eq!(unsafe { cached() }, 4242);
+
+    drop(hooks);
+    // Free retired stubs, so a released one would now be unmapped.
+    neohook::reclaim();
+
+    let value = unsafe { cached() };
+    if cfg!(target_arch = "x86_64") {
+        assert_ne!(value, 4242, "the stub leads to the original export again");
+    }
 }

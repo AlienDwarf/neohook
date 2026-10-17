@@ -1,3 +1,5 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Demonstrates the tracing / logging detour generator.
 //
 // `detour_trace!` installs an inline hook that logs every call - its arguments

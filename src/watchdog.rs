@@ -183,7 +183,8 @@ struct Shared {
 /// Created with [`Self::with_interval`], it spawns a thread that wakes every
 /// `interval`, compares each guarded region against its snapshot, and - per the
 /// active [`WatchMode`] - rewrites or merely reports any that differ. The thread
-/// is stopped and joined when the `Watchdog` is dropped.
+/// is stopped and joined when the `Watchdog` is dropped; dropped from its own
+/// tamper callback, it is stopped and exits once the callback returns.
 pub struct Watchdog {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
@@ -357,6 +358,11 @@ impl Drop for Watchdog {
     fn drop(&mut self) {
         self.shared.running.store(false, Ordering::Release);
         if let Some(thread) = self.thread.take() {
+            // Dropped from its own tamper callback: the thread cannot join
+            // itself, and exits once the callback returns.
+            if thread.thread().id() == std::thread::current().id() {
+                return;
+            }
             // Wake the thread if it is parked so shutdown is not delayed by a
             // full sweep interval, then wait for it to exit.
             thread.thread().unpark();
@@ -549,13 +555,20 @@ unsafe fn restore_quiescent(targets: &[(usize, &[u8])], restored: &mut [bool]) {
             handles.push(h);
         }
 
+        // A thread whose position cannot be read might be inside any region,
+        // so nothing is rewritten this sweep.
+        let mut position_unknown = false;
         for &h in &handles {
-            if let Some(ip) = thread_ip(h) {
-                ips.push(ip);
+            match thread_ip(h) {
+                Some(ip) => ips.push(ip),
+                None => position_unknown = true,
             }
         }
 
         for (&(target, bytes), restored) in targets.iter().zip(restored.iter_mut()) {
+            if position_unknown {
+                break;
+            }
             let end = target.saturating_add(bytes.len());
             if ips.iter().any(|&ip| ip >= target && ip < end) {
                 continue;

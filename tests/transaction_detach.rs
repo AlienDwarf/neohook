@@ -1,3 +1,6 @@
+// Copyright (c) 2026 NeoHook Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #![cfg(windows)]
 
 use neohook::DetourTransaction;
@@ -176,4 +179,38 @@ fn ffi_handle_indices_stay_stable_after_detach() {
         assert_eq!(slot_target_b(1), 3);
         assert_eq!(slot_target_c(1), 4);
     }
+}
+
+#[inline(never)]
+fn reenable_target(value: i32) -> i32 {
+    black_box(value) + black_box(3)
+}
+
+#[inline(never)]
+fn reenable_detour(value: i32) -> i32 {
+    black_box(value) + black_box(300)
+}
+
+#[test]
+fn detached_hook_cannot_be_reenabled() {
+    let mut tx = DetourTransaction::begin();
+    tx.attach(reenable_target as *mut u8, reenable_detour as *const u8)
+        .expect("attach should succeed");
+    let mut hooks = tx.commit().expect("attach commit should succeed");
+    assert_eq!(reenable_target(1), 301);
+
+    let mut detach_tx = DetourTransaction::begin();
+    detach_tx
+        .detach(&mut hooks[0])
+        .expect("detach should queue");
+    detach_tx.commit().expect("detach commit should succeed");
+    assert_eq!(reenable_target(1), 4);
+
+    // Its trampoline is released on drop, so the jump must not come back.
+    assert!(hooks[0].enable().is_err());
+    assert!(!hooks[0].is_enabled());
+    assert_eq!(reenable_target(1), 4);
+
+    drop(hooks);
+    assert_eq!(reenable_target(1), 4);
 }

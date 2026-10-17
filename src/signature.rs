@@ -346,7 +346,9 @@ fn reg_index(reg: Register) -> Option<usize> {
     if reg.is_xmm() {
         Some(16 + reg.number())
     } else if reg.is_gpr() {
-        Some(reg.number())
+        // Byte registers count from AL with AH..BH and SPL..DIL in between, so
+        // map every width to its full register first.
+        Some(reg.full_register().number())
     } else {
         None
     }
@@ -915,7 +917,10 @@ impl Analysis {
 
         // The x87 stack: a load leaves a value, a popping store removes it.
         let name = mnemonic_name(mnemonic);
-        if name.starts_with("Fld") || name.starts_with("Fild") {
+        // `fldcw` / `fldenv` load control state, not a value.
+        if (name.starts_with("Fld") && !matches!(mnemonic, Mnemonic::Fldcw | Mnemonic::Fldenv))
+            || name.starts_with("Fild")
+        {
             state.x87 = true;
         } else if name.starts_with("Fstp") || name.starts_with("Fistp") || name.ends_with("pp") {
             state.x87 = false;
