@@ -173,8 +173,12 @@ impl VTableHook {
         Ok(())
     }
 
-    /// Re-points the slot at the detour after a [`Self::disable`].
+    /// Re-points the slot at the detour after a [`Self::disable`]. Fails with
+    /// [`DetourError::InvalidParameter`] once the hook has been detached.
     pub fn enable(&mut self) -> Result<(), DetourError> {
+        if !self.active {
+            return Err(DetourError::InvalidParameter);
+        }
         if self.enabled {
             return Ok(());
         }
@@ -185,6 +189,9 @@ impl VTableHook {
 
     /// Unhooks this VTable hook by restoring the original slot pointer.
     pub fn unhook(mut self) -> Result<(), DetourError> {
+        if !self.active {
+            return Ok(());
+        }
         self.perform_unhook()?;
         self.active = false;
         Ok(())
@@ -481,7 +488,12 @@ impl VTableInstanceHook {
     }
 
     /// Re-points the object at the cloned VTable after a [`Self::disable`].
+    /// Fails with [`DetourError::InvalidParameter`] once the hook has been
+    /// detached.
     pub fn enable(&mut self) -> Result<(), DetourError> {
+        if !self.active {
+            return Err(DetourError::InvalidParameter);
+        }
         if self.enabled {
             return Ok(());
         }
@@ -543,6 +555,9 @@ impl VTableInstanceHook {
     /// Unhooks the instance hook by restoring the original VTable pointer and
     /// releasing the cloned VTable memory.
     pub fn unhook(mut self) -> Result<(), DetourError> {
+        if !self.active {
+            return Ok(());
+        }
         self.perform_unhook()?;
         self.active = false;
         Ok(())

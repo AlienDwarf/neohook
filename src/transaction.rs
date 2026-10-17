@@ -284,8 +284,12 @@ impl InlineHook {
     /// Re-installs the detour jump at the target after a [`Self::disable`].
     ///
     /// Like [`Self::disable`], this rewrites the target in place without thread
-    /// redirection.
+    /// redirection. Fails with [`DetourError::InvalidParameter`] once the hook
+    /// has been detached.
     pub fn enable(&mut self) -> Result<(), DetourError> {
+        if !self.active {
+            return Err(DetourError::InvalidParameter);
+        }
         if self.enabled {
             return Ok(());
         }
@@ -311,6 +315,9 @@ impl InlineHook {
 
     /// Unhooks this inline hook by restoring the original bytes at the target address.
     pub fn unhook(mut self) -> Result<(), DetourError> {
+        if !self.active {
+            return Ok(());
+        }
         with_code_lock(|| {
             self.perform_unhook()?;
             self.release();
@@ -409,6 +416,9 @@ pub struct IatHook {
 
 impl IatHook {
     pub fn unhook(mut self) -> Result<(), DetourError> {
+        if !self.active {
+            return Ok(());
+        }
         self.perform_unhook()?;
         self.active = false;
 
@@ -439,7 +449,12 @@ impl IatHook {
     }
 
     /// Re-points the import slot at the detour after a [`Self::disable`].
+    /// Fails with [`DetourError::InvalidParameter`] once the hook has been
+    /// detached.
     pub fn enable(&mut self) -> Result<(), DetourError> {
+        if !self.active {
+            return Err(DetourError::InvalidParameter);
+        }
         if self.enabled {
             return Ok(());
         }
@@ -534,7 +549,12 @@ impl EatHook {
     }
 
     /// Re-points the export slot at the detour after a [`Self::disable`].
+    /// Fails with [`DetourError::InvalidParameter`] once the hook has been
+    /// detached.
     pub fn enable(&mut self) -> Result<(), DetourError> {
+        if !self.active {
+            return Err(DetourError::InvalidParameter);
+        }
         if self.enabled {
             return Ok(());
         }
@@ -546,6 +566,9 @@ impl EatHook {
     /// Unhooks this EAT hook by restoring the original export RVA. The jump stub
     /// (if any) is released when the guard is dropped.
     pub fn unhook(mut self) -> Result<(), DetourError> {
+        if !self.active {
+            return Ok(());
+        }
         self.perform_unhook()?;
         self.active = false;
         Ok(())
