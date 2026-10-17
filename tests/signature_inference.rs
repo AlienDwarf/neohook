@@ -259,10 +259,20 @@ mod x86 {
         );
     }
 
+    #[unsafe(naked)]
+    extern "C" fn sets_control_word() {
+        naked_asm!("fldcw [esp + 4]", "ret");
+    }
+
     #[test]
     fn high_byte_register_write_keeps_the_frame_pointer() {
         let sig = unsafe { infer_signature(high_byte_write_keeps_frame as *const u8) }.unwrap();
         assert_eq!(sig.args.len(), 1);
+    }
+
+    #[test]
+    fn loading_the_control_word_returns_no_value() {
+        assert_ne!(kinds(sets_control_word as *const u8).1, Some(Double));
     }
 
     #[unsafe(naked)]

@@ -917,7 +917,10 @@ impl Analysis {
 
         // The x87 stack: a load leaves a value, a popping store removes it.
         let name = mnemonic_name(mnemonic);
-        if name.starts_with("Fld") || name.starts_with("Fild") {
+        // `fldcw` / `fldenv` load control state, not a value.
+        if (name.starts_with("Fld") && !matches!(mnemonic, Mnemonic::Fldcw | Mnemonic::Fldenv))
+            || name.starts_with("Fild")
+        {
             state.x87 = true;
         } else if name.starts_with("Fstp") || name.starts_with("Fistp") || name.ends_with("pp") {
             state.x87 = false;
