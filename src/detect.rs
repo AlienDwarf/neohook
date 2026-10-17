@@ -607,25 +607,29 @@ impl HardwareBreakpoints {
         #[repr(align(16))]
         struct AlignedContext(CONTEXT);
 
-        let mut addresses = Vec::new();
-        let mut read = |h_thread| {
+        // The execute breakpoints armed in a thread, 0 for an unused register.
+        // Allocates nothing: it runs while the thread is suspended, and that
+        // thread may hold the heap lock.
+        let read = |h_thread| {
+            let mut found = [0usize; 4];
             let mut ctx: AlignedContext = unsafe { std::mem::zeroed() };
             ctx.0.ContextFlags = CONTEXT_DEBUG;
             if unsafe { GetThreadContext(h_thread, &mut ctx.0) } == 0 {
-                return;
+                return found;
             }
             let ctx = ctx.0;
             for (slot, dr) in [ctx.Dr0, ctx.Dr1, ctx.Dr2, ctx.Dr3].into_iter().enumerate() {
                 // Locally or globally enabled, with an execute condition (R/W = 00).
                 let enabled = ctx.Dr7 & (0b11 << (slot * 2)) != 0;
                 let execute = (ctx.Dr7 >> (16 + slot * 4)) & 0b11 == 0;
-                if enabled && execute && dr != 0 {
-                    addresses.push(dr as usize);
+                if enabled && execute {
+                    found[slot] = dr as usize;
                 }
             }
+            found
         };
 
-        read(unsafe { GetCurrentThread() });
+        let mut addresses: Vec<usize> = read(unsafe { GetCurrentThread() }).to_vec();
         let _freeze = crate::threads::hold_freeze_lock();
         for tid in crate::threads::ThreadEnumerator::enumerate_process_threads() {
             let h = unsafe { OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME, 0, tid) };
@@ -633,11 +637,13 @@ impl HardwareBreakpoints {
                 continue;
             }
             if unsafe { SuspendThread(h) } != u32::MAX {
-                read(h);
+                let found = read(h);
                 unsafe { ResumeThread(h) };
+                addresses.extend(found);
             }
             unsafe { CloseHandle(h) };
         }
+        addresses.retain(|&address| address != 0);
         addresses.sort_unstable();
         addresses.dedup();
         Self { addresses }
