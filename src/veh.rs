@@ -18,8 +18,10 @@
 //! * **Four hooks at a time.** There are only four hardware breakpoint
 //!   registers, so AT MOST FOUR VEH hooks can be active in the process.
 //! * **Per-thread arming.** Debug registers are per-thread. NeoHook arms every
-//!   thread that exists at install time, but threads created *afterwards* will
-//!   not carry the breakpoint and will call the original function.
+//!   thread that exists at install time and that it can open and suspend, but
+//!   threads created *afterwards* will not carry the breakpoint and will call
+//!   the original function. A thread that cannot be armed (one protected
+//!   against `THREAD_SET_CONTEXT`, say) is skipped without an error.
 //! * **Full replacement.** Like [`crate::detour_inline!`], the detour replaces
 //!   the target; there is no trampoline to call the original through (calling
 //!   the target again from the same thread would re-trigger the breakpoint).
