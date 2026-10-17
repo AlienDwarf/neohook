@@ -1030,6 +1030,11 @@ impl TransactionCore {
                 .map_err(|_| DetourError::InvalidParameter)
         }?;
 
+        // A later branch into the stolen bytes would land inside the jump.
+        if unsafe { disasm::Disassembler::branches_into(target, stolen_len) } {
+            return Err(DetourError::InvalidParameter);
+        }
+
         // The stolen bytes must not overlap another inline hook, queued here or
         // already installed: one jump would be written over the other, or the
         // live jump relocated into this trampoline. `commit` checks installed

@@ -566,3 +566,33 @@ mod ymm_upper_halves {
         unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) };
     }
 }
+
+#[test]
+fn hook_site_a_loop_jumps_back_into_is_refused() {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+    unsafe extern "C" fn handler(_: *mut neohook::HookContext) {}
+
+    // xor eax,eax ; L: inc eax ; cmp eax,10 ; jne L ; ret - the patch at the
+    // first byte would cover L.
+    let code = [0x31, 0xC0, 0xFF, 0xC0, 0x83, 0xF8, 0x0A, 0x75, 0xF9, 0xC3];
+    let page = unsafe {
+        VirtualAlloc(
+            std::ptr::null(),
+            4096,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_EXECUTE_READWRITE,
+        )
+    } as *mut u8;
+    assert!(!page.is_null());
+    unsafe {
+        std::ptr::write_bytes(page, 0xCC, 4096);
+        std::ptr::copy_nonoverlapping(code.as_ptr(), page, code.len());
+    }
+
+    assert!(unsafe { MidHook::install(page, handler) }.is_err());
+    let count: extern "C" fn() -> u32 = unsafe { std::mem::transmute(page) };
+    assert_eq!(count(), 10);
+    unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) };
+}
