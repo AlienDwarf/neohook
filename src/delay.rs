@@ -6,8 +6,8 @@
 //! Every other hook in NeoHook needs the target to already be resolvable. But a
 //! plugin DLL, a lazily-loaded codec, or a graphics backend chosen at runtime
 //! may only appear *after* your code runs. A delay hook bridges that gap: you
-//! register the module + export name up front, and NeoHook installs the hook the
-//! moment that module is brought into the process.
+//! register the module + export name up front, and NeoHook installs the hook as
+//! soon as the load call that brings the module into the process returns.
 //!
 //! It works by inline-hooking `ntdll!LdrLoadDll` - the single chokepoint every
 //! `LoadLibrary*` call funnels through - once, the first time you register. When
@@ -27,6 +27,10 @@
 //!   target; there is no trampoline to call the original through.
 //! * **Capacity.** Each installed delay hook consumes one INT3 slot
 //!   ([`crate::int3::MAX_HOOKS`]).
+//! * **Not during the load.** The hook is installed after the outermost
+//!   `LdrLoadDll` call returns, so calls made while the module initializes -
+//!   from its own `DllMain` or TLS callbacks, or from a dependency loaded with
+//!   it - reach the original function.
 //!
 //! When the hooked module is unloaded, the hook drops back to pending (and is
 //! installed again on the next load) without writing to the old address. Unloads
