@@ -233,6 +233,11 @@ macro_rules! detour_inline {
 /// Convenience macro for installing a hook and storing a typed trampoline
 /// pointer to the original function.
 ///
+/// The `OnceLock` is set before the commit, so the detour finds the original
+/// as soon as the patch lands. A `OnceLock` can be set only once: after a
+/// failed commit, or once the hook is gone, the same static cannot be used for
+/// another hook, and the macro returns [`DetourError::InvalidParameter`].
+///
 /// # Examples
 ///
 /// ```rust,ignore
