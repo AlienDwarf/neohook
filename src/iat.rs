@@ -147,10 +147,18 @@ impl IatHook {
         crate::transaction::with_code_lock(|| {
             let original_fn = unsafe { thunk_function(thunk) as *mut u8 };
 
-            // Change the protection of the memory page containing the IAT entry to allow writing
+            // Change the protection of the memory page containing the IAT entry to allow writing.
+            // Execute stays as it was: the import table can share a page with
+            // code another thread is running (merged sections, packed images).
             let mut old_protect = 0;
-            let success =
-                unsafe { VirtualProtect(slot_ptr, slot_size, PAGE_READWRITE, &mut old_protect) };
+            let success = unsafe {
+                crate::mem::virtual_protect_same_execute(
+                    slot_ptr.cast(),
+                    slot_size,
+                    PAGE_READWRITE,
+                    &mut old_protect,
+                )
+            };
 
             // 11.03.26 (03-11-26) If we fail to change the protection, we return an error with the last OS error
             if success == 0 {

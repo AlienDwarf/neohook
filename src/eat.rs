@@ -33,7 +33,7 @@
 
 use std::fmt;
 use windows_sys::Win32::System::Diagnostics::Debug::*;
-use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+use windows_sys::Win32::System::Memory::PAGE_READWRITE;
 use windows_sys::Win32::System::SystemServices::*;
 
 use crate::pe::{self, ModuleImage, PeError};
@@ -374,8 +374,21 @@ type ProtectFn = unsafe extern "system" fn(*const core::ffi::c_void, usize, u32,
 /// (see `transaction::with_code_lock`).
 unsafe fn write_export_slot(slot_ptr: *mut u32, rva: u32) -> Result<(), EatHookError> {
     crate::transaction::with_code_lock(|| unsafe {
-        write_export_slot_with(slot_ptr, rva, VirtualProtect)
+        write_export_slot_with(slot_ptr, rva, protect_same_execute)
     })
+}
+
+/// `VirtualProtect` that leaves execute permission as it is: the export
+/// directory can share a page with code another thread is running.
+unsafe extern "system" fn protect_same_execute(
+    address: *const core::ffi::c_void,
+    size: usize,
+    new_protect: u32,
+    old_protect: *mut u32,
+) -> i32 {
+    unsafe {
+        crate::mem::virtual_protect_same_execute(address as *mut u8, size, new_protect, old_protect)
+    }
 }
 
 unsafe fn write_export_slot_with(
@@ -430,6 +443,45 @@ mod tests {
 
     thread_local! {
         static PROTECT_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn slot_write_keeps_a_shared_code_page_executable() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+            VirtualAlloc, VirtualFree, VirtualProtect,
+        };
+
+        // One page holding both code (`ret`) and an export-table-like slot.
+        let page = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            )
+        } as *mut u8;
+        assert!(!page.is_null());
+        unsafe { *page = 0xC3 };
+        let mut old = 0u32;
+        unsafe { VirtualProtect(page.cast(), 4096, PAGE_EXECUTE_READ, &mut old) };
+        let slot = unsafe { page.add(0x800) }.cast::<u32>();
+
+        static STOP: AtomicBool = AtomicBool::new(false);
+        let code = page as usize;
+        let runner = std::thread::spawn(move || {
+            let f: extern "C" fn() = unsafe { std::mem::transmute(code) };
+            while !STOP.load(Ordering::Relaxed) {
+                f();
+            }
+        });
+        for i in 0..20_000u32 {
+            unsafe { write_export_slot(slot, i) }.expect("slot write");
+        }
+        STOP.store(true, Ordering::Relaxed);
+        runner.join().expect("code on the page kept running");
+        unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) };
     }
 
     /// Succeeds on the first call (making the slot "writable") and fails every
