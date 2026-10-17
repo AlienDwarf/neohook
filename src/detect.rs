@@ -350,7 +350,8 @@ fn classify(at: *const u8, live: &[u8]) -> DetectedHook {
         Mnemonic::Push if is_push_imm(&instr) => {
             if live.get(instr.len()) == Some(&0xC3) {
                 hook.kind = DetectedHookKind::InlineJump;
-                destination = Some(instr.immediate(0) as u32 as usize as *const u8);
+                // Sign-extended to 64 bits on x64, as the CPU does.
+                destination = Some(instr.immediate(0) as usize as *const u8);
             }
         }
         // mov rax/eax, imm; jmp rax/eax
