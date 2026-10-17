@@ -465,3 +465,53 @@ fn handler_runs_with_direction_flag_clear() {
         "DF must reach the resumed code unchanged (got {flags:#x})"
     );
 }
+
+#[cfg(target_arch = "x86")]
+mod x86_alignment {
+    use neohook::{HookContext, MidHook};
+    use std::hint::black_box;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static MISALIGNED: AtomicUsize = AtomicUsize::new(0);
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[inline(never)]
+    extern "C" fn target(x: u32) -> u32 {
+        black_box(x)
+            .wrapping_mul(black_box(3))
+            .wrapping_add(black_box(2))
+    }
+
+    unsafe extern "C" fn handler(ctx: *mut HookContext) {
+        CALLS.fetch_add(1, Ordering::SeqCst);
+        if !(ctx as usize).is_multiple_of(std::mem::align_of::<HookContext>()) {
+            MISALIGNED.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn handler_context_is_aligned_for_any_entry_esp() {
+        let hook = unsafe { MidHook::install(target as *const u8, handler) }.unwrap();
+        for shift in [0u32, 4, 8, 12] {
+            let mut result: u32;
+            unsafe {
+                std::arch::asm!(
+                    "sub esp, {s}",
+                    "push 5",
+                    "call {f}",
+                    "add esp, 4",
+                    "add esp, {s}",
+                    s = in(reg) shift,
+                    f = in(reg) target as *const () as usize,
+                    out("eax") result,
+                    out("ecx") _,
+                    out("edx") _,
+                );
+            }
+            assert_eq!(result, 17);
+        }
+        hook.unhook().unwrap();
+        assert_eq!(CALLS.load(Ordering::SeqCst), 4);
+        assert_eq!(MISALIGNED.load(Ordering::SeqCst), 0);
+    }
+}

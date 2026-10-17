@@ -582,12 +582,28 @@ fn build_stub(site: *const u8, handler: *const u8, gateway: *mut u8) -> Stub {
     c.push(0xFC); // cld  (the ABI requires DF=0 at calls; popfd restores it)
 
     // --- call handler(&context) ---
-    c.extend_from_slice(&[0x89, 0xE0]); // mov eax, esp   (eax = &context)
-    c.push(0x50); // push eax        (arg)
+    // x86 code keeps esp only 4-aligned, but `HookContext` is 8-aligned: the
+    // handler gets an aligned copy, which is copied back once it returns. The
+    // registers used here are all saved in the block and restored by popad.
+    const CONTEXT_DWORDS: u8 = 44; // size_of::<HookContext>() / 4
+    c.extend_from_slice(&[0x89, 0xE3]); // mov ebx, esp   (ebx = &context, survives the call)
+    c.extend_from_slice(&[0x89, 0xE6]); // mov esi, esp
+    c.extend_from_slice(&[0x8D, 0xBC, 0x24]); // lea edi, [esp - 184]
+    c.extend_from_slice(&(-184i32).to_le_bytes());
+    c.extend_from_slice(&[0x83, 0xE7, 0xF8]); // and edi, -8
+    c.extend_from_slice(&[0x89, 0xFC]); // mov esp, edi   (the copy sits right above esp)
+    c.extend_from_slice(&[0x6A, CONTEXT_DWORDS, 0x59]); // push 44 ; pop ecx
+    c.extend_from_slice(&[0xF3, 0xA5]); // rep movsd      (context -> copy; DF is clear)
+    c.push(0x54); // push esp        (arg = &copy)
     c.push(0xB8); // mov eax, imm32
     c.extend_from_slice(&(handler as u32).to_le_bytes());
     c.extend_from_slice(&[0xFF, 0xD0]); // call eax
     c.extend_from_slice(&[0x83, 0xC4, 0x04]); // add esp, 4  (cdecl: the caller pops the arg)
+    c.extend_from_slice(&[0x89, 0xE6]); // mov esi, esp
+    c.extend_from_slice(&[0x89, 0xDF]); // mov edi, ebx
+    c.extend_from_slice(&[0x6A, CONTEXT_DWORDS, 0x59]); // push 44 ; pop ecx
+    c.extend_from_slice(&[0xF3, 0xA5]); // rep movsd      (copy -> context)
+    c.extend_from_slice(&[0x89, 0xDC]); // mov esp, ebx   (back to the context block)
 
     // --- pick the jump target: redirect_eip if the handler set it, else gateway ---
     // esp == context base here; redirect_eip is at offset 168. eax/ecx are
