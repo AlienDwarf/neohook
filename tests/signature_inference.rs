@@ -151,6 +151,28 @@ mod x64 {
         );
     }
 
+    #[unsafe(naked)]
+    extern "C" fn third_arg_bool() {
+        naked_asm!("test r8b, r8b", "setne al", "ret");
+    }
+
+    #[unsafe(naked)]
+    extern "C" fn byte_write_then_xmm2() {
+        // Writing r14b must not count as writing xmm2.
+        naked_asm!("mov r14b, 1", "movsd xmm0, xmm2", "ret");
+    }
+
+    #[test]
+    fn byte_registers_map_to_their_full_register() {
+        let sig = unsafe { infer_signature(third_arg_bool as *const u8) }.unwrap();
+        assert_eq!(sig.args.len(), 3);
+        assert_eq!(sig.args[2].location, ArgLocation::Register("r8"));
+
+        let sig = unsafe { infer_signature(byte_write_then_xmm2 as *const u8) }.unwrap();
+        assert_eq!(sig.args.len(), 3);
+        assert_eq!(sig.args[2].location, ArgLocation::Register("xmm2"));
+    }
+
     #[test]
     fn dereferenced_argument_is_a_pointer() {
         assert_eq!(kinds(deref as *const u8).0, vec![Pointer]);
@@ -222,6 +244,25 @@ mod x86 {
     #[unsafe(naked)]
     extern "C" fn cdecl_identity() {
         naked_asm!("mov eax, [esp + 4]", "ret");
+    }
+
+    #[unsafe(naked)]
+    extern "C" fn high_byte_write_keeps_frame() {
+        // Writing ch must not drop the ebp frame tracking.
+        naked_asm!(
+            "push ebp",
+            "mov ebp, esp",
+            "mov ch, 1",
+            "mov eax, [ebp + 8]",
+            "pop ebp",
+            "ret"
+        );
+    }
+
+    #[test]
+    fn high_byte_register_write_keeps_the_frame_pointer() {
+        let sig = unsafe { infer_signature(high_byte_write_keeps_frame as *const u8) }.unwrap();
+        assert_eq!(sig.args.len(), 1);
     }
 
     #[unsafe(naked)]

@@ -346,7 +346,9 @@ fn reg_index(reg: Register) -> Option<usize> {
     if reg.is_xmm() {
         Some(16 + reg.number())
     } else if reg.is_gpr() {
-        Some(reg.number())
+        // Byte registers count from AL with AH..BH and SPL..DIL in between, so
+        // map every width to its full register first.
+        Some(reg.full_register().number())
     } else {
         None
     }
