@@ -93,11 +93,15 @@ pub enum PendingHook {
         target_dll: String,
         target_func: String,
         detour: *const u8,
+        /// Address of the import slot, resolved by `attach_iat`.
+        slot: usize,
     },
     Eat {
         module: HMODULE,
         target_func: String,
         detour: *const u8,
+        /// Address of the export slot, resolved by `attach_eat`.
+        slot: usize,
     },
     Vtable {
         vtable: *mut *mut u8,
@@ -407,6 +411,10 @@ pub struct IatHook {
     pub dll_name: String,
     pub func_name: String,
     pub original_ptr: *mut u8,
+    /// The import slot this hook claimed (see [`claim_table_slot`]).
+    slot: usize,
+    /// Whether the claim on `slot` is still held.
+    claimed: bool,
     active: bool,
     /// Detour pointer currently written into the import slot when enabled.
     detour: *mut u8,
@@ -483,19 +491,23 @@ impl IatHook {
     }
 
     fn detach_finalize(&mut self) {
-        if self.enabled {
-            let _ = self.disable();
-        }
+        let restored = !self.enabled || self.disable().is_ok();
         self.active = false;
         self.enabled = false;
+        // A detached hook frees its slot for the next hook right away.
+        if restored && self.claimed {
+            release_table_slot(self.slot);
+            self.claimed = false;
+        }
     }
 }
 
 impl Drop for IatHook {
     fn drop(&mut self) {
-        if self.active {
-            // auto unhook when dropped, best effort, ignore errors
-            let _ = self.perform_unhook();
+        // auto unhook when dropped, best effort. A slot still pointing at the
+        // detour stays claimed, so no later hook stacks on it.
+        if self.claimed && (!self.active || self.perform_unhook().is_ok()) {
+            release_table_slot(self.slot);
         }
     }
 }
@@ -521,6 +533,9 @@ pub struct EatHook {
     /// `Drop` releases the allocation when the hook goes away.
     #[allow(dead_code)]
     stub: Option<crate::alloc::Trampoline>,
+    /// Whether this hook still holds the claim on its export slot (see
+    /// [`claim_table_slot`]).
+    claimed: bool,
     active: bool,
     /// Whether the export slot currently points at the detour.
     enabled: bool,
@@ -580,19 +595,23 @@ impl EatHook {
     }
 
     fn detach_finalize(&mut self) {
-        if self.enabled {
-            let _ = self.disable();
-        }
+        let restored = !self.enabled || self.disable().is_ok();
         self.active = false;
         self.enabled = false;
+        // A detached hook frees its slot for the next hook right away.
+        if restored && self.claimed {
+            release_table_slot(self.slot_ptr as usize);
+            self.claimed = false;
+        }
     }
 }
 
 impl Drop for EatHook {
     fn drop(&mut self) {
-        if self.active {
-            // auto unhook when dropped, best effort, ignore errors
-            let _ = self.perform_unhook();
+        // auto unhook when dropped, best effort. A slot still pointing at the
+        // detour stays claimed, so no later hook stacks on it.
+        if self.claimed && (!self.active || self.perform_unhook().is_ok()) {
+            release_table_slot(self.slot_ptr as usize);
         }
         // `stub` is released here via its own Drop, after the slot no longer
         // points at it.
@@ -1125,8 +1144,11 @@ impl TransactionCore {
         // Check if we can find the import
         // if find_import_address returns None it means there is no such dll or function in the IAT, so we return an error
 
-        unsafe {
-            crate::iat::IatHook::find_import_address(h_module, target_dll, target_func)?;
+        let slot =
+            unsafe { crate::iat::IatHook::find_import_address(h_module, target_dll, target_func)? }
+                as usize;
+        if self.table_slot_taken(slot) {
+            return Err(DetourError::InvalidParameter);
         }
 
         // NOW WE CAN SAFELY PUSH THE HOOK TO THE PENDING LIST, THE COMMIT FUNCTION WILL TAKE CARE OF INSTALLING IT
@@ -1136,6 +1158,7 @@ impl TransactionCore {
             target_dll: target_dll.to_string(),
             target_func: target_func.to_string(),
             detour,
+            slot,
         });
         Ok(())
     }
@@ -1199,14 +1222,17 @@ impl TransactionCore {
 
         // Validate up front that the export exists and is hookable (not a
         // forwarder), so we fail before any thread is suspended.
-        unsafe {
-            crate::eat::EatHook::find_export_address(h_module, target_func)?;
+        let slot =
+            unsafe { crate::eat::EatHook::find_export_address(h_module, target_func)? } as usize;
+        if self.table_slot_taken(slot) {
+            return Err(DetourError::InvalidParameter);
         }
 
         self.pending_hooks.push(PendingHook::Eat {
             module: h_module,
             target_func: target_func.to_string(),
             detour,
+            slot,
         });
         Ok(())
     }
@@ -1266,6 +1292,10 @@ impl TransactionCore {
             }
         }
 
+        if self.table_slot_taken(slot as usize) {
+            return Err(DetourError::InvalidParameter);
+        }
+
         let original_ptr = unsafe { *slot };
 
         self.pending_hooks.push(PendingHook::Vtable {
@@ -1314,6 +1344,14 @@ impl TransactionCore {
             return Err(DetourError::InvalidParameter);
         }
 
+        let queued = self.pending_hooks.iter().any(|hook| {
+            matches!(hook, PendingHook::VtableInstance { object_vptr: queued, index: queued_index, .. }
+                if *queued == object_vptr && *queued_index == index)
+        });
+        if queued || crate::vtable::instance_slot_hooked(object_vptr, index) {
+            return Err(DetourError::InvalidParameter);
+        }
+
         let original_ptr = unsafe { *(original_vtable as *mut *mut u8).add(index) };
 
         self.pending_hooks.push(PendingHook::VtableInstance {
@@ -1324,6 +1362,21 @@ impl TransactionCore {
         });
 
         Ok(original_ptr)
+    }
+
+    /// Whether a live hook or one queued in this transaction already redirects
+    /// the table slot at `slot`.
+    fn table_slot_taken(&self, slot: usize) -> bool {
+        let queued = self.pending_hooks.iter().any(|hook| match hook {
+            PendingHook::Iat { slot: queued, .. } | PendingHook::Eat { slot: queued, .. } => {
+                *queued == slot
+            }
+            PendingHook::Vtable { vtable, index, .. } => {
+                vtable.wrapping_add(*index) as usize == slot
+            }
+            _ => false,
+        });
+        queued || table_slot_claimed(slot)
     }
 
     /// Queues an installed hook to be detached when the transaction commits.
@@ -1461,6 +1514,7 @@ impl TransactionCore {
                     module,
                     target_func,
                     detour,
+                    ..
                 } => unsafe { crate::eat::EatHook::prepare_export(*module, target_func, *detour) }
                     .map(Reserved::Eat)
                     .map_err(|e| (HookKind::Eat, e.into())),
@@ -1499,6 +1553,29 @@ impl TransactionCore {
         // before the first suspension, so no frozen thread can hold it.
         let code_guard = hold_code_lock();
 
+        // Table hooks claim their slot and VTable instance hooks may register a
+        // clone inside the suspend window; make room now, while allocating is
+        // still safe. Nothing else inserts while the code lock is held.
+        reserve_table_slots(
+            pending
+                .iter()
+                .filter(|hook| {
+                    matches!(
+                        hook,
+                        PendingHook::Iat { .. }
+                            | PendingHook::Eat { .. }
+                            | PendingHook::Vtable { .. }
+                    )
+                })
+                .count(),
+        );
+        crate::vtable::reserve_instance_clones(
+            pending
+                .iter()
+                .filter(|hook| matches!(hook, PendingHook::VtableInstance { .. }))
+                .count(),
+        );
+
         // A gateway queued for chaining may have lost its owner since `attach`
         // (dropping a hook only waits for this lock, not for the transaction):
         // it is retired and will be freed, so it must not be patched. Checked
@@ -1535,8 +1612,17 @@ impl TransactionCore {
                     target_dll,
                     target_func,
                     detour,
-                } => unsafe {
-                    crate::iat::IatHook::hook_import(*module, target_dll, target_func, *detour)
+                    slot,
+                } => {
+                    if claim_table_slot(*slot) {
+                        unsafe {
+                            crate::iat::IatHook::hook_import(
+                                *module,
+                                target_dll,
+                                target_func,
+                                *detour,
+                            )
+                        }
                         .map(|original| {
                             Some(Hook::Iat(IatHook {
                                 module: *module,
@@ -1545,13 +1631,21 @@ impl TransactionCore {
                                 dll_name: std::mem::take(target_dll),
                                 func_name: std::mem::take(target_func),
                                 original_ptr: original,
+                                slot: *slot,
+                                claimed: true,
                                 active: true,
                                 detour: *detour as *mut u8,
                                 enabled: true,
                             }))
                         })
-                        .map_err(|err| (HookKind::Iat, err.into()))
-                },
+                        .map_err(|err| {
+                            release_table_slot(*slot);
+                            (HookKind::Iat, err.into())
+                        })
+                    } else {
+                        Err((HookKind::Iat, DetourError::InvalidParameter))
+                    }
+                }
                 PendingHook::Eat {
                     module,
                     target_func,
@@ -2616,10 +2710,16 @@ fn install_eat(
     let Reserved::Eat(prepared) = reserved else {
         return Err(DetourError::InvalidParameter);
     };
-    // Re-read the slot: an earlier hook in this commit may have redirected the
-    // same export since it was prepared.
+    if !claim_table_slot(prepared.slot_ptr as usize) {
+        return Err(DetourError::InvalidParameter);
+    }
     let original_rva = unsafe { prepared.slot_ptr.read() };
-    unsafe { crate::eat::EatHook::write_export_rva(prepared.slot_ptr, prepared.detour_rva) }?;
+    if let Err(err) =
+        unsafe { crate::eat::EatHook::write_export_rva(prepared.slot_ptr, prepared.detour_rva) }
+    {
+        release_table_slot(prepared.slot_ptr as usize);
+        return Err(err.into());
+    }
 
     let Reserved::Eat(prepared) = std::mem::replace(reserved, Reserved::Nothing) else {
         unreachable!("checked above");
@@ -2634,6 +2734,7 @@ fn install_eat(
         detour_rva: prepared.detour_rva,
         original_ptr: (module as usize).wrapping_add(original_rva as usize) as *mut u8,
         stub: prepared.stub,
+        claimed: true,
         active: true,
         enabled: true,
     }))
@@ -2781,6 +2882,39 @@ fn orphan_chained_gateway(gateway: *mut u8, size: usize) -> bool {
             _ => false,
         })
         .unwrap_or(false)
+}
+
+/// Table slots (import, export and VTable entries) redirected by a live hook.
+/// A second hook on a slot is refused: unhooking the two in the wrong order
+/// would put a released detour or stub back into the table.
+///
+/// Only touched under the code lock, so no suspended thread can hold it while a
+/// commit claims slots inside its suspend window. Claiming there does not
+/// allocate, as [`reserve_table_slots`] made room beforehand.
+fn table_slots() -> &'static Mutex<HashSet<usize>> {
+    static SLOTS: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+    SLOTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn reserve_table_slots(additional: usize) {
+    with_code_lock(|| {
+        let _ = table_slots().lock().map(|mut s| s.reserve(additional));
+    });
+}
+
+/// Claims `slot` for a new hook. Returns `false` if a live hook owns it.
+pub(crate) fn claim_table_slot(slot: usize) -> bool {
+    with_code_lock(|| table_slots().lock().is_ok_and(|mut s| s.insert(slot)))
+}
+
+pub(crate) fn release_table_slot(slot: usize) {
+    with_code_lock(|| {
+        let _ = table_slots().lock().map(|mut s| s.remove(&slot));
+    });
+}
+
+fn table_slot_claimed(slot: usize) -> bool {
+    with_code_lock(|| table_slots().lock().is_ok_and(|s| s.contains(&slot)))
 }
 
 /// Code ranges patched by installed inline hooks, as start -> length. Updated
